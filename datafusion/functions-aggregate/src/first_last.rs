@@ -571,9 +571,9 @@ where
         for (idx_in_val, group_idx) in group_indices.iter().enumerate() {
             let group_idx = *group_idx;
 
-            let passed_filter = opt_filter.is_none_or(|x| x.value(idx_in_val));
+            let passed_filter = opt_filter.map_or(true, |x| x.value(idx_in_val));
 
-            let is_set = is_set_arr.is_none_or(|x| x.value(idx_in_val));
+            let is_set = is_set_arr.map_or(true, |x| x.value(idx_in_val));
 
             if !passed_filter || !is_set {
                 continue;
