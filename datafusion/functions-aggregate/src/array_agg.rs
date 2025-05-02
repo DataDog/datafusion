@@ -388,6 +388,7 @@ impl Accumulator for DistinctArrayAggAccumulator {
         let array = &values[0];
 
         for i in 0..array.len() {
+            // XXX
             let scalar = ScalarValue::try_from_array(&array, i)?;
             self.values.insert(scalar);
         }

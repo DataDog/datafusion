@@ -407,6 +407,7 @@ impl MinMaxBytesState {
     /// # Arguments:
     /// * `data_type`: The data type of the arrays that will be passed to this accumulator
     fn new(data_type: DataType) -> Self {
+        println!("Creating minmax state");
         Self {
             min_max: vec![],
             data_type,
@@ -420,11 +421,13 @@ impl MinMaxBytesState {
             None => {
                 self.min_max[group_index] = Some(new_val.to_vec());
                 self.total_data_bytes += new_val.len();
+                println!("Total: {}, Adding {} bytes", self.total_data_bytes, new_val.len());
             }
             Some(existing_val) => {
                 // Copy data over to avoid re-allocating
                 self.total_data_bytes -= existing_val.len();
                 self.total_data_bytes += new_val.len();
+                println!("Total: {}, Adding {} bytes, removing {} bytes", self.total_data_bytes, new_val.len(), existing_val.len());
                 existing_val.clear();
                 existing_val.extend_from_slice(new_val);
             }

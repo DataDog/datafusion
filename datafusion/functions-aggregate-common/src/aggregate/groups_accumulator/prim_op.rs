@@ -196,6 +196,8 @@ where
     }
 
     fn size(&self) -> usize {
-        self.values.capacity() * size_of::<T::Native>() + self.null_state.size()
+        let size = self.values.capacity() * size_of::<T::Native>() + self.null_state.size();
+        println!("size: {}", size);
+        size
     }
 }
