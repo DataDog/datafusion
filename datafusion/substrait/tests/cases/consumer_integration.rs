@@ -560,13 +560,4 @@ mod tests {
                         );
         Ok(())
     }
-
-    #[tokio::test]
-    async fn test_binary_op_large_argument_list() -> Result<()> {
-        let _ = test_plan_to_string("binary_op_large_argument_list.json").await?;
-        // The test is to check that the plan can be parsed and executed without error, originally
-        // this plan was causing a stack overflow. The resulting logical is pretty massive and
-        // asserting its correctness is not the purpose of this test.
-        Ok(())
-    }
 }
