@@ -383,15 +383,15 @@ pub async fn from_substrait_sorts(
 pub(crate) mod tests {
     use crate::extensions::Extensions;
     use crate::logical_plan::consumer::{DefaultSubstraitConsumer, SubstraitConsumer};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::DFSchema;
     use datafusion::execution::SessionState;
     use datafusion::prelude::SessionContext;
     use std::sync::LazyLock;
+    use substrait::proto::expression::literal::LiteralType;
+    use substrait::proto::expression::{Literal, RexType, ScalarFunction};
     use substrait::proto::function_argument::ArgType;
     use substrait::proto::{Expression, FunctionArgument};
-    use substrait::proto::expression::{Literal, RexType, ScalarFunction};
-    use substrait::proto::expression::literal::LiteralType;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::common::DFSchema;
 
     pub(crate) static TEST_SESSION_STATE: LazyLock<SessionState> =
         LazyLock::new(|| SessionContext::default().state());
