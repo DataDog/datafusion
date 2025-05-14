@@ -24,9 +24,7 @@ use crate::variation_const::{
     DEFAULT_CONTAINER_TYPE_VARIATION_REF, DEFAULT_TYPE_VARIATION_REF,
     INTERVAL_DAY_TIME_TYPE_REF, INTERVAL_MONTH_DAY_NANO_TYPE_NAME,
     INTERVAL_MONTH_DAY_NANO_TYPE_REF, INTERVAL_YEAR_MONTH_TYPE_REF,
-    LARGE_CONTAINER_TYPE_VARIATION_REF, TIMESTAMP_MICRO_TYPE_VARIATION_REF,
-    TIMESTAMP_MILLI_TYPE_VARIATION_REF, TIMESTAMP_NANO_TYPE_VARIATION_REF,
-    TIMESTAMP_SECOND_TYPE_VARIATION_REF, UNSIGNED_INTEGER_TYPE_VARIATION_REF,
+    LARGE_CONTAINER_TYPE_VARIATION_REF, UNSIGNED_INTEGER_TYPE_VARIATION_REF,
     VIEW_CONTAINER_TYPE_VARIATION_REF,
 };
 use datafusion::arrow::datatypes::{
@@ -84,26 +82,9 @@ pub fn from_substrait_type(
             },
             r#type::Kind::Fp32(_) => Ok(DataType::Float32),
             r#type::Kind::Fp64(_) => Ok(DataType::Float64),
-            r#type::Kind::Timestamp(ts) => {
-                // Kept for backwards compatibility, new plans should use PrecisionTimestamp(Tz) instead
-                #[allow(deprecated)]
-                match ts.type_variation_reference {
-                    TIMESTAMP_SECOND_TYPE_VARIATION_REF => {
-                        Ok(DataType::Timestamp(TimeUnit::Second, None))
-                    }
-                    TIMESTAMP_MILLI_TYPE_VARIATION_REF => {
-                        Ok(DataType::Timestamp(TimeUnit::Millisecond, None))
-                    }
-                    TIMESTAMP_MICRO_TYPE_VARIATION_REF => {
-                        Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
-                    }
-                    TIMESTAMP_NANO_TYPE_VARIATION_REF => {
-                        Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
-                    }
-                    v => not_impl_err!(
-                        "Unsupported Substrait type variation {v} of type {s_kind:?}"
-                    ),
-                }
+            // TODO: DataDog-specific workaround, don't commit upstream
+            r#type::Kind::Timestamp(_) => {
+                Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
             }
             r#type::Kind::PrecisionTimestamp(pts) => {
                 let unit = match pts.precision {
