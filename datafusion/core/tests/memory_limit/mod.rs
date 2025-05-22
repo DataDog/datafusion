@@ -403,6 +403,19 @@ async fn oom_with_tracked_consumer_pool() {
         .await
 }
 
+#[tokio::test]
+async fn oom_grouped_hash_aggregate() {
+    TestCase::new()
+        .with_query("SELECT COUNT(*), SUM(request_bytes) FROM t GROUP BY host")
+        .with_expected_errors(vec![
+            "Failed to allocate additional",
+            "GroupedHashAggregateStream[0] (count(*), sum(t.request_bytes))",
+        ])
+        .with_memory_limit(1_000)
+        .run()
+        .await
+}
+
 /// Run the query with the specified memory limit,
 /// and verifies the expected errors are returned
 #[derive(Clone, Debug)]
