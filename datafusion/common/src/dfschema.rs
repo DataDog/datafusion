@@ -145,7 +145,7 @@ impl DFSchema {
         metadata: HashMap<String, String>,
     ) -> Result<Self> {
         let (qualifiers, fields): (Vec<Option<TableReference>>, Vec<Arc<Field>>) =
-            qualified_fields.into_iter().unzip();
+            qualified_fields.clone().into_iter().unzip();
 
         let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
 
@@ -154,6 +154,8 @@ impl DFSchema {
             field_qualifiers: qualifiers,
             functional_dependencies: FunctionalDependencies::empty(),
         };
+        // println!("{:?}", qualified_fields);
+        //println!();
         dfschema.check_names()?;
         Ok(dfschema)
     }
@@ -210,6 +212,8 @@ impl DFSchema {
     pub fn check_names(&self) -> Result<()> {
         let mut qualified_names = BTreeSet::new();
         let mut unqualified_names = BTreeSet::new();
+        // println!("Fields: {:?}", self.inner.fields().iter().map(|f| f.name()));
+        println!("Fields qualifiers: {:?}", self.field_qualifiers);
 
         for (field, qualifier) in self.inner.fields().iter().zip(&self.field_qualifiers) {
             if let Some(qualifier) = qualifier {
@@ -802,6 +806,10 @@ impl DFSchema {
             inner: self.inner,
             functional_dependencies: self.functional_dependencies,
         }
+    }
+
+    pub fn show_field_qualifiers(&self) -> Vec<Option<&TableReference>> {
+        self.field_qualifiers.iter().map(|q| q.as_ref()).collect()
     }
 
     /// Replace all field qualifier with new value in schema

@@ -2182,14 +2182,14 @@ impl Projection {
 /// produced by the projection operation. If the schema computation is successful,
 /// the `Result` will contain the schema; otherwise, it will contain an error.
 pub fn projection_schema(input: &LogicalPlan, exprs: &[Expr]) -> Result<Arc<DFSchema>> {
+    println!("BEFORE QUALIFIERS: {:?}", input.schema().show_field_qualifiers());
     let metadata = input.schema().metadata().clone();
-
     let schema =
         DFSchema::new_with_metadata(exprlist_to_fields(exprs, input)?, metadata)?
             .with_functional_dependencies(calc_func_dependencies_for_project(
                 exprs, input,
             )?)?;
-
+    println!("AFTER QUALIFIERS: {:?}", schema.show_field_qualifiers());
     Ok(Arc::new(schema))
 }
 

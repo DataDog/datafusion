@@ -38,6 +38,9 @@ pub async fn from_join_rel(
     let right = LogicalPlanBuilder::from(
         consumer.consume_rel(join.right.as_ref().unwrap()).await?,
     );
+    
+    //println!("Left: {:?}, Right: {:?}", left.schema(), right.schema());
+    println!();
     let (left, right) = requalify_sides_if_needed(left, right)?;
 
     let join_type = from_substrait_jointype(join.r#type)?;

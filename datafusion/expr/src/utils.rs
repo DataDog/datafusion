@@ -694,13 +694,21 @@ pub fn exprlist_to_fields<'a>(
     exprs: impl IntoIterator<Item = &'a Expr>,
     plan: &LogicalPlan,
 ) -> Result<Vec<(Option<TableReference>, Arc<Field>)>> {
-    // Look for exact match in plan's output schema
     let input_schema = plan.schema();
+
     exprs
         .into_iter()
-        .map(|e| e.to_field(input_schema))
+        .map(|e| {
+            let (qualifier, field) = e.to_field(input_schema)?;
+            println!(
+                "[exprlist_to_fields] Expr: {:?}, Qualifier: {:?}, Field Name: {}",
+                e, qualifier, field.name()
+            );
+            Ok((qualifier, field))
+        })
         .collect()
 }
+
 
 /// Convert an expression into Column expression if it's already provided as input plan.
 ///

@@ -54,6 +54,12 @@ pub(super) fn requalify_sides_if_needed(
     }) {
         // These names have no connection to the original plan, but they'll make the columns
         // (mostly) unique.
+        // NOTE: here it is trying to avoid column name conflicts, it is reached, but for some reason it is not bubbling up the qualifier 
+        // println!(
+        //     "Requalifying join sides to avoid column name conflicts: left={:?}, right={:?}",
+        //     left.schema(),
+        //     right.schema()
+        // );
         Ok((
             left.alias(TableReference::bare("left"))?,
             right.alias(TableReference::bare("right"))?,
