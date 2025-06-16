@@ -29,6 +29,7 @@ use substrait::proto::sort_field::SortDirection;
 use substrait::proto::sort_field::SortKind::{ComparisonFunctionReference, Direction};
 use substrait::proto::SortField;
 
+
 // Substrait PrecisionTimestampTz indicates that the timestamp is relative to UTC, which
 // is the same as the expectation for any non-empty timezone in DF, so any non-empty timezone
 // results in correct points on the timeline, and we pick UTC as a reasonable default.
@@ -54,12 +55,6 @@ pub(super) fn requalify_sides_if_needed(
     }) {
         // These names have no connection to the original plan, but they'll make the columns
         // (mostly) unique.
-        // NOTE: here it is trying to avoid column name conflicts, it is reached, but for some reason it is not bubbling up the qualifier 
-        // println!(
-        //     "Requalifying join sides to avoid column name conflicts: left={:?}, right={:?}",
-        //     left.schema(),
-        //     right.schema()
-        // );
         Ok((
             left.alias(TableReference::bare("left"))?,
             right.alias(TableReference::bare("right"))?,
@@ -412,7 +407,7 @@ impl NameTracker {
             false => {
                 let mut counter = 0;
                 loop {
-                    let candidate_name = format!("{}__temp__{}", name, counter);
+                    let candidate_name = format!("{name}__temp__{counter}");
                     if self.seen_names.insert(candidate_name.clone()) {
                         return (candidate_name, NameTrackerStatus::SeenBefore);
                     }
@@ -484,11 +479,17 @@ pub async fn from_substrait_sorts(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::make_renamed_schema;
     use crate::extensions::Extensions;
     use crate::logical_plan::consumer::DefaultSubstraitConsumer;
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::common::DFSchema;
+    use datafusion::error::Result;
     use datafusion::execution::SessionState;
     use datafusion::prelude::SessionContext;
-    use std::sync::LazyLock;
+    use datafusion::sql::TableReference;
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock};
 
     pub(crate) static TEST_SESSION_STATE: LazyLock<SessionState> =
         LazyLock::new(|| SessionContext::default().state());

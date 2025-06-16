@@ -65,18 +65,20 @@ pub async fn from_substrait_plan_with_consumer(
                             // Nothing to do if the schema is already equivalent
                             return Ok(plan);
                         }
-                        let mut file = File::create("preplan_dump.txt")?;
-                        write!(file, "PrePlan: {:#?}", plan)?;
-                        println!();
+
                         match plan {
                             // If the last node of the plan produces expressions, bake the renames into those expressions.
                             // This isn't necessary for correctness, but helps with roundtrip tests.
-                            LogicalPlan::Projection(p) => {
-                                println!("PROJECT PLAN");
-                                Ok(LogicalPlan::Projection(Projection::try_new(rename_expressions(p.expr, p.input.schema(), renamed_schema.fields())?, p.input)?))
+                            LogicalPlan::Projection(p) => {    
+                                let proj =  Projection::try_new(rename_expressions(p.expr, p.input.schema(), renamed_schema.fields())?, p.input)?;  
+                                let logical_proj = LogicalPlan::Projection(proj);
+                                let mut file = File::create("logical_pre_plan_dump.txt")?;
+                                write!(file, "PrePlan: {:#?}", logical_proj)?;
+                                println!();
+                                Ok(logical_proj)
                             },
                             LogicalPlan::Aggregate(a) => {
-                                println!("AGGREGATE PLAN");
+
                                 let (group_fields, expr_fields) = renamed_schema.fields().split_at(a.group_expr.len());
                                 let new_group_exprs = rename_expressions(a.group_expr, a.input.schema(), group_fields)?;
                                 let new_aggr_exprs = rename_expressions(a.aggr_expr, a.input.schema(), expr_fields)?;

@@ -1160,7 +1160,8 @@ async fn join_coercion_unnamed() -> Result<()> {
 
     let filter = None;
     let join = right.join(left, JoinType::LeftAnti, &cols, &cols, filter)?;
-    let results = join.collect().await?;
+    println!("Logical PLan: \n{:#?}", join.logical_plan());
+    let results = join.collect().await?; // failing later in physcial planning it is replacing the relation names for some reason 
 
     assert_snapshot!(
         batches_to_sort_string(&results),
@@ -1174,6 +1175,41 @@ async fn join_coercion_unnamed() -> Result<()> {
     );
     Ok(())
 }
+
+
+// #[tokio::test]
+// async fn duplciate_qualified_reproducer() -> Result<()> {
+//     let ctx: SessionContext = SessionContext::new();
+
+//     // Test that join will coerce column types when necessary
+//     // even when the relations don't have unique names
+//     let left = ctx.read_batch(record_batch!(
+//         ("id", Int32, [1, 2, 3]),
+//         ("name", Utf8, ["a", "b", "c"])
+//     )?)?;
+//     let right = ctx.read_batch(record_batch!(
+//         ("id", Int32, [10, 3]),
+//         ("name", Utf8View, ["d", "c"]) // Utf8View is a different type
+//     )?)?;
+//     let cols = vec!["id"];
+
+//     let filter = None;
+//     let join = right.join(left, JoinType::Inner, &cols, &cols, filter)?;
+//     println!("Logical PLan: \n{:#?}", join.logical_plan());
+//     let results = join.collect().await?;
+
+//     assert_snapshot!(
+//         batches_to_sort_string(&results),
+//         @r###"
+//     +----+------+
+//     | id | name |
+//     +----+------+
+//     | 10 | d    |
+//     +----+------+
+//     "###
+//     );
+//     Ok(())
+// }
 
 #[tokio::test]
 async fn join_on() -> Result<()> {

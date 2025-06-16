@@ -695,15 +695,12 @@ pub fn exprlist_to_fields<'a>(
     plan: &LogicalPlan,
 ) -> Result<Vec<(Option<TableReference>, Arc<Field>)>> {
     let input_schema = plan.schema();
+    //println!("Input schema: {:?}", input_schema);
 
     exprs
         .into_iter()
         .map(|e| {
             let (qualifier, field) = e.to_field(input_schema)?;
-            println!(
-                "[exprlist_to_fields] Expr: {:?}, Qualifier: {:?}, Field Name: {}",
-                e, qualifier, field.name()
-            );
             Ok((qualifier, field))
         })
         .collect()

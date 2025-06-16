@@ -1528,6 +1528,9 @@ pub fn build_join_schema(
     right: &DFSchema,
     join_type: &JoinType,
 ) -> Result<DFSchema> {
+    // println!("Join type: {:?}", join_type);
+    // println!("Left schema: {:?}", left);
+    // println!("Right schema: {:?}", right);
     fn nullify_fields<'a>(
         fields: impl Iterator<Item = (Option<&'a TableReference>, &'a Arc<Field>)>,
     ) -> Vec<(Option<TableReference>, Arc<Field>)> {
@@ -1609,6 +1612,7 @@ pub fn build_join_schema(
         .into_iter()
         .chain(right.metadata().clone())
         .collect();
+
     let dfschema = DFSchema::new_with_metadata(qualified_fields, metadata)?;
     dfschema.with_functional_dependencies(func_dependencies)
 }
@@ -1888,7 +1892,8 @@ pub fn wrap_projection_for_join_if_necessary(
     join_keys: &[Expr],
     input: LogicalPlan,
 ) -> Result<(LogicalPlan, Vec<Column>, bool)> {
-    let input_schema = input.schema();
+    //println!("Wrap projection for join schema: {:?}", input.schema()); left -> value, tags.   right -> tags_get_value (host)
+    let input_schema = input.schema(); // 
     let alias_join_keys: Vec<Expr> = join_keys
         .iter()
         .map(|key| {
@@ -1919,7 +1924,7 @@ pub fn wrap_projection_for_join_if_necessary(
             .collect::<Vec<_>>();
         let join_key_items = alias_join_keys
             .iter()
-            .flat_map(|expr| expr.try_as_col().is_none().then_some(expr))
+            .flat_map(|expr| expr.try_as_col().is_none().then_some(expr)) // this addition is what causes the duplicate thing later for the column utf8 (...)
             .cloned()
             .collect::<HashSet<Expr>>();
         projection.extend(join_key_items);

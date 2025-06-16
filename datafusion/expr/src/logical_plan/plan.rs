@@ -24,6 +24,7 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
+
 use super::dml::CopyTo;
 use super::invariants::{
     assert_always_invariants_at_current_node, assert_executable_invariants,
@@ -2144,6 +2145,8 @@ impl Projection {
         input: Arc<LogicalPlan>,
         schema: DFSchemaRef,
     ) -> Result<Self> {
+        //println!("PROJECTION SCHEMA:{}", schema.sch());
+
         #[expect(deprecated)]
         if !expr.iter().any(|e| matches!(e, Expr::Wildcard { .. }))
             && expr.len() != schema.fields().len()
@@ -2182,14 +2185,14 @@ impl Projection {
 /// produced by the projection operation. If the schema computation is successful,
 /// the `Result` will contain the schema; otherwise, it will contain an error.
 pub fn projection_schema(input: &LogicalPlan, exprs: &[Expr]) -> Result<Arc<DFSchema>> {
-    println!("BEFORE QUALIFIERS: {:?}", input.schema().show_field_qualifiers());
+    //println!("BEFORE QUALIFIERS: {:?}", input.schema().show_field_qualifiers());
     let metadata = input.schema().metadata().clone();
     let schema =
         DFSchema::new_with_metadata(exprlist_to_fields(exprs, input)?, metadata)?
             .with_functional_dependencies(calc_func_dependencies_for_project(
                 exprs, input,
             )?)?;
-    println!("AFTER QUALIFIERS: {:?}", schema.show_field_qualifiers());
+    //println!("AFTER QUALIFIERS: {:?}", schema.show_field_qualifiers());
     Ok(Arc::new(schema))
 }
 
@@ -3676,6 +3679,44 @@ fn calc_func_dependencies_for_project(
         .project_functional_dependencies(&proj_indices, exprs.len()))
 }
 
+// Substrait PrecisionTimestampTz indicates that the timestamp is relative to UTC, which
+// is the same as the expectation for any non-empty timezone in DF, so any non-empty timezone
+// results in correct points on the timeline, and we pick UTC as a reasonable default.
+// However, DF uses the timezone also for some arithmetic and display purposes (see e.g.
+// https://github.com/apache/arrow-rs/blob/ee5694078c86c8201549654246900a4232d531a9/arrow-cast/src/cast/mod.rs#L1749).
+pub(super) const DEFAULT_TIMEZONE: &str = "UTC";
+
+/// (Re)qualify the sides of a join if needed, i.e. if the columns from one side would otherwise
+/// conflict with the columns from the other.
+/// Substrait doesn't currently allow specifying aliases, neither for columns nor for tables. For
+/// Substrait the names don't matter since it only refers to columns by indices, however DataFusion
+/// requires columns to be uniquely identifiable, in some places (see e.g. DFSchema::check_names).
+pub(super) fn requalify_sides_if_needed(
+    left: LogicalPlanBuilder,
+    right: LogicalPlanBuilder,
+) -> Result<(LogicalPlanBuilder, LogicalPlanBuilder)> {
+    let left_cols = left.schema().columns();
+    let right_cols = right.schema().columns();
+    println!("LEFT SCHEMA {:?}", left.schema());
+    println!("RIGHT SCHEMA {:?}", right.schema());
+    if left_cols.iter().any(|l| {
+        right_cols.iter().any(|r| {
+            l == r || (l.name == r.name && (l.relation.is_none() || r.relation.is_none())) // we should check here if qualifiers where already there
+        })
+    }) {
+
+        println!("Requalifying join sides to avoid column name conflicts");
+        // These names have no connection to the original plan, but they'll make the columns
+        // (mostly) unique.
+        Ok((
+            left.alias(TableReference::bare("left"))?,
+            right.alias(TableReference::bare("right"))?,
+        ))
+    } else {
+        Ok((left, right))
+    }
+}
+
 /// Sorts its input according to a list of sort expressions.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub struct Sort {
@@ -3720,15 +3761,33 @@ impl Join {
             LogicalPlan::Join(join) => join,
             _ => return plan_err!("Could not create join with project input"),
         };
-
+       
         let on: Vec<(Expr, Expr)> = column_on
             .0
             .into_iter()
             .zip(column_on.1)
             .map(|(l, r)| (Expr::Column(l), Expr::Column(r)))
             .collect();
+
+        let mut left_sch = LogicalPlanBuilder::from(
+            Arc::clone(&left),
+        );
+        let mut right_sch = LogicalPlanBuilder::from(
+            Arc::clone(&right),
+        );
+        
+        // Anti and semi joins schemas are just one of the sides, so we don't need to requalify them. 
+        // since its not possible to have duplicates on either side at this point
+        if !(original_join.join_type == JoinType::LeftAnti || 
+            original_join.join_type == JoinType::LeftSemi || 
+            original_join.join_type == JoinType::RightAnti ||
+            original_join.join_type == JoinType::RightSemi) {
+            (left_sch, right_sch) =  requalify_sides_if_needed(left_sch.clone(), right_sch.clone())?; 
+        }
+
+        
         let join_schema =
-            build_join_schema(left.schema(), right.schema(), &original_join.join_type)?;
+            build_join_schema(left_sch.schema(), right_sch.schema(), &original_join.join_type)?;
 
         Ok(Join {
             left,

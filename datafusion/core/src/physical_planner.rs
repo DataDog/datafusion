@@ -66,8 +66,7 @@ use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeVisitor,
 };
 use datafusion_common::{
-    exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_err, DFSchema,
-    ScalarValue,
+exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_err, DFSchema, ScalarValue
 };
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_expr::dml::{CopyTo, InsertOp};
@@ -78,9 +77,7 @@ use datafusion_expr::expr::{
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessary;
 use datafusion_expr::{
-    Analyze, DescribeTable, DmlStatement, Explain, ExplainFormat, Extension, FetchType,
-    Filter, JoinType, RecursiveQuery, SkipType, StringifiedPlan, WindowFrame,
-    WindowFrameBound, WriteOp,
+    Analyze, DescribeTable, DmlStatement, Explain, ExplainFormat, Extension, FetchType, Filter, JoinType, RecursiveQuery, SkipType, StringifiedPlan, SubqueryAlias, WindowFrame, WindowFrameBound, WriteOp
 };
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::expressions::{Column, Literal};
@@ -185,10 +182,10 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
             return Ok(plan);
         }
         let plan = self
-            .create_initial_plan(logical_plan, session_state)
+            .create_initial_plan(logical_plan, session_state) //fails  here
             .await?;
-
-        self.optimize_physical_plan(plan, session_state, |_, _| {})
+            
+            self.optimize_physical_plan(plan, session_state, |_, _| {})
     }
 
     /// Create a physical expression from a logical expression
@@ -762,13 +759,16 @@ impl DefaultPhysicalPlanner {
                     Arc::clone(&physical_input_schema),
                 )?)
             }
-            LogicalPlan::Projection(Projection { input, expr, .. }) => self
-                .create_project_physical_exec(
+            LogicalPlan::Projection(Projection { input, expr, .. }) => {
+                let result = self.create_project_physical_exec(
                     session_state,
                     children.one()?,
                     input,
                     expr,
-                )?,
+                );
+
+                result?
+            },
             LogicalPlan::Filter(Filter {
                 predicate, input, ..
             }) => {
@@ -901,35 +901,39 @@ impl DefaultPhysicalPlanner {
                 schema: join_schema,
                 ..
             }) => {
+                // println!("join_schema : {:?}", join_schema); // "value" "tags", "tags_get_values(tags,Utf8(\"host\"))"
+                // println!("left.schema() : {:?}", left.schema());  "value" "tags"
+                // println!("right.schema() : {:?}", right.schema()); "tags_get_values(tags,Utf8(\"host\"))"
                 let null_equals_null = *null_equals_null;
 
                 let [physical_left, physical_right] = children.two()?;
 
-                // If join has expression equijoin keys, add physical projection.
-                let has_expr_join_key = keys.iter().any(|(l, r)| {
+                // If join has expression equijoin keys, add physical projection since there are common columns
+                let has_expr_join_key = keys.iter().any(|(l, r)| { // for our case it is an expresion because the key is  BinaryExpr
                     !(matches!(l, Expr::Column(_)) && matches!(r, Expr::Column(_)))
                 });
+            
                 let (new_logical, physical_left, physical_right) = if has_expr_join_key {
                     // TODO: Can we extract this transformation to somewhere before physical plan
                     //       creation?
+                    println!("This is a join with an equijoin key");
                     let (left_keys, right_keys): (Vec<_>, Vec<_>) =
                         keys.iter().cloned().unzip();
 
-                    let (left, left_col_keys, left_projected) =
+                    let (left, left_col_keys, left_projected) = // this does wrap it in a projection
                         wrap_projection_for_join_if_necessary(
                             &left_keys,
                             left.as_ref().clone(),
                         )?;
-                    let (right, right_col_keys, right_projected) =
+                    let (right, right_col_keys, right_projected) = // this one doesn't
                         wrap_projection_for_join_if_necessary(
                             &right_keys,
                             right.as_ref().clone(),
                         )?;
                     let column_on = (left_col_keys, right_col_keys);
-
-                    let left = Arc::new(left);
+                    let left = Arc::new(left); // modified left & right fields
                     let right = Arc::new(right);
-                    let new_join = LogicalPlan::Join(Join::try_new_with_project_input(
+                    let new_join = LogicalPlan::Join(Join::try_new_with_project_input( // it was failing here
                         node,
                         Arc::clone(&left),
                         Arc::clone(&right),
@@ -964,12 +968,13 @@ impl DefaultPhysicalPlanner {
                         )?,
                         _ => physical_right,
                     };
+                    //println!("NEW JOIN SCHEMA {:?}", new_join.schema());
 
                     // Remove temporary projected columns
                     if left_projected || right_projected {
                         let final_join_result =
                             join_schema.iter().map(Expr::from).collect::<Vec<_>>();
-                        let projection = LogicalPlan::Projection(Projection::try_new(
+                        let projection = LogicalPlan::Projection(Projection::try_new( // now it fails here
                             final_join_result,
                             Arc::new(new_join),
                         )?);

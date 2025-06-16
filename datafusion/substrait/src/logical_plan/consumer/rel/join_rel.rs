@@ -14,9 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-use crate::logical_plan::consumer::utils::requalify_sides_if_needed;
-use crate::logical_plan::consumer::SubstraitConsumer;
+use crate::logical_plan::consumer::{requalify_sides_if_needed, SubstraitConsumer};
 use datafusion::common::{not_impl_err, plan_err, Column, JoinType};
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{
@@ -40,14 +38,13 @@ pub async fn from_join_rel(
     );
     
     //println!("Left: {:?}, Right: {:?}", left.schema(), right.schema());
-    println!();
+    //println!();
     let (left, right) = requalify_sides_if_needed(left, right)?;
 
     let join_type = from_substrait_jointype(join.r#type)?;
     // The join condition expression needs full input schema and not the output schema from join since we lose columns from
     // certain join types such as semi and anti joins
     let in_join_schema = left.schema().join(right.schema())?;
-
     // If join expression exists, parse the `on` condition expression, build join and return
     // Otherwise, build join with only the filter, without join keys
     match &join.expression.as_ref() {
