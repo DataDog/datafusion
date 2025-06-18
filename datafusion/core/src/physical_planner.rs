@@ -86,6 +86,7 @@ use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_plan::execution_plan::InvariantLevel;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::unnest::ListUnnest;
+use datafusion_sql::TableReference;
 
 use crate::schema_equivalence::schema_satisfied_by;
 use async_trait::async_trait;
@@ -892,8 +893,8 @@ impl DefaultPhysicalPlanner {
 
             // 2 Children
             LogicalPlan::Join(Join {
-                left,
-                right,
+                left: original_left,
+                right: original_right,
                 on: keys,
                 filter,
                 join_type,
@@ -904,6 +905,7 @@ impl DefaultPhysicalPlanner {
                 // println!("join_schema : {:?}", join_schema); // "value" "tags", "tags_get_values(tags,Utf8(\"host\"))"
                 // println!("left.schema() : {:?}", left.schema());  "value" "tags"
                 // println!("right.schema() : {:?}", right.schema()); "tags_get_values(tags,Utf8(\"host\"))"
+
                 let null_equals_null = *null_equals_null;
 
                 let [physical_left, physical_right] = children.two()?;
@@ -916,30 +918,33 @@ impl DefaultPhysicalPlanner {
                 let (new_logical, physical_left, physical_right) = if has_expr_join_key {
                     // TODO: Can we extract this transformation to somewhere before physical plan
                     //       creation?
-                    println!("This is a join with an equijoin key");
+                    // println!("This is a join with an equijoin key");
                     let (left_keys, right_keys): (Vec<_>, Vec<_>) =
                         keys.iter().cloned().unzip();
 
                     let (left, left_col_keys, left_projected) = // this does wrap it in a projection
                         wrap_projection_for_join_if_necessary(
                             &left_keys,
-                            left.as_ref().clone(),
+                            original_left.as_ref().clone(),
                         )?;
                     let (right, right_col_keys, right_projected) = // this one doesn't
                         wrap_projection_for_join_if_necessary(
                             &right_keys,
-                            right.as_ref().clone(),
+                            original_right.as_ref().clone(),
                         )?;
                     let column_on = (left_col_keys, right_col_keys);
                     let left = Arc::new(left); // modified left & right fields
                     let right = Arc::new(right);
-                    let new_join = LogicalPlan::Join(Join::try_new_with_project_input( // it was failing here
+                    
+                    let (new_join, requalified) = Join::try_new_with_project_input( // it was failing here
                         node,
                         Arc::clone(&left),
                         Arc::clone(&right),
                         column_on,
-                    )?);
+                    )?;
 
+                    let new_join = LogicalPlan::Join(new_join);
+       
                     // If inputs were projected then create ExecutionPlan for these new
                     // LogicalPlan nodes.
                     let physical_left = match (left_projected, left.as_ref()) {
@@ -968,12 +973,21 @@ impl DefaultPhysicalPlanner {
                         )?,
                         _ => physical_right,
                     };
-                    //println!("NEW JOIN SCHEMA {:?}", new_join.schema());
-
+                    
                     // Remove temporary projected columns
                     if left_projected || right_projected {
+                        // This qualification is only valid for inner joins since by definition the join_schema will always be the result 
+                        // of the left and right side combined. Also we should qualify schemas in case sides have been previosuly 
+                        // requalified on try_new_with_project_input, this with the aim to determine later the 
+                        // nullability and datatypes by looking into both sides of the schema, avoiding ambiguity errors.
+                        let qualified_join_schema = if *join_type == JoinType::Inner && requalified {
+                            Arc::new(qualify_join_schema(join_schema, original_left, original_right)?)
+                        } else {
+                            Arc::clone(join_schema)
+                        };
+
                         let final_join_result =
-                            join_schema.iter().map(Expr::from).collect::<Vec<_>>();
+                            qualified_join_schema.iter().map(Expr::from).collect::<Vec<_>>();
                         let projection = LogicalPlan::Projection(Projection::try_new( // now it fails here
                             final_join_result,
                             Arc::new(new_join),
@@ -1314,6 +1328,64 @@ impl DefaultPhysicalPlanner {
         }
     }
 }
+
+
+/// Qualify each field of the schema on the fly: 
+pub fn qualify_join_schema(
+    join_schema: &DFSchema,
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+) -> Result<DFSchema> {
+    let left_fields = left.schema().fields();
+    let right_fields = right.schema().fields();
+    let join_fields = join_schema.fields();
+
+    // 1. Validate lengths
+    if join_fields.len() != left_fields.len() + right_fields.len() {
+        return Err(DataFusionError::Plan(format!(
+            "Join schema field count mismatch: {} (join) != {} (left) + {} (right)",
+            join_fields.len(),
+            left_fields.len(),
+            right_fields.len()
+        )));
+    }
+
+    // 2. Validate field names match
+    for (i, field) in join_fields.iter().enumerate() {
+        let expected_field = if i < left_fields.len() {
+            &left_fields[i]
+        } else {
+            &right_fields[i - left_fields.len()]
+        };
+
+        if field.name() != expected_field.name() {
+            return Err(DataFusionError::Plan(format!(
+                "Field name mismatch at index {}: '{}' (join) != '{}' (input)",
+                i,
+                field.name(),
+                expected_field.name()
+            )));
+        }
+    }
+
+    // 3. Build qualifiers:  left → "left", right → "right"
+    //     (Replace these literals with real table names if you have them.)
+    let qualifiers= join_fields
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            if i < left_fields.len() {
+                Some(TableReference::Bare { table: Arc::from("left") })
+            } else {
+                Some(TableReference::Bare { table: Arc::from("right") })
+            }
+        })
+        .collect();
+
+    // 4️⃣  Return a *new* DFSchema (no mutation of the original)
+    join_schema.with_field_specific_qualified_schema(qualifiers)
+}
+
 
 /// Expand and align a GROUPING SET expression.
 /// (see <https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS>)

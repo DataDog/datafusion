@@ -2145,7 +2145,6 @@ impl Projection {
         input: Arc<LogicalPlan>,
         schema: DFSchemaRef,
     ) -> Result<Self> {
-        //println!("PROJECTION SCHEMA:{}", schema.sch());
 
         #[expect(deprecated)]
         if !expr.iter().any(|e| matches!(e, Expr::Wildcard { .. }))
@@ -2185,14 +2184,29 @@ impl Projection {
 /// produced by the projection operation. If the schema computation is successful,
 /// the `Result` will contain the schema; otherwise, it will contain an error.
 pub fn projection_schema(input: &LogicalPlan, exprs: &[Expr]) -> Result<Arc<DFSchema>> {
-    //println!("BEFORE QUALIFIERS: {:?}", input.schema().show_field_qualifiers());
+
     let metadata = input.schema().metadata().clone();
-    let schema =
-        DFSchema::new_with_metadata(exprlist_to_fields(exprs, input)?, metadata)?
-            .with_functional_dependencies(calc_func_dependencies_for_project(
-                exprs, input,
-            )?)?;
-    //println!("AFTER QUALIFIERS: {:?}", schema.show_field_qualifiers());
+
+    let fields = exprlist_to_fields(exprs, input).map_err(|e| {
+        // println!("ERROR in exprlist_to_fields: {:?}", e);
+        e
+    })?;
+
+    let schema = DFSchema::new_with_metadata(fields, metadata).map_err(|e| {
+        // println!("ERROR in DFSchema::new_with_metadata: {:?}", e);
+        e
+    })?;
+
+    let func_deps = calc_func_dependencies_for_project(exprs, input).map_err(|e| {
+        // println!("ERROR in calc_func_dependencies_for_project: {:?}", e);
+        e
+    })?;
+
+    let schema = schema.with_functional_dependencies(func_deps).map_err(|e| {
+        // println!("ERROR in with_functional_dependencies: {:?}", e);
+        e
+    })?;
+
     Ok(Arc::new(schema))
 }
 
@@ -3694,26 +3708,23 @@ pub(super) const DEFAULT_TIMEZONE: &str = "UTC";
 pub(super) fn requalify_sides_if_needed(
     left: LogicalPlanBuilder,
     right: LogicalPlanBuilder,
-) -> Result<(LogicalPlanBuilder, LogicalPlanBuilder)> {
+) -> Result<(LogicalPlanBuilder, LogicalPlanBuilder, bool)> {
     let left_cols = left.schema().columns();
     let right_cols = right.schema().columns();
-    println!("LEFT SCHEMA {:?}", left.schema());
-    println!("RIGHT SCHEMA {:?}", right.schema());
     if left_cols.iter().any(|l| {
         right_cols.iter().any(|r| {
-            l == r || (l.name == r.name && (l.relation.is_none() || r.relation.is_none())) // we should check here if qualifiers where already there
+            l == r || (l.name == r.name && (l.relation.is_none() || r.relation.is_none()))
         })
     }) {
-
-        println!("Requalifying join sides to avoid column name conflicts");
         // These names have no connection to the original plan, but they'll make the columns
         // (mostly) unique.
         Ok((
             left.alias(TableReference::bare("left"))?,
             right.alias(TableReference::bare("right"))?,
+            true
         ))
     } else {
-        Ok((left, right))
+        Ok((left, right, false))
     }
 }
 
@@ -3756,7 +3767,7 @@ impl Join {
         left: Arc<LogicalPlan>,
         right: Arc<LogicalPlan>,
         column_on: (Vec<Column>, Vec<Column>),
-    ) -> Result<Self> {
+    ) -> Result<(Self, bool)> {
         let original_join = match original {
             LogicalPlan::Join(join) => join,
             _ => return plan_err!("Could not create join with project input"),
@@ -3775,30 +3786,33 @@ impl Join {
         let mut right_sch = LogicalPlanBuilder::from(
             Arc::clone(&right),
         );
+
+        let mut requalified = false;
         
-        // Anti and semi joins schemas are just one of the sides, so we don't need to requalify them. 
+        // Anti and semi joins schemas come from just one of the sides, so we don't need to requalify them. 
         // since its not possible to have duplicates on either side at this point
         if !(original_join.join_type == JoinType::LeftAnti || 
             original_join.join_type == JoinType::LeftSemi || 
             original_join.join_type == JoinType::RightAnti ||
             original_join.join_type == JoinType::RightSemi) {
-            (left_sch, right_sch) =  requalify_sides_if_needed(left_sch.clone(), right_sch.clone())?; 
+            (left_sch, right_sch, requalified) =  requalify_sides_if_needed(left_sch.clone(), right_sch.clone())?; 
         }
 
         
         let join_schema =
-            build_join_schema(left_sch.schema(), right_sch.schema(), &original_join.join_type)?;
+            build_join_schema(left_sch.schema(), right_sch.schema(), &original_join.join_type)?; // aqui para inner joins por ejemplo hacemos chain del schema
 
-        Ok(Join {
-            left,
-            right,
+        
+        Ok((Join {
+            left: Arc::new(left_sch.build()?),
+            right: Arc::new(right_sch.build()?),
             on,
             filter: original_join.filter.clone(),
             join_type: original_join.join_type,
             join_constraint: original_join.join_constraint,
             schema: Arc::new(join_schema),
             null_equals_null: original_join.null_equals_null,
-        })
+        }, requalified))
     }
 }
 

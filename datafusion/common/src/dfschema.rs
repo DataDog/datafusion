@@ -23,10 +23,11 @@ use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::Arc;
 
+
+
 use crate::error::{DataFusionError, Result, _plan_err, _schema_err};
 use crate::{
-    field_not_found, unqualified_field_not_found, Column, FunctionalDependencies,
-    SchemaError, TableReference,
+    field_not_found, unqualified_field_not_found, Column, FunctionalDependencies, SchemaError, TableReference
 };
 
 use arrow::compute::can_cast_types;
@@ -144,7 +145,6 @@ impl DFSchema {
         qualified_fields: Vec<(Option<TableReference>, Arc<Field>)>,
         metadata: HashMap<String, String>,
     ) -> Result<Self> {
-
         let (qualifiers, fields): (Vec<Option<TableReference>>, Vec<Arc<Field>>) =
             qualified_fields.clone().into_iter().unzip();
 
@@ -206,12 +206,25 @@ impl DFSchema {
         Ok(dfschema)
     }
 
+    /// Qualify each field of the schema on the fly: 
+    pub fn with_field_specific_qualified_schema(
+        &self,
+        qualifiers: Vec<Option<TableReference>>,
+    ) -> Result<Self> {
+        if qualifiers.len() != self.fields().len() {
+            return  Err(DataFusionError::Plan("Number of qualifiers must match number of fields".to_string()));
+        }
+        Ok(DFSchema {
+            inner: Arc::clone(&self.inner),
+            field_qualifiers: qualifiers,
+            functional_dependencies: self.functional_dependencies.clone(),
+        })
+    }
+
     /// Check if the schema have some fields with the same name
     pub fn check_names(&self) -> Result<()> {
         let mut qualified_names = BTreeSet::new();
         let mut unqualified_names = BTreeSet::new();
-        println!("Fields: {:?}", self.inner.fields().iter().map(|f| f.name()));
-        println!("Fields qualifiers: {:?}", self.field_qualifiers);
 
         for (field, qualifier) in self.inner.fields().iter().zip(&self.field_qualifiers) {
             if let Some(qualifier) = qualifier {
@@ -500,7 +513,8 @@ impl DFSchema {
 
     /// Find the field with the given name
     pub fn field_with_unqualified_name(&self, name: &str) -> Result<&Field> {
-        self.qualified_field_with_unqualified_name(name)
+        self.qualified_field_with_unqualified_name(name)// y aqui no va a saber 
+        //si es del left or right por eso sale ambigous porque no sabe de  qe l;ado elegir porque Expr no tiene el qualifier left o right :/ 
             .map(|(_, field)| field)
     }
 
@@ -806,10 +820,6 @@ impl DFSchema {
         }
     }
 
-    pub fn show_field_qualifiers(&self) -> Vec<Option<&TableReference>> {
-        self.field_qualifiers.iter().map(|q| q.as_ref()).collect()
-    }
-
     /// Replace all field qualifier with new value in schema
     pub fn replace_qualifier(self, qualifier: impl Into<TableReference>) -> Self {
         let qualifier = qualifier.into();
@@ -1020,6 +1030,7 @@ impl ExprSchema for DFSchema {
     }
 
     fn data_type_and_nullable(&self, col: &Column) -> Result<(&DataType, bool)> {
+        //println!("COL!");
         let field = self.field_from_column(col)?;
         Ok((field.data_type(), field.is_nullable()))
     }
