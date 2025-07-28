@@ -284,8 +284,6 @@ pub(crate) fn to_substrait_type(
                 precision: *p as i32,
             })),
         }),
-        // TODO: DataDog-specific workaround, don't commit upstream
-        DataType::Dictionary(_, dt) => to_substrait_type(dt, nullable),
         _ => not_impl_err!("Unsupported cast type: {dt:?}"),
     }
 }
