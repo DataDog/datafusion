@@ -17,8 +17,8 @@
 
 pub use crate::display::{DefaultDisplay, DisplayAs, DisplayFormatType, VerboseDisplay};
 use crate::filter_pushdown::{
-    ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
-    FilterPushdownPropagation, PushedDownPredicate,
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+    FilterPushdownPropagation,
 };
 pub use crate::metrics::Metric;
 pub use crate::ordering::InputOrderMode;
@@ -33,7 +33,6 @@ pub use datafusion_physical_expr::window::WindowExpr;
 pub use datafusion_physical_expr::{
     expressions, Distribution, Partitioning, PhysicalExpr,
 };
-use itertools::Itertools;
 
 use std::any::Any;
 use std::fmt::Debug;
@@ -194,6 +193,31 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>>;
+
+    /// Reset any internal state within this [`ExecutionPlan`].
+    ///
+    /// This method is called when an [`ExecutionPlan`] needs to be re-executed,
+    /// such as in recursive queries. Unlike [`ExecutionPlan::with_new_children`], this method
+    /// ensures that any stateful components (e.g., [`DynamicFilterPhysicalExpr`])
+    /// are reset to their initial state.
+    ///
+    /// The default implementation simply calls [`ExecutionPlan::with_new_children`] with the existing children,
+    /// effectively creating a new instance of the [`ExecutionPlan`] with the same children but without
+    /// necessarily resetting any internal state. Implementations that require resetting of some
+    /// internal state should override this method to provide the necessary logic.
+    ///
+    /// This method should *not* reset state recursively for children, as it is expected that
+    /// it will be called from within a walk of the execution plan tree so that it will be called on each child later
+    /// or was already called on each child.
+    ///
+    /// Note to implementers: unlike [`ExecutionPlan::with_new_children`] this method does not accept new children as an argument,
+    /// thus it is expected that any cached plan properties will remain valid after the reset.
+    ///
+    /// [`DynamicFilterPhysicalExpr`]: datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        let children = self.children().into_iter().cloned().collect();
+        self.with_new_children(children)
+    }
 
     /// If supported, attempt to increase the partitioning of this `ExecutionPlan` to
     /// produce `target_partitions` partitions.
@@ -521,19 +545,10 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
-        // Default implementation: mark all filters as unsupported for all children
-        let mut desc = FilterDescription::new();
-        let child_filters = parent_filters
-            .iter()
-            .map(|f| PushedDownPredicate::unsupported(Arc::clone(f)))
-            .collect_vec();
-        for _ in 0..self.children().len() {
-            desc = desc.with_child(ChildFilterDescription {
-                parent_filters: child_filters.clone(),
-                self_filters: vec![],
-            });
-        }
-        Ok(desc)
+        Ok(FilterDescription::all_unsupported(
+            &parent_filters,
+            &self.children(),
+        ))
     }
 
     /// Handle the result of a child pushdown.
