@@ -124,8 +124,7 @@ impl Eq for DynamicFilterPhysicalExpr {}
 
 impl Display for DynamicFilterPhysicalExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.current().expect("Failed to get current expression");
-        write!(f, "DynamicFilterPhysicalExpr [ {inner} ]")
+        self.render(f, |expr, f| write!(f, "{expr}"))
     }
 }
 
@@ -199,6 +198,11 @@ impl DynamicFilterPhysicalExpr {
             // If we don't have any remapped children, just return the expression
             Ok(Arc::clone(&expr))
         }
+    }
+
+    /// Get the current generation of the expression.
+    fn current_generation(&self) -> u64 {
+        self.inner.read().generation
     }
 
     /// Get the current expression.
@@ -288,6 +292,26 @@ impl DynamicFilterPhysicalExpr {
         let _ = rx
             .wait_for(|state| matches!(state, FilterState::Complete { .. }))
             .await;
+    }
+    
+    fn render(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        render_expr: impl FnOnce(
+            Arc<dyn PhysicalExpr>,
+            &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result,
+    ) -> std::fmt::Result {
+        let inner = self.current().map_err(|_| std::fmt::Error)?;
+        let current_generation = self.current_generation();
+        write!(f, "DynamicFilter [ ")?;
+        if current_generation == 1 {
+            write!(f, "empty")?;
+        } else {
+            render_expr(inner, f)?;
+        }
+
+        write!(f, " ]")
     }
 }
 
@@ -379,8 +403,7 @@ impl PhysicalExpr for DynamicFilterPhysicalExpr {
     }
 
     fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.current().map_err(|_| std::fmt::Error)?;
-        inner.fmt_sql(f)
+        self.render(f, |expr, f| expr.fmt_sql(f))
     }
 
     fn snapshot(&self) -> Result<Option<Arc<dyn PhysicalExpr>>> {
