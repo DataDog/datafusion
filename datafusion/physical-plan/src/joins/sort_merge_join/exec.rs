@@ -356,10 +356,10 @@ impl DisplayAs for SortMergeJoinExec {
                     "SortMergeJoin: join_type={:?}, on=[{}]{}",
                     self.join_type,
                     on,
-                    self.filter.as_ref().map_or("".to_string(), |f| format!(
-                        ", filter={}",
-                        f.expression()
-                    ))
+                    self.filter.as_ref().map_or_else(
+                        || "".to_string(),
+                        |f| format!(", filter={}", f.expression())
+                    )
                 )
             }
             DisplayFormatType::TreeRender => {
