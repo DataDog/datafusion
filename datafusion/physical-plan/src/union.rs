@@ -36,16 +36,18 @@ use crate::execution_plan::{
     boundedness_from_children, check_default_invariants, emission_type_from_children,
     InvariantLevel,
 };
+use crate::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use crate::metrics::BaselineMetrics;
 use crate::projection::{make_with_child, ProjectionExec};
 use crate::stream::ObservedStream;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
 use datafusion_common::{exec_err, internal_err, DataFusionError, Result};
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::{calculate_union, EquivalenceProperties};
+use datafusion_physical_expr::{calculate_union, EquivalenceProperties, PhysicalExpr};
 
 use futures::Stream;
 use itertools::Itertools;
@@ -187,10 +189,6 @@ impl ExecutionPlan for UnionExec {
             ))
     }
 
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        self.inputs.iter().collect()
-    }
-
     fn maintains_input_order(&self) -> Vec<bool> {
         // If the Union has an output ordering, it maintains at least one
         // child's ordering (i.e. the meet).
@@ -214,6 +212,14 @@ impl ExecutionPlan for UnionExec {
         } else {
             vec![false; self.inputs().len()]
         }
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false; self.children().len()]
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.inputs.iter().collect()
     }
 
     fn with_new_children(
@@ -293,10 +299,6 @@ impl ExecutionPlan for UnionExec {
         }
     }
 
-    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false; self.children().len()]
-    }
-
     fn supports_limit_pushdown(&self) -> bool {
         true
     }
@@ -320,6 +322,15 @@ impl ExecutionPlan for UnionExec {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Some(Arc::new(UnionExec::new(new_children))))
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
     }
 }
 
