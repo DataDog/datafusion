@@ -21,6 +21,7 @@ typ = "typ"
 datas = "datas"
 YOUY = "YOUY"
 lits = "lits"
+nteger = "nteger"
 
 # exposed to public API
 Serializeable = "Serializeable"
