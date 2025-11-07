@@ -3436,11 +3436,7 @@ mod tests {
 
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
         let hashes_buff = &mut vec![0; left.num_rows()];
-        let hashes = create_hashes(
-            &[Arc::clone(&left.columns()[0])],
-            &random_state,
-            hashes_buff,
-        )?;
+        let hashes = create_hashes([&left.columns()[0]], &random_state, hashes_buff)?;
 
         // Maps both values to both indices (1 and 2, representing input 0 and 1)
         // 0 -> (0, 1)
@@ -3469,11 +3465,7 @@ mod tests {
         let right_keys_values =
             key_column.evaluate(&right)?.into_array(right.num_rows())?;
         let mut hashes_buffer = vec![0; right.num_rows()];
-        create_hashes(
-            &[Arc::clone(&right_keys_values)],
-            &random_state,
-            &mut hashes_buffer,
-        )?;
+        create_hashes([&right_keys_values], &random_state, &mut hashes_buffer)?;
 
         let (l, r, _) = lookup_join_hashmap(
             &join_hash_map,
@@ -3507,11 +3499,7 @@ mod tests {
 
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
         let hashes_buff = &mut vec![0; left.num_rows()];
-        let hashes = create_hashes(
-            &[Arc::clone(&left.columns()[0])],
-            &random_state,
-            hashes_buff,
-        )?;
+        let hashes = create_hashes([&left.columns()[0]], &random_state, hashes_buff)?;
 
         hashmap_left.insert_unique(hashes[0], (hashes[0], 1u32), |(h, _)| *h);
         hashmap_left.insert_unique(hashes[0], (hashes[0], 2u32), |(h, _)| *h);
@@ -3534,11 +3522,7 @@ mod tests {
         let right_keys_values =
             key_column.evaluate(&right)?.into_array(right.num_rows())?;
         let mut hashes_buffer = vec![0; right.num_rows()];
-        create_hashes(
-            &[Arc::clone(&right_keys_values)],
-            &random_state,
-            &mut hashes_buffer,
-        )?;
+        create_hashes([&right_keys_values], &random_state, &mut hashes_buffer)?;
 
         let (l, r, _) = lookup_join_hashmap(
             &join_hash_map,
