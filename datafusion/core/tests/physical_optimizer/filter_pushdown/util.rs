@@ -64,6 +64,9 @@ impl FileOpener for TestOpener {
         _file: PartitionedFile,
     ) -> Result<FileOpenFuture> {
         let mut batches = self.batches.clone();
+        if self.batches.is_empty() {
+            return Ok((async { Ok(TestStream::new(vec![]).boxed()) }).boxed());
+        }
         if let Some(batch_size) = self.batch_size {
             let batch = concat_batches(&batches[0].schema(), &batches)?;
             let mut new_batches = Vec::new();
@@ -334,11 +337,12 @@ impl TestStream {
     /// least one entry in data (for the schema)
     pub fn new(data: Vec<RecordBatch>) -> Self {
         // check that there is at least one entry in data and that all batches have the same schema
-        assert!(!data.is_empty(), "data must not be empty");
-        assert!(
-            data.iter().all(|batch| batch.schema() == data[0].schema()),
-            "all batches must have the same schema"
-        );
+        if let Some(first) = data.first() {
+            assert!(
+                data.iter().all(|batch| batch.schema() == first.schema()),
+                "all batches must have the same schema"
+            );
+        }
         Self {
             data,
             ..Default::default()
