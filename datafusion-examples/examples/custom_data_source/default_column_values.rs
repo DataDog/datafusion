@@ -28,7 +28,8 @@ use async_trait::async_trait;
 use datafusion::assert_batches_eq;
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::DFSchema;
+use datafusion::common::tree_node::{Transformed, TransformedResult};
+use datafusion::common::{DFSchema, HashSet};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
@@ -38,7 +39,8 @@ use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::parquet::file::properties::WriterProperties;
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
+use datafusion::physical_expr::{PhysicalExpr, PhysicalExprExt};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, lit};
 use datafusion_physical_expr_adapter::{
@@ -304,32 +306,76 @@ struct DefaultValuePhysicalExprAdapter {
 
 impl PhysicalExprAdapter for DefaultValuePhysicalExprAdapter {
     fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
-        // Pre-compute replacements for missing columns with default values
-        let mut replacements = HashMap::new();
-        for field in self.logical_file_schema.fields() {
-            // Skip columns that exist in physical schema
-            if self.physical_file_schema.index_of(field.name()).is_ok() {
-                continue;
-            }
+        // First try our custom default value injection for missing columns
+        let rewritten = expr
+            .transform_with_lambdas_params(|expr, lambdas_params| {
+                self.inject_default_values(
+                    expr,
+                    &self.logical_file_schema,
+                    &self.physical_file_schema,
+                    lambdas_params,
+                )
+            })
+            .data()?;
 
-            // Check if this missing column has a default value in metadata
-            if let Some(default_str) = field.metadata().get(DEFAULT_VALUE_METADATA_KEY) {
-                // Create a Utf8 ScalarValue from the string and cast it to the target type
-                let string_value = ScalarValue::Utf8(Some(default_str.to_string()));
-                let typed_value = string_value.cast_to(field.data_type())?;
-                replacements.insert(field.name().as_str(), typed_value);
+        // Then apply the default adapter as a fallback to handle standard schema differences
+        // like type casting, partition column handling, etc.
+        let default_adapter = if !self.partition_values.is_empty() {
+            self.default_adapter
+                .with_partition_values(self.partition_values.clone())
+        } else {
+            self.default_adapter.clone()
+        };
+
+        default_adapter.rewrite(rewritten)
+    }
+
+    fn with_partition_values(
+        &self,
+        partition_values: Vec<(FieldRef, ScalarValue)>,
+    ) -> Arc<dyn PhysicalExprAdapter> {
+        Arc::new(DefaultValuePhysicalExprAdapter {
+            logical_file_schema: self.logical_file_schema.clone(),
+            physical_file_schema: self.physical_file_schema.clone(),
+            default_adapter: self.default_adapter.clone(),
+            partition_values,
+        })
+    }
+}
+
+impl DefaultValuePhysicalExprAdapter {
+    fn inject_default_values(
+        &self,
+        expr: Arc<dyn PhysicalExpr>,
+        logical_file_schema: &Schema,
+        physical_file_schema: &Schema,
+        lambdas_params: &HashSet<String>,
+    ) -> Result<Transformed<Arc<dyn PhysicalExpr>>> {
+        if let Some(column) = expr.as_any().downcast_ref::<Column>() {
+            let column_name = column.name();
+
+            // Check if this column exists in the physical schema
+            if !lambdas_params.contains(column_name)
+                && physical_file_schema.index_of(column_name).is_err()
+            {
+                // Column is missing from physical schema, check if logical schema has a default
+                if let Ok(logical_field) =
+                    logical_file_schema.field_with_name(column_name)
+                {
+                    if let Some(default_value_str) =
+                        logical_field.metadata().get(DEFAULT_VALUE_METADATA_KEY)
+                    {
+                        // Create a string literal and wrap it in a cast expression
+                        let default_literal = self.create_default_value_expr(
+                            default_value_str,
+                            logical_field.data_type(),
+                        )?;
+                        return Ok(Transformed::yes(default_literal));
+                    }
+                }
             }
         }
 
-        // Replace columns with their default literals if any
-        let rewritten = if !replacements.is_empty() {
-            let refs: HashMap<_, _> = replacements.iter().map(|(k, v)| (*k, v)).collect();
-            replace_columns_with_literals(expr, &refs)?
-        } else {
-            expr
-        };
-
-        // Apply the default adapter as a fallback for other schema adaptations
-        self.default_adapter.rewrite(rewritten)
+        Ok(Transformed::no(expr))
     }
 }

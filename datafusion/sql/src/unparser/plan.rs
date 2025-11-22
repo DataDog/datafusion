@@ -41,7 +41,7 @@ use crate::utils::UNNEST_PLACEHOLDER;
 use datafusion_common::{
     Column, DataFusionError, Result, ScalarValue, TableReference, assert_or_internal_err,
     internal_err, not_impl_err,
-    tree_node::{TransformedResult, TreeNode},
+    tree_node::TransformedResult,
 };
 use datafusion_expr::expr::OUTER_REFERENCE_COLUMN_PREFIX;
 use datafusion_expr::{
@@ -1118,7 +1118,7 @@ impl Unparser<'_> {
                     .cloned()
                     .map(|expr| {
                         if let Some(ref mut rewriter) = filter_alias_rewriter {
-                            expr.rewrite(rewriter).data()
+                            expr.rewrite_with_lambdas_params(rewriter).data()
                         } else {
                             Ok(expr)
                         }
@@ -1185,7 +1185,7 @@ impl Unparser<'_> {
                             .cloned()
                             .map(|expr| {
                                 if let Some(ref mut rewriter) = alias_rewriter {
-                                    expr.rewrite(rewriter).data()
+                                    expr.rewrite_with_lambdas_params(rewriter).data()
                                 } else {
                                     Ok(expr)
                                 }

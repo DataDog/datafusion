@@ -22,13 +22,11 @@ use datafusion_common::{
     DFSchema, Dependency, Diagnostic, Result, Span, internal_datafusion_err,
     internal_err, not_impl_err, plan_datafusion_err, plan_err,
 };
-use datafusion_expr::{
-    Expr, ExprSchemable, SortExpr, WindowFrame, WindowFunctionDefinition,
-    arguments::ArgumentName,
-    expr,
-    expr::{NullTreatment, ScalarFunction, Unnest, WildcardOptions, WindowFunction},
-    planner::{PlannerResult, RawAggregateExpr, RawWindowExpr},
-};
+use datafusion_expr::expr::{Lambda, ScalarFunction, Unnest};
+use datafusion_expr::expr::{NullTreatment, WildcardOptions, WindowFunction};
+use datafusion_expr::planner::PlannerResult;
+use datafusion_expr::planner::{RawAggregateExpr, RawWindowExpr};
+use datafusion_expr::{expr, Expr, ExprSchemable, WindowFrame, WindowFunctionDefinition};
 use sqlparser::ast::{
     DuplicateTreatment, Expr as SQLExpr, Function as SQLFunction, FunctionArg,
     FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments,
@@ -776,6 +774,26 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     is_quoted: name.quote_style.is_some(),
                 };
                 Ok((expr, Some(arg_name)))
+            }
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(SQLExpr::Lambda(
+                sqlparser::ast::LambdaFunction { params, body },
+            ))) => {
+                let params = params
+                    .into_iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>();
+
+                Ok((
+                    Expr::Lambda(Lambda {
+                        params: params.clone(),
+                        body: Box::new(self.sql_expr_to_logical_expr(
+                            *body,
+                            schema,
+                            &mut planner_context.clone().with_lambda_parameters(params),
+                        )?),
+                    }),
+                    None,
+                ))
             }
             FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)) => {
                 let expr = self.sql_expr_to_logical_expr(arg, schema, planner_context)?;

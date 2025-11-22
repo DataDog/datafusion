@@ -24,6 +24,7 @@ use datafusion_common::{
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
 };
 use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
+use datafusion_expr::tree_node::TreeNodeRewriterWithPayload;
 use datafusion_expr::{Expr, LogicalPlan, Projection, Sort, SortExpr};
 use sqlparser::ast::Ident;
 
@@ -464,12 +465,17 @@ pub struct TableAliasRewriter<'a> {
     pub alias_name: TableReference,
 }
 
-impl TreeNodeRewriter for TableAliasRewriter<'_> {
+impl TreeNodeRewriterWithPayload for TableAliasRewriter<'_> {
     type Node = Expr;
+    type Payload<'a> = &'a datafusion_common::HashSet<String>;
 
-    fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
+    fn f_down(
+        &mut self,
+        expr: Expr,
+        lambdas_params: &datafusion_common::HashSet<String>,
+    ) -> Result<Transformed<Expr>> {
         match expr {
-            Expr::Column(column) => {
+            Expr::Column(column) if !column.is_lambda_parameter(lambdas_params) => {
                 if let Ok(field) = self.table_schema.field_with_name(&column.name) {
                     let new_column =
                         Column::new(Some(self.alias_name.clone()), field.name().clone());

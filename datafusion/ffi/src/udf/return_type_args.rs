@@ -18,10 +18,10 @@
 use abi_stable::StableAbi;
 use abi_stable::std_types::{ROption, RVec};
 use arrow_schema::FieldRef;
-use datafusion_common::scalar::ScalarValue;
-use datafusion_common::{DataFusionError, ffi_datafusion_err};
-use datafusion_expr::ReturnFieldArgs;
-use prost::Message;
+use datafusion::{
+    common::{exec_datafusion_err, exec_err}, error::DataFusionError, logical_expr::ReturnFieldArgs,
+    scalar::ScalarValue,
+};
 
 use crate::arrow_wrappers::WrappedSchema;
 use crate::util::{rvec_wrapped_to_vec_fieldref, vec_fieldref_to_rvec_wrapped};
@@ -38,6 +38,10 @@ impl TryFrom<ReturnFieldArgs<'_>> for FFI_ReturnFieldArgs {
     type Error = DataFusionError;
 
     fn try_from(value: ReturnFieldArgs) -> Result<Self, Self::Error> {
+        if value.lambdas.iter().any(|l| *l) {
+            return exec_err!("FFI_ReturnFieldArgs doesn't support lambdas")
+        }
+
         let arg_fields = vec_fieldref_to_rvec_wrapped(value.arg_fields)?;
         let scalar_arguments: Result<Vec<_>, Self::Error> = value
             .scalar_arguments
@@ -73,6 +77,7 @@ pub struct ForeignReturnFieldArgsOwned {
 pub struct ForeignReturnFieldArgs<'a> {
     arg_fields: &'a [FieldRef],
     scalar_arguments: Vec<Option<&'a ScalarValue>>,
+    lambdas: Vec<bool>, // currently always false, used to return a reference in From<&Self> for ReturnFieldArgs
 }
 
 impl TryFrom<&FFI_ReturnFieldArgs> for ForeignReturnFieldArgsOwned {
@@ -112,6 +117,7 @@ impl<'a> From<&'a ForeignReturnFieldArgsOwned> for ForeignReturnFieldArgs<'a> {
                 .iter()
                 .map(|opt| opt.as_ref())
                 .collect(),
+            lambdas: vec![false; value.arg_fields.len()]
         }
     }
 }
@@ -121,6 +127,7 @@ impl<'a> From<&'a ForeignReturnFieldArgs<'a>> for ReturnFieldArgs<'a> {
         ReturnFieldArgs {
             arg_fields: value.arg_fields,
             scalar_arguments: &value.scalar_arguments,
+            lambdas: &value.lambdas,
         }
     }
 }

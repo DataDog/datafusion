@@ -18,10 +18,13 @@
 //! Simplifier for Physical Expressions
 
 use arrow::datatypes::Schema;
-use datafusion_common::{Result, tree_node::TreeNode};
+use datafusion_common::{
+    tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
+    Result,
+};
 use std::sync::Arc;
 
-use crate::{PhysicalExpr, simplifier::not::simplify_not_expr};
+use crate::{PhysicalExpr, PhysicalExprExt};
 
 pub mod const_evaluator;
 pub mod not;
@@ -45,41 +48,25 @@ impl<'a> PhysicalExprSimplifier<'a> {
     }
 
     /// Simplify a physical expression
-    pub fn simplify(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
-        let mut current_expr = expr;
-        let mut count = 0;
-        let schema = self.schema;
-
-        while count < MAX_LOOP_COUNT {
-            count += 1;
-            let result = current_expr.transform(|node| {
+    pub fn simplify(
+        &mut self,
+        expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        return expr
+            .transform_up_with_schema(self.schema, |node, schema| {
+                // Apply unwrap cast optimization
                 #[cfg(test)]
                 let original_type = node.data_type(schema).unwrap();
-
-                // Apply NOT expression simplification first, then unwrap cast optimization,
-                // then constant expression evaluation
-                let rewritten = simplify_not_expr(&node, schema)?
-                    .transform_data(|node| {
-                        unwrap_cast::unwrap_cast_in_comparison(node, schema)
-                    })?
-                    .transform_data(|node| const_evaluator::simplify_const_expr(&node))?;
-
+                let unwrapped = unwrap_cast::unwrap_cast_in_comparison(node, schema)?;
                 #[cfg(test)]
                 assert_eq!(
-                    rewritten.data.data_type(schema).unwrap(),
+                    unwrapped.data.data_type(schema).unwrap(),
                     original_type,
                     "Simplified expression should have the same data type as the original"
-                );
-
-                Ok(rewritten)
-            })?;
-
-            if !result.transformed {
-                return Ok(result.data);
-            }
-            current_expr = result.data;
-        }
-        Ok(current_expr)
+            );
+                Ok(unwrapped)
+            })
+            .data();
     }
 }
 

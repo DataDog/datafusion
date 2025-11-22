@@ -26,12 +26,17 @@ use arrow::datatypes::{DataType, Field};
 use arrow::error::ArrowError;
 use arrow::ffi::{FFI_ArrowSchema, from_ffi, to_ffi};
 use arrow_schema::FieldRef;
-use datafusion_common::config::ConfigOptions;
-use datafusion_common::{DataFusionError, Result, internal_err};
-use datafusion_expr::type_coercion::functions::fields_with_udf;
-use datafusion_expr::{
-    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature,
+use datafusion::config::ConfigOptions;
+use datafusion::{common::exec_err, logical_expr::ReturnFieldArgs};
+use datafusion::{
+    error::DataFusionError,
+    logical_expr::type_coercion::functions::data_types_with_scalar_udf,
+};
+use datafusion::{
+    error::Result,
+    logical_expr::{
+        ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    },
 };
 use return_type_args::{
     FFI_ReturnFieldArgs, ForeignReturnFieldArgs, ForeignReturnFieldArgsOwned,
@@ -160,50 +165,47 @@ unsafe extern "C" fn invoke_with_args_fn_wrapper(
     number_rows: usize,
     return_field: WrappedSchema,
 ) -> FFIResult<WrappedArray> {
-    unsafe {
-        let args = args
-            .into_iter()
-            .map(|arr| {
-                from_ffi(arr.array, &arr.schema.0)
-                    .map(|v| ColumnarValue::Array(arrow::array::make_array(v)))
-            })
-            .collect::<std::result::Result<_, _>>();
-
-        let args = rresult_return!(args);
-        let return_field = rresult_return!(Field::try_from(&return_field.0)).into();
-
-        let arg_fields = arg_fields
-            .into_iter()
-            .map(|wrapped_field| {
-                Field::try_from(&wrapped_field.0)
-                    .map(Arc::new)
-                    .map_err(DataFusionError::from)
-            })
-            .collect::<Result<Vec<FieldRef>>>();
-        let arg_fields = rresult_return!(arg_fields);
-
-        let args = ScalarFunctionArgs {
-            args,
-            arg_fields,
-            number_rows,
-            return_field,
-            // TODO: pass config options: https://github.com/apache/datafusion/issues/17035
-            config_options: Arc::new(ConfigOptions::default()),
-        };
-
-        let result = rresult_return!(
-            udf.inner()
-                .invoke_with_args(args)
-                .and_then(|r| r.to_array(number_rows))
-        );
-
-        let (result_array, result_schema) = rresult_return!(to_ffi(&result.to_data()));
-
-        RResult::ROk(WrappedArray {
-            array: result_array,
-            schema: WrappedSchema(result_schema),
+    let args = args
+        .into_iter()
+        .map(|arr| {
+            from_ffi(arr.array, &arr.schema.0)
+                .map(|v| ColumnarValue::Array(arrow::array::make_array(v)))
         })
-    }
+        .collect::<std::result::Result<_, _>>();
+
+    let args = rresult_return!(args);
+    let return_field = rresult_return!(Field::try_from(&return_field.0)).into();
+
+    let arg_fields = arg_fields
+        .into_iter()
+        .map(|wrapped_field| {
+            Field::try_from(&wrapped_field.0)
+                .map(Arc::new)
+                .map_err(DataFusionError::from)
+        })
+        .collect::<Result<Vec<FieldRef>>>();
+    let arg_fields = rresult_return!(arg_fields);
+
+    let args = ScalarFunctionArgs {
+        args,
+        arg_fields,
+        number_rows,
+        return_field,
+        // TODO: pass config options: https://github.com/apache/datafusion/issues/17035
+        config_options: Arc::new(ConfigOptions::default()),
+        lambdas: None,
+    };
+
+    let result = rresult_return!(udf
+        .invoke_with_args(args)
+        .and_then(|r| r.to_array(number_rows)));
+
+    let (result_array, result_schema) = rresult_return!(to_ffi(&result.to_data()));
+
+    RResult::ROk(WrappedArray {
+        array: result_array,
+        schema: WrappedSchema(result_schema),
+    })
 }
 
 unsafe extern "C" fn release_fn_wrapper(udf: &mut FFI_ScalarUDF) {
@@ -366,9 +368,14 @@ impl ScalarUDFImpl for ForeignScalarUDF {
             arg_fields,
             number_rows,
             return_field,
+            lambdas,
             // TODO: pass config options: https://github.com/apache/datafusion/issues/17035
             config_options: _config_options,
         } = invoke_args;
+
+        if lambdas.is_some_and(|lambdas| lambdas.iter().any(|l| l.is_some())) {
+            return exec_err!("ForeignScalarUDF doesn't support lambdas");
+        }
 
         let args = args
             .into_iter()

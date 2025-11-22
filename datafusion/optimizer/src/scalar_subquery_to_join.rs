@@ -107,17 +107,22 @@ impl OptimizerRule for ScalarSubqueryToJoin {
                     {
                         if !expr_check_map.is_empty() {
                             rewrite_expr = rewrite_expr
-                                .transform_up(|expr| {
-                                    // replace column references with entry in map, if it exists
-                                    if let Some(map_expr) = expr
-                                        .try_as_col()
-                                        .and_then(|col| expr_check_map.get(&col.name))
-                                    {
-                                        Ok(Transformed::yes(map_expr.clone()))
-                                    } else {
-                                        Ok(Transformed::no(expr))
-                                    }
-                                })
+                                .transform_up_with_lambdas_params(
+                                    |expr, lambdas_params| {
+                                        // replace column references with entry in map, if it exists
+                                        if let Some(map_expr) = expr
+                                            .try_as_col()
+                                            .filter(|c| {
+                                                !c.is_lambda_parameter(lambdas_params)
+                                            })
+                                            .and_then(|col| expr_check_map.get(&col.name))
+                                        {
+                                            Ok(Transformed::yes(map_expr.clone()))
+                                        } else {
+                                            Ok(Transformed::no(expr))
+                                        }
+                                    },
+                                )
                                 .data()?;
                         }
                         cur_input = optimized_subquery;
@@ -166,25 +171,37 @@ impl OptimizerRule for ScalarSubqueryToJoin {
                         build_join(&subquery, &cur_input, &alias)?
                     {
                         cur_input = optimized_subquery;
-                        if !expr_check_map.is_empty()
-                            && let Some(expr) = subquery_to_expr_map.get(&subquery)
-                            && let Some(rewrite_expr) = expr_to_rewrite_expr_map.get(expr)
-                        {
-                            let new_expr = rewrite_expr
-                                .clone()
-                                .transform_up(|expr| {
-                                    // replace column references with entry in map, if it exists
-                                    if let Some(map_expr) = expr
-                                        .try_as_col()
-                                        .and_then(|col| expr_check_map.get(&col.name))
-                                    {
-                                        Ok(Transformed::yes(map_expr.clone()))
-                                    } else {
-                                        Ok(Transformed::no(expr))
-                                    }
-                                })
-                                .data()?;
-                            expr_to_rewrite_expr_map.insert(expr, new_expr);
+                        if !expr_check_map.is_empty() {
+                            if let Some(expr) = subquery_to_expr_map.get(&subquery) {
+                                if let Some(rewrite_expr) =
+                                    expr_to_rewrite_expr_map.get(expr)
+                                {
+                                    let new_expr = rewrite_expr
+                                        .clone()
+                                        .transform_up_with_lambdas_params(
+                                            |expr, lambdas_params| {
+                                                // replace column references with entry in map, if it exists
+                                                if let Some(map_expr) = expr
+                                                    .try_as_col()
+                                                    .filter(|c| {
+                                                        !c.is_lambda_parameter(
+                                                            lambdas_params,
+                                                        )
+                                                    })
+                                                    .and_then(|col| {
+                                                        expr_check_map.get(&col.name)
+                                                    })
+                                                {
+                                                    Ok(Transformed::yes(map_expr.clone()))
+                                                } else {
+                                                    Ok(Transformed::no(expr))
+                                                }
+                                            },
+                                        )
+                                        .data()?;
+                                    expr_to_rewrite_expr_map.insert(expr, new_expr);
+                                }
+                            }
                         }
                     } else {
                         // if we can't handle all of the subqueries then bail for now
@@ -394,8 +411,12 @@ fn build_join(
             let mut expr_rewrite = TypeCoercionRewriter {
                 schema: new_plan.schema(),
             };
-            computation_project_expr
-                .insert(name, computer_expr.rewrite(&mut expr_rewrite).data()?);
+            computation_project_expr.insert(
+                name,
+                computer_expr
+                    .rewrite_with_schema(new_plan.schema(), &mut expr_rewrite)
+                    .data()?,
+            );
         }
     }
 

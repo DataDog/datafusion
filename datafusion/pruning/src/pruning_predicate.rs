@@ -38,14 +38,15 @@ use datafusion_common::error::Result;
 use datafusion_common::tree_node::{TransformedResult, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema, assert_eq_or_internal_err};
 use datafusion_common::{
-    ScalarValue, internal_datafusion_err, plan_datafusion_err, plan_err,
-    tree_node::{Transformed, TreeNode},
+    internal_datafusion_err, internal_err, plan_datafusion_err, plan_err,
+    tree_node::Transformed, ScalarValue,
 };
 use datafusion_expr_common::operator::Operator;
-use datafusion_physical_expr::expressions::CastColumnExpr;
-use datafusion_physical_expr::utils::{Guarantee, LiteralGuarantee};
-use datafusion_physical_expr::{PhysicalExprRef, expressions as phys_expr};
-use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr_opt;
+use datafusion_physical_expr::utils::{collect_columns, Guarantee, LiteralGuarantee};
+use datafusion_physical_expr::{
+    expressions as phys_expr, PhysicalExprExt, PhysicalExprRef,
+};
+use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion_physical_plan::{ColumnarValue, PhysicalExpr};
 
 /// Used to prove that arbitrary predicates (boolean expression) can not
@@ -1249,11 +1250,11 @@ fn rewrite_column_expr(
     column_old: &phys_expr::Column,
     column_new: &phys_expr::Column,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    e.transform(|expr| {
-        if let Some(column) = expr.as_any().downcast_ref::<phys_expr::Column>()
-            && column == column_old
-        {
-            return Ok(Transformed::yes(Arc::new(column_new.clone())));
+    e.transform_with_lambdas_params(|expr, lambdas_params| {
+        if let Some(column) = expr.as_any().downcast_ref::<phys_expr::Column>() {
+            if !lambdas_params.contains(column.name()) && column == column_old {
+                return Ok(Transformed::yes(Arc::new(column_new.clone())));
+            }
         }
 
         Ok(Transformed::no(expr))
