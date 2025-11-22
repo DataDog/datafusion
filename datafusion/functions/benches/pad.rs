@@ -98,6 +98,34 @@ fn create_pad_args<O: OffsetSizeTrait>(
     }
 }
 
+fn invoke_pad_with_args(
+    args: Vec<ColumnarValue>,
+    number_rows: usize,
+    left_pad: bool,
+) -> Result<ColumnarValue, DataFusionError> {
+    let arg_fields = args
+        .iter()
+        .enumerate()
+        .map(|(idx, arg)| Field::new(format!("arg_{idx}"), arg.data_type(), true).into())
+        .collect::<Vec<_>>();
+    let config_options = Arc::new(ConfigOptions::default());
+
+    let scalar_args = ScalarFunctionArgs {
+        args: args.clone(),
+        arg_fields,
+        number_rows,
+        return_field: Field::new("f", DataType::Utf8, true).into(),
+        config_options: Arc::clone(&config_options),
+        lambdas: None,
+    };
+
+    if left_pad {
+        lpad().invoke_with_args(scalar_args)
+    } else {
+        rpad().invoke_with_args(scalar_args)
+    }
+}
+
 fn criterion_benchmark(c: &mut Criterion) {
     for size in [1024, 4096] {
         let mut group = c.benchmark_group(format!("lpad size={size}"));
