@@ -84,7 +84,6 @@ use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::file::writer::SerializedFileWriter;
-use parquet::format::FileMetaData;
 use parquet::schema::types::SchemaDescriptor;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -309,7 +308,7 @@ async fn get_file_decryption_properties(
 ) -> Result<Option<FileDecryptionProperties>> {
     let file_decryption_properties: Option<FileDecryptionProperties> =
         match &options.crypto.file_decryption {
-            Some(cfd) => Some(map_config_decryption_to_decryption(cfd)),
+            Some(cfd) => Some((*map_config_decryption_to_decryption(cfd)).clone()),
             None => match &options.crypto.factory_id {
                 Some(factory_id) => {
                     let factory =
@@ -1080,7 +1079,7 @@ pub struct ParquetSink {
     parquet_options: TableParquetOptions,
     /// File metadata from successfully produced parquet files. The Mutex is only used
     /// to allow inserting to HashMap from behind borrowed reference in DataSink::write_all.
-    written: Arc<parking_lot::Mutex<HashMap<Path, FileMetaData>>>,
+    written: Arc<parking_lot::Mutex<HashMap<Path, ParquetMetaData>>>,
 }
 
 impl Debug for ParquetSink {
@@ -1117,7 +1116,7 @@ impl ParquetSink {
 
     /// Retrieve the file metadata for the written files, keyed to the path
     /// which may be partitioned (in the case of hive style partitioning).
-    pub fn written(&self) -> HashMap<Path, FileMetaData> {
+    pub fn written(&self) -> HashMap<Path, ParquetMetaData> {
         self.written.lock().clone()
     }
 
@@ -1217,7 +1216,7 @@ async fn set_writer_encryption_properties(
             .await?;
         if let Some(file_encryption_properties) = file_encryption_properties {
             return Ok(
-                builder.with_file_encryption_properties(file_encryption_properties)
+                builder.with_file_encryption_properties(Arc::new(file_encryption_properties))
             );
         }
     }
@@ -1261,7 +1260,7 @@ impl FileSink for ParquetSink {
         }
 
         let mut file_write_tasks: JoinSet<
-            std::result::Result<(Path, FileMetaData), DataFusionError>,
+            std::result::Result<(Path, ParquetMetaData), DataFusionError>,
         > = JoinSet::new();
 
         let runtime = context.runtime_env();
@@ -1338,7 +1337,9 @@ impl FileSink for ParquetSink {
             match result {
                 Ok(r) => {
                     let (path, file_metadata) = r?;
-                    row_count += file_metadata.num_rows;
+                    for rg in file_metadata.row_groups() {
+                        row_count += rg.num_rows() as usize;
+                    }
                     let mut written_files = self.written.lock();
                     written_files
                         .try_insert(path.clone(), file_metadata)
@@ -1606,7 +1607,7 @@ async fn concatenate_parallel_row_groups(
     writer_props: Arc<WriterProperties>,
     mut object_store_writer: Box<dyn AsyncWrite + Send + Unpin>,
     pool: Arc<dyn MemoryPool>,
-) -> Result<FileMetaData> {
+) -> Result<ParquetMetaData> {
     let merged_buff = SharedBuffer::new(INITIAL_BUFFER_BYTES);
 
     let mut file_reservation =
@@ -1663,7 +1664,7 @@ async fn output_single_parquet_file_parallelized(
     parquet_props: &WriterProperties,
     parallel_options: ParallelParquetWriterOptions,
     pool: Arc<dyn MemoryPool>,
-) -> Result<FileMetaData> {
+) -> Result<ParquetMetaData> {
     let max_rowgroups = parallel_options.max_parallel_row_groups;
     // Buffer size of this channel limits maximum number of RowGroups being worked on in parallel
     let (serialize_tx, serialize_rx) =

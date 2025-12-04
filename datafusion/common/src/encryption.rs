@@ -31,6 +31,7 @@ pub struct FileDecryptionProperties;
 pub struct FileEncryptionProperties;
 
 pub use crate::config::{ConfigFileDecryptionProperties, ConfigFileEncryptionProperties};
+use std::sync::Arc;
 
 #[cfg(feature = "parquet_encryption")]
 pub fn map_encryption_to_config_encryption(
@@ -49,13 +50,13 @@ pub fn map_encryption_to_config_encryption(
 #[cfg(feature = "parquet_encryption")]
 pub fn map_config_decryption_to_decryption(
     decryption: &ConfigFileDecryptionProperties,
-) -> FileDecryptionProperties {
+) -> Arc<FileDecryptionProperties> {
     decryption.clone().into()
 }
 
 #[cfg(not(feature = "parquet_encryption"))]
 pub fn map_config_decryption_to_decryption(
     _decryption: &ConfigFileDecryptionProperties,
-) -> FileDecryptionProperties {
-    FileDecryptionProperties {}
+) -> Arc<FileDecryptionProperties> {
+    Arc::new(FileDecryptionProperties {})
 }

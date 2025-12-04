@@ -982,7 +982,7 @@ fn encode_scalar_nested_value(
     let gen = IpcDataGenerator {};
     let mut dict_tracker = DictionaryTracker::new(false);
     let (encoded_dictionaries, encoded_message) = gen
-        .encoded_batch(&batch, &mut dict_tracker, &Default::default())
+        .encode(&batch, &mut dict_tracker, &Default::default(), &mut Default::default())
         .map_err(|e| {
             Error::General(format!("Error encoding ScalarValue::List as IPC: {e}"))
         })?;

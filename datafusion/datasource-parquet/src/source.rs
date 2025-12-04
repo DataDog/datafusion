@@ -554,8 +554,7 @@ impl FileSource for ParquetSource {
             .crypto
             .file_decryption
             .as_ref()
-            .map(map_config_decryption_to_decryption)
-            .map(Arc::new);
+            .map(map_config_decryption_to_decryption);
 
         let coerce_int96 = self
             .table_parquet_options

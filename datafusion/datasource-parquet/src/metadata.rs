@@ -145,7 +145,7 @@ impl<'a> DFParquetMetadata<'a> {
 
         #[cfg(feature = "parquet_encryption")]
         if let Some(decryption_properties) = decryption_properties {
-            reader = reader.with_decryption_properties(Some(decryption_properties));
+            reader = reader.with_decryption_properties(Some(Arc::new((*decryption_properties).clone())));
         }
 
         if cache_metadata && file_metadata_cache.is_some() {

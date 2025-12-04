@@ -564,7 +564,7 @@ mod tests {
         };
 
         #[cfg(feature = "parquet_encryption")]
-        let fep = map_encryption_to_config_encryption(props.file_encryption_properties());
+        let fep = map_encryption_to_config_encryption(props.file_encryption_properties().map(|v| &**v));
         #[cfg(not(feature = "parquet_encryption"))]
         let fep = None;
 

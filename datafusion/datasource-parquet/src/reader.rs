@@ -261,10 +261,12 @@ impl AsyncFileReader for CachedParquetFileReader {
                 options.and_then(|o| o.file_decryption_properties());
 
             #[cfg(not(feature = "parquet_encryption"))]
-            let file_decryption_properties = None;
+            let file_decryption_properties: Option<Arc<_>> = None;
 
             DFParquetMetadata::new(&self.store, &file_meta.object_meta)
-                .with_decryption_properties(file_decryption_properties)
+                .with_decryption_properties(
+                    file_decryption_properties.as_deref().map(|v: &Arc<_>| &**v),
+                )
                 .with_file_metadata_cache(Some(Arc::clone(&metadata_cache)))
                 .with_metadata_size_hint(self.metadata_size_hint)
                 .fetch_metadata()

@@ -27,6 +27,9 @@ use crate::utils::get_available_parallelism;
 use crate::{DataFusionError, Result};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
+
+#[cfg(feature = "parquet_encryption")]
+use std::sync::Arc;
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::str::FromStr;
@@ -2240,7 +2243,7 @@ impl ConfigField for ConfigFileEncryptionProperties {
 }
 
 #[cfg(feature = "parquet_encryption")]
-impl From<ConfigFileEncryptionProperties> for FileEncryptionProperties {
+impl From<ConfigFileEncryptionProperties> for Arc<FileEncryptionProperties> {
     fn from(val: ConfigFileEncryptionProperties) -> Self {
         let mut fep = FileEncryptionProperties::builder(
             hex::decode(val.footer_key_as_hex).unwrap(),
@@ -2400,7 +2403,7 @@ impl ConfigField for ConfigFileDecryptionProperties {
 }
 
 #[cfg(feature = "parquet_encryption")]
-impl From<ConfigFileDecryptionProperties> for FileDecryptionProperties {
+impl From<ConfigFileDecryptionProperties> for Arc<FileDecryptionProperties> {
     fn from(val: ConfigFileDecryptionProperties) -> Self {
         let mut column_names: Vec<&str> = Vec::new();
         let mut column_keys: Vec<Vec<u8>> = Vec::new();
@@ -2821,6 +2824,7 @@ mod tests {
         };
         use parquet::encryption::decrypt::FileDecryptionProperties;
         use parquet::encryption::encrypt::FileEncryptionProperties;
+        use std::sync::Arc;
 
         let footer_key = b"0123456789012345".to_vec(); // 128bit/16
         let column_names = vec!["double_field", "float_field"];
@@ -2842,14 +2846,14 @@ mod tests {
 
         // Test round-trip
         let config_encrypt: ConfigFileEncryptionProperties =
-            (&file_encryption_properties).into();
-        let encryption_properties_built: FileEncryptionProperties =
+            (&*file_encryption_properties).into();
+        let encryption_properties_built: Arc<FileEncryptionProperties> =
             config_encrypt.clone().into();
         assert_eq!(file_encryption_properties, encryption_properties_built);
 
         let config_decrypt: ConfigFileDecryptionProperties =
-            (&decryption_properties).into();
-        let decryption_properties_built: FileDecryptionProperties =
+            (&*decryption_properties).into();
+        let decryption_properties_built: Arc<FileDecryptionProperties> =
             config_decrypt.clone().into();
         assert_eq!(decryption_properties, decryption_properties_built);
 
