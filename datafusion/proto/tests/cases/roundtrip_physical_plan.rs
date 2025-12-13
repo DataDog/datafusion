@@ -75,8 +75,8 @@ use datafusion::physical_plan::expressions::{
 };
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::{
-    HashJoinExec, NestedLoopJoinExec, PartitionMode, SortMergeJoinExec,
-    StreamJoinPartitionMode, SymmetricHashJoinExec,
+    HashJoinExec, HashTableLookupExpr, NestedLoopJoinExec, PartitionMode,
+    SortMergeJoinExec, StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
@@ -103,12 +103,12 @@ use datafusion_common::{
     internal_err, not_impl_err, DataFusionError, NullEquality, Result, UnnestOptions,
 };
 use datafusion_expr::{
-    Accumulator, AccumulatorFactoryFunction, AggregateUDF, ColumnarValue, ScalarUDF,
-    Signature, SimpleAggregateUDF, WindowFrame, WindowFrameBound, WindowUDF,
+    Accumulator, AccumulatorFactoryFunction, AggregateUDF, ColumnarValue, ScalarUDF, Signature, SimpleAggregateUDF, WindowFrame, WindowFrameBound, WindowUDF
 };
 use datafusion_functions_aggregate::average::avg_udaf;
 use datafusion_functions_aggregate::nth_value::nth_value_udaf;
 use datafusion_functions_aggregate::string_agg::string_agg_udaf;
+use datafusion::physical_plan::joins::join_hash_map::JoinHashMapU32;
 use datafusion_proto::physical_plan::{
     AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
 };
@@ -2238,4 +2238,49 @@ async fn roundtrip_memory_source() -> Result<()> {
         .create_physical_plan()
         .await?;
     roundtrip_test(plan)
+}
+
+/// Test that HashTableLookupExpr serializes to lit(true)
+///
+/// HashTableLookupExpr contains a runtime hash table that cannot be serialized.
+/// The serialization code replaces it with lit(true) which is safe because
+/// it's a performance optimization filter, not a correctness requirement.
+#[test]
+fn roundtrip_hash_table_lookup_expr_to_lit() -> Result<()> {
+    // Create a simple schema and input plan
+    let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int64, false)]));
+    let input = Arc::new(EmptyExec::new(schema.clone()));
+
+    // Create a HashTableLookupExpr - it will be replaced with lit(true) during serialization
+    let hash_map = Arc::new(JoinHashMapU32::with_capacity(0));
+    let hash_expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("col", 0));
+    let lookup_expr: Arc<dyn PhysicalExpr> = Arc::new(HashTableLookupExpr::new(
+        hash_expr,
+        hash_map,
+        "test_lookup".to_string(),
+    ));
+
+    // Create a filter with the lookup expression
+    let filter = Arc::new(FilterExec::try_new(lookup_expr, input)?);
+
+    // Serialize
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let proto: protobuf::PhysicalPlanNode =
+        protobuf::PhysicalPlanNode::try_from_physical_plan(filter.clone(), &codec)
+            .expect("serialization should succeed");
+
+    // Deserialize
+    let result: Arc<dyn ExecutionPlan> = proto
+        .try_into_physical_plan(&ctx, &ctx.runtime_env(), &codec)
+        .expect("deserialization should succeed");
+
+    // The deserialized plan should have lit(true) instead of HashTableLookupExpr
+    // Verify the filter predicate is a Literal(true)
+    let result_filter = result.as_any().downcast_ref::<FilterExec>().unwrap();
+    let predicate = result_filter.predicate();
+    let literal = predicate.as_any().downcast_ref::<Literal>().unwrap();
+    assert_eq!(*literal.value(), ScalarValue::Boolean(Some(true)));
+
+    Ok(())
 }
