@@ -27,14 +27,13 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
-use datafusion_common::HashSet;
+use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{
     exec_err,
     tree_node::{Transformed, TransformedResult},
     Result, ScalarValue,
 };
 use datafusion_functions::core::getfield::GetFieldFunc;
-use datafusion_physical_expr::PhysicalExprExt;
 use datafusion_physical_expr::{
     ScalarFunctionExpr,
     expressions::{self, Column},
@@ -261,10 +260,8 @@ impl PhysicalExprAdapter for DefaultPhysicalExprAdapter {
             logical_file_schema: &self.logical_file_schema,
             physical_file_schema: &self.physical_file_schema,
         };
-        expr.transform_with_lambdas_params(|expr, lambdas_params| {
-            rewriter.rewrite_expr(Arc::clone(&expr), lambdas_params)
-        })
-        .data()
+        expr.transform(|expr| rewriter.rewrite_expr(Arc::clone(&expr)))
+            .data()
     }
 }
 
@@ -277,18 +274,13 @@ impl<'a> DefaultPhysicalExprAdapterRewriter<'a> {
     fn rewrite_expr(
         &self,
         expr: Arc<dyn PhysicalExpr>,
-        lambdas_params: &HashSet<String>,
     ) -> Result<Transformed<Arc<dyn PhysicalExpr>>> {
-        if let Some(transformed) =
-            self.try_rewrite_struct_field_access(&expr, lambdas_params)?
-        {
+        if let Some(transformed) = self.try_rewrite_struct_field_access(&expr)? {
             return Ok(Transformed::yes(transformed));
         }
 
         if let Some(column) = expr.as_any().downcast_ref::<Column>() {
-            if !lambdas_params.contains(column.name()) {
-                return self.rewrite_column(Arc::clone(&expr), column);
-            }
+            return self.rewrite_column(Arc::clone(&expr), column);
         }
 
         Ok(Transformed::no(expr))
@@ -300,7 +292,6 @@ impl<'a> DefaultPhysicalExprAdapterRewriter<'a> {
     fn try_rewrite_struct_field_access(
         &self,
         expr: &Arc<dyn PhysicalExpr>,
-        lambdas_params: &HashSet<String>,
     ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
         let get_field_expr =
             match ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(expr.as_ref()) {
@@ -332,8 +323,8 @@ impl<'a> DefaultPhysicalExprAdapterRewriter<'a> {
         };
 
         let column = match source_expr.as_any().downcast_ref::<Column>() {
-            Some(column) if !lambdas_params.contains(column.name()) => column,
-            _ => return Ok(None),
+            Some(column) => column,
+            None => return Ok(None),
         };
 
         let physical_field =
@@ -624,7 +615,6 @@ mod tests {
     use super::*;
     use arrow::array::{RecordBatch, RecordBatchOptions};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use datafusion_common::hashbrown::HashSet;
     use datafusion_common::{assert_contains, record_batch, Result, ScalarValue};
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{Column, Literal, col, lit};
@@ -1183,9 +1173,7 @@ mod tests {
 
         // Test that when a field exists in physical schema, it returns None
         let column = Arc::new(Column::new("struct_col", 0)) as Arc<dyn PhysicalExpr>;
-        let result = rewriter
-            .try_rewrite_struct_field_access(&column, &HashSet::new())
-            .unwrap();
+        let result = rewriter.try_rewrite_struct_field_access(&column).unwrap();
         assert!(result.is_none());
 
         // The actual test for the get_field expression would require creating a proper ScalarFunctionExpr
