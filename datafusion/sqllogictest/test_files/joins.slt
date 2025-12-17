@@ -5170,9 +5170,6 @@ DROP TABLE t2;
 statement ok
 set datafusion.explain.physical_plan_only = false;
 
-statement ok
-set datafusion.optimizer.enable_piecewise_merge_join = false;
-
 # Test hash join with columns named c0, c1, c2
 # These names match the internal naming pattern in inlist_builder.rs
 # Regression test for https://github.com/apache/datafusion/pull/18393#discussion_r2601145291
