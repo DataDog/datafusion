@@ -74,6 +74,7 @@ use datafusion::physical_plan::expressions::{
     binary, cast, col, in_list, like, lit, BinaryExpr, Column, NotExpr, PhysicalSortExpr,
 };
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::joins::join_hash_map::JoinHashMapU32;
 use datafusion::physical_plan::joins::{
     HashJoinExec, HashTableLookupExpr, NestedLoopJoinExec, PartitionMode,
     SortMergeJoinExec, StreamJoinPartitionMode, SymmetricHashJoinExec,
@@ -103,12 +104,12 @@ use datafusion_common::{
     internal_err, not_impl_err, DataFusionError, NullEquality, Result, UnnestOptions,
 };
 use datafusion_expr::{
-    Accumulator, AccumulatorFactoryFunction, AggregateUDF, ColumnarValue, ScalarUDF, Signature, SimpleAggregateUDF, WindowFrame, WindowFrameBound, WindowUDF
+    Accumulator, AccumulatorFactoryFunction, AggregateUDF, ColumnarValue, ScalarUDF,
+    Signature, SimpleAggregateUDF, WindowFrame, WindowFrameBound, WindowUDF,
 };
 use datafusion_functions_aggregate::average::avg_udaf;
 use datafusion_functions_aggregate::nth_value::nth_value_udaf;
 use datafusion_functions_aggregate::string_agg::string_agg_udaf;
-use datafusion::physical_plan::joins::join_hash_map::JoinHashMapU32;
 use datafusion_proto::physical_plan::{
     AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
 };

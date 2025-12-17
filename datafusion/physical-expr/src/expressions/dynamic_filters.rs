@@ -293,7 +293,7 @@ impl DynamicFilterPhysicalExpr {
             .wait_for(|state| matches!(state, FilterState::Complete { .. }))
             .await;
     }
-    
+
     fn render(
         &self,
         f: &mut std::fmt::Formatter<'_>,

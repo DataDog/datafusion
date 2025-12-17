@@ -33,7 +33,7 @@ use arrow::datatypes::*;
 use arrow::util::bit_iterator::BitIndexIterator;
 use datafusion_common::hash_utils::with_hashes;
 use datafusion_common::{
-    DFSchema, HashSet, Result, ScalarValue, exec_datafusion_err, exec_err, internal_err
+    exec_datafusion_err, exec_err, internal_err, DFSchema, HashSet, Result, ScalarValue,
 };
 use datafusion_expr::{expr_vec_fmt, ColumnarValue};
 
@@ -232,28 +232,34 @@ impl StaticFilter for Int32StaticFilter {
         let result = match (v.null_count() > 0, negated) {
             (true, false) => {
                 // has nulls, not negated"
-                let values: Vec<Option<bool>> = v.iter()
+                let values: Vec<Option<bool>> = v
+                    .iter()
                     .map(|value| Some(self.values.contains(&value?)))
                     .collect();
                 BooleanArray::from(values)
             }
             (true, true) => {
                 // has nulls, negated
-                let values: Vec<Option<bool>> = v.iter()
+                let values: Vec<Option<bool>> = v
+                    .iter()
                     .map(|value| Some(!self.values.contains(&value?)))
                     .collect();
                 BooleanArray::from(values)
             }
             (false, false) => {
                 //no null, not negated
-                let values: Vec<bool> = v.values().iter()
+                let values: Vec<bool> = v
+                    .values()
+                    .iter()
                     .map(|value| self.values.contains(value))
                     .collect();
                 BooleanArray::from(values)
             }
             (false, true) => {
                 // no null, negated
-                let values: Vec<bool> = v.values().iter()
+                let values: Vec<bool> = v
+                    .values()
+                    .iter()
                     .map(|value| !self.values.contains(value))
                     .collect();
                 BooleanArray::from(values)

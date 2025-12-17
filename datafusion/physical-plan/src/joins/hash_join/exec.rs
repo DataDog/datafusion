@@ -4565,7 +4565,7 @@ mod tests {
         )?;
         join.dynamic_filter = Some(HashJoinExecDynamicFilter {
             filter: dynamic_filter,
-            bounds_accumulator: OnceLock::new(),
+            build_accumulator: OnceLock::new(),
         });
 
         // Execute the join
@@ -4613,7 +4613,7 @@ mod tests {
         )?;
         join.dynamic_filter = Some(HashJoinExecDynamicFilter {
             filter: dynamic_filter,
-            bounds_accumulator: OnceLock::new(),
+            build_accumulator: OnceLock::new(),
         });
 
         // Execute the join

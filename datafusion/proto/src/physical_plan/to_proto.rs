@@ -31,9 +31,9 @@ use datafusion::physical_plan::expressions::{
     BinaryExpr, CaseExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr,
     Literal, NegativeExpr, NotExpr, TryCastExpr, UnKnownColumn,
 };
+use datafusion::physical_plan::joins::HashTableLookupExpr;
 use datafusion::physical_plan::udaf::AggregateFunctionExpr;
 use datafusion::physical_plan::windows::{PlainAggregateWindowExpr, WindowUDFExpr};
-use datafusion::physical_plan::joins::HashTableLookupExpr;
 use datafusion::physical_plan::{Partitioning, PhysicalExpr, WindowExpr};
 use datafusion::{
     datasource::{
