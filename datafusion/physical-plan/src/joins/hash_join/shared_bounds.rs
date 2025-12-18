@@ -578,6 +578,7 @@ impl SharedBuildAccumulator {
                     }
                 }
             }
+            self.dynamic_filter.mark_complete();
         }
 
         Ok(())
