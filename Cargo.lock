@@ -2538,7 +2538,7 @@ dependencies = [
  "object_store",
  "pbjson 0.8.0",
  "pretty_assertions",
- "prost 0.14.1",
+ "prost 0.13.5",
  "serde",
  "serde_json",
  "tokio",
@@ -2552,7 +2552,7 @@ dependencies = [
  "datafusion-common",
  "doc-comment",
  "pbjson 0.8.0",
- "prost 0.14.1",
+ "prost 0.13.5",
  "serde",
 ]
 
