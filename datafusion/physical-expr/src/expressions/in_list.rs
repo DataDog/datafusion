@@ -33,7 +33,7 @@ use arrow::datatypes::*;
 use arrow::util::bit_iterator::BitIndexIterator;
 use datafusion_common::hash_utils::with_hashes;
 use datafusion_common::{
-    DFSchema, HashSet, Result, ScalarValue, exec_datafusion_err, exec_err, internal_err
+    exec_datafusion_err, exec_err, internal_err, DFSchema, HashSet, Result, ScalarValue,
 };
 use datafusion_expr::{expr_vec_fmt, ColumnarValue};
 
