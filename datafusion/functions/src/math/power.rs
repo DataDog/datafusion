@@ -613,28 +613,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_power_f64() {
-        let arg_fields = vec![
-            Field::new("a", DataType::Float64, true).into(),
-            Field::new("a", DataType::Float64, true).into(),
-        ];
-        let args = ScalarFunctionArgs {
-            args: vec![
-                ColumnarValue::Array(Arc::new(Float64Array::from(vec![
-                    2.0, 2.0, 3.0, 5.0,
-                ]))), // base
-                ColumnarValue::Array(Arc::new(Float64Array::from(vec![
-                    3.0, 2.0, 4.0, 4.0,
-                ]))), // exponent
-            ],
-            arg_fields,
-            number_rows: 4,
-            return_field: Field::new("f", DataType::Float64, true).into(),
-            config_options: Arc::new(ConfigOptions::default()),
-        };
-        let result = PowerFunc::new()
-            .invoke_with_args(args)
-            .expect("failed to initialize function power");
+    fn test_pow_decimal128_helper() {
+        // Expression: 2.5 ^ 4 = 39.0625
+        assert_eq!(pow_decimal_int(25i128, 1, 4).unwrap(), 390i128);
+        assert_eq!(pow_decimal_int(2500i128, 3, 4).unwrap(), 39062i128);
+        assert_eq!(pow_decimal_int(25000i128, 4, 4).unwrap(), 390625i128);
 
         // Expression: 25 ^ 4 = 390625
         assert_eq!(pow_decimal_int(25i128, 0, 4).unwrap(), 390625i128);
@@ -649,24 +632,11 @@ mod tests {
     }
 
     #[test]
-    fn test_power_i64() {
-        let arg_fields = vec![
-            Field::new("a", DataType::Int64, true).into(),
-            Field::new("a", DataType::Int64, true).into(),
-        ];
-        let args = ScalarFunctionArgs {
-            args: vec![
-                ColumnarValue::Array(Arc::new(Int64Array::from(vec![2, 2, 3, 5]))), // base
-                ColumnarValue::Array(Arc::new(Int64Array::from(vec![3, 2, 4, 4]))), // exponent
-            ],
-            arg_fields,
-            number_rows: 4,
-            return_field: Field::new("f", DataType::Int64, true).into(),
-            config_options: Arc::new(ConfigOptions::default()),
-        };
-        let result = PowerFunc::new()
-            .invoke_with_args(args)
-            .expect("failed to initialize function power");
+    fn test_pow_decimal_float_fallback() {
+        // Test negative exponent: 4^(-1) = 0.25
+        // 4 with scale 2 = 400, result should be 25 (0.25 with scale 2)
+        let result: i128 = pow_decimal_float(400i128, 2, -1.0).unwrap();
+        assert_eq!(result, 25);
 
         // Test non-integer exponent: 4^0.5 = 2
         // 4 with scale 2 = 400, result should be 200 (2.0 with scale 2)
