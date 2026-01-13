@@ -2297,7 +2297,7 @@ dependencies = [
  "doc-comment",
  "futures",
  "log",
- "prost 0.13.5",
+ "prost 0.14.1",
  "semver",
  "tokio",
 ]
