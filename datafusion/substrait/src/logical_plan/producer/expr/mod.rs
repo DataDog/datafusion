@@ -88,6 +88,7 @@ pub fn to_substrait_extended_expr(
         advanced_extensions: None,
         expected_type_urls: vec![],
         extension_uris: vec![],
+        extension_urns: vec![],
         extensions: extensions.into(),
         version: Some(version::version_with_producer("datafusion")),
         referred_expr: substrait_exprs,
