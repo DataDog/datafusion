@@ -26,7 +26,6 @@ use substrait::version;
 /// Convert DataFusion LogicalPlan to Substrait Plan
 // Silence deprecation warnings for `extension_uris` during the uri -> urn migration
 // See: https://github.com/substrait-io/substrait/issues/856
-#[expect(deprecated)]
 pub fn to_substrait_plan(
     plan: &LogicalPlan,
     state: &SessionState,
