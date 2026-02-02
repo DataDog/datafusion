@@ -42,7 +42,9 @@ use datafusion_expr::expr_rewriter::coerce_plan_expr_for_schema;
 use datafusion_expr::expr_schema::cast_subquery;
 use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::type_coercion::binary::{comparison_coercion, like_coercion};
-use datafusion_expr::type_coercion::functions::fields_with_udf;
+use datafusion_expr::type_coercion::functions::{
+    data_types_with_scalar_udf, fields_with_aggregate_udf,
+};
 use datafusion_expr::type_coercion::other::{
     get_coerce_type_for_case_expression, get_coerce_type_for_list,
 };
@@ -926,20 +928,17 @@ fn coerce_arguments_for_signature_with_scalar_udf(
         return Ok(expressions);
     }
 
-    let current_fields = expressions
+    let current_types = expressions
         .iter()
-        .map(|e| e.to_field(schema).map(|(_, f)| f))
+        .map(|e| e.get_type(schema))
         .collect::<Result<Vec<_>>>()?;
 
-    let coerced_types = fields_with_udf(&current_fields, func)?
-        .into_iter()
-        .map(|f| f.data_type().clone())
-        .collect::<Vec<_>>();
+    let new_types = data_types_with_scalar_udf(&current_types, func)?;
 
     expressions
         .into_iter()
         .enumerate()
-        .map(|(i, expr)| expr.cast_to(&coerced_types[i], schema))
+        .map(|(i, expr)| expr.cast_to(&new_types[i], schema))
         .collect()
 }
 
@@ -961,7 +960,7 @@ fn coerce_arguments_for_signature_with_aggregate_udf(
         .map(|e| e.to_field(schema).map(|(_, f)| f))
         .collect::<Result<Vec<_>>>()?;
 
-    let coerced_types = fields_with_udf(&current_fields, func)?
+    let new_types = fields_with_aggregate_udf(&current_fields, func)?
         .into_iter()
         .map(|f| f.data_type().clone())
         .collect::<Vec<_>>();
@@ -969,7 +968,7 @@ fn coerce_arguments_for_signature_with_aggregate_udf(
     expressions
         .into_iter()
         .enumerate()
-        .map(|(i, expr)| expr.cast_to(&coerced_types[i], schema))
+        .map(|(i, expr)| expr.cast_to(&new_types[i], schema))
         .collect()
 }
 
