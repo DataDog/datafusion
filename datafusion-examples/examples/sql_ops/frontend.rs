@@ -22,8 +22,8 @@ use datafusion::common::{TableReference, plan_err};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::logical_expr::{
-    AggregateUDF, Expr, LogicalPlan, ScalarUDF, TableProviderFilterPushDown, TableSource,
-    WindowUDF,
+    AggregateUDF, Expr, LambdaUDF, LogicalPlan, ScalarUDF, TableProviderFilterPushDown,
+    TableSource, WindowUDF,
 };
 use datafusion::optimizer::{
     Analyzer, AnalyzerRule, Optimizer, OptimizerConfig, OptimizerContext, OptimizerRule,
@@ -152,6 +152,10 @@ impl ContextProvider for MyContextProvider {
     }
 
     fn get_function_meta(&self, _name: &str) -> Option<Arc<ScalarUDF>> {
+        None
+    }
+
+    fn get_lambda_meta(&self, _name: &str) -> Option<Arc<dyn LambdaUDF>> {
         None
     }
 

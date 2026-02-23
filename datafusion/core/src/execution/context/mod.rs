@@ -83,6 +83,8 @@ use datafusion_execution::disk_manager::{
     DEFAULT_MAX_TEMP_DIRECTORY_SIZE, DiskManagerBuilder,
 };
 use datafusion_execution::registry::SerializerRegistry;
+pub use datafusion_execution::TaskContext;
+use datafusion_expr::LambdaUDF;
 pub use datafusion_expr::execution_props::ExecutionProps;
 #[cfg(feature = "sql")]
 use datafusion_expr::planner::RelationPlanner;
@@ -1930,6 +1932,21 @@ impl FunctionRegistry for SessionContext {
 
     fn udwfs(&self) -> HashSet<String> {
         self.state.read().udwfs()
+    }
+
+    fn udlfs(&self) -> HashSet<String> {
+        self.state.read().udlfs()
+    }
+
+    fn udlf(&self, name: &str) -> Result<Arc<dyn LambdaUDF>> {
+        self.state.read().udlf(name)
+    }
+
+    fn register_udlf(
+        &mut self,
+        udlf: Arc<dyn LambdaUDF>,
+    ) -> Result<Option<Arc<dyn LambdaUDF>>> {
+        self.state.write().register_udlf(udlf)
     }
 }
 

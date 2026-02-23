@@ -59,7 +59,7 @@ use datafusion_expr::planner::{RelationPlanner, TypePlanner};
 use datafusion_expr::registry::{FunctionRegistry, SerializerRegistry};
 use datafusion_expr::simplify::SimplifyInfo;
 use datafusion_expr::{
-    AggregateUDF, Explain, Expr, ExprSchemable, LogicalPlan, ScalarUDF, WindowUDF,
+    AggregateUDF, Explain, Expr, ExprSchemable, LambdaUDF, LogicalPlan, ScalarUDF, WindowUDF
 };
 use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_optimizer::{
@@ -156,6 +156,8 @@ pub struct SessionState {
     table_functions: HashMap<String, Arc<TableFunction>>,
     /// Scalar functions that are registered with the context
     scalar_functions: HashMap<String, Arc<ScalarUDF>>,
+    /// Lambda functions that are registered with the context
+    lambda_functions: HashMap<String, Arc<dyn LambdaUDF>>,
     /// Aggregate functions registered in the context
     aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
     /// Window functions registered in the context
@@ -258,6 +260,10 @@ impl Session for SessionState {
 
     fn scalar_functions(&self) -> &HashMap<String, Arc<ScalarUDF>> {
         &self.scalar_functions
+    }
+    
+    fn lambda_functions(&self) -> &HashMap<String, Arc<dyn LambdaUDF>> {
+        &self.lambda_functions
     }
 
     fn aggregate_functions(&self) -> &HashMap<String, Arc<AggregateUDF>> {
@@ -983,6 +989,7 @@ pub struct SessionStateBuilder {
     catalog_list: Option<Arc<dyn CatalogProviderList>>,
     table_functions: Option<HashMap<String, Arc<TableFunction>>>,
     scalar_functions: Option<Vec<Arc<ScalarUDF>>>,
+    lambda_functions: Option<Vec<Arc<dyn LambdaUDF>>>,
     aggregate_functions: Option<Vec<Arc<AggregateUDF>>>,
     window_functions: Option<Vec<Arc<WindowUDF>>>,
     serializer_registry: Option<Arc<dyn SerializerRegistry>>,
@@ -1023,6 +1030,7 @@ impl SessionStateBuilder {
             catalog_list: None,
             table_functions: None,
             scalar_functions: None,
+            lambda_functions: None,
             aggregate_functions: None,
             window_functions: None,
             serializer_registry: None,
@@ -1076,6 +1084,7 @@ impl SessionStateBuilder {
             catalog_list: Some(existing.catalog_list),
             table_functions: Some(existing.table_functions),
             scalar_functions: Some(existing.scalar_functions.into_values().collect_vec()),
+            lambda_functions: Some(existing.lambda_functions.into_values().collect_vec()),
             aggregate_functions: Some(
                 existing.aggregate_functions.into_values().collect_vec(),
             ),
@@ -1116,6 +1125,10 @@ impl SessionStateBuilder {
         self.scalar_functions
             .get_or_insert_with(Vec::new)
             .extend(SessionStateDefaults::default_scalar_functions());
+        
+        self.lambda_functions
+            .get_or_insert_with(Vec::new)
+            .extend(SessionStateDefaults::default_lambda_functions());
 
         self.aggregate_functions
             .get_or_insert_with(Vec::new)
@@ -1451,6 +1464,7 @@ impl SessionStateBuilder {
             catalog_list,
             table_functions,
             scalar_functions,
+            lambda_functions,
             aggregate_functions,
             window_functions,
             serializer_registry,
@@ -1487,6 +1501,7 @@ impl SessionStateBuilder {
             }),
             table_functions: table_functions.unwrap_or_default(),
             scalar_functions: HashMap::new(),
+            lambda_functions: HashMap::new(),
             aggregate_functions: HashMap::new(),
             window_functions: HashMap::new(),
             serializer_registry: serializer_registry
@@ -1534,6 +1549,34 @@ impl SessionStateBuilder {
                         }
                         Err(err) => {
                             debug!("Failed to register UDF '{}': {}", udf.name(), err);
+                        }
+                    },
+                }
+            }
+        }
+        
+        if let Some(lambda_functions) = lambda_functions {
+            for udlf in lambda_functions {
+                let config_options = state.config().options();
+                match udlf.with_updated_config(config_options) {
+                    Some(new_udf) => {
+                        if let Err(err) = state.register_udlf(new_udf) {
+                            debug!(
+                                "Failed to re-register updated UDLF '{}': {}",
+                                udlf.name(),
+                                err
+                            );
+                        }
+                    }
+                    None => match state.register_udlf(Arc::clone(&udlf)) {
+                        Ok(Some(existing)) => {
+                            debug!("Overwrote existing UDLF '{}'", existing.name());
+                        }
+                        Ok(None) => {
+                            debug!("Registered UDLF '{}'", udlf.name());
+                        }
+                        Err(err) => {
+                            debug!("Failed to register UDLF '{}': {}", udlf.name(), err);
                         }
                     },
                 }
@@ -1766,6 +1809,7 @@ impl Debug for SessionStateBuilder {
             .field("physical_optimizers", &self.physical_optimizers)
             .field("table_functions", &self.table_functions)
             .field("scalar_functions", &self.scalar_functions)
+            .field("lambda_functions", &self.lambda_functions)
             .field("aggregate_functions", &self.aggregate_functions)
             .field("window_functions", &self.window_functions)
             .finish()
@@ -1862,6 +1906,10 @@ impl ContextProvider for SessionContextProvider<'_> {
 
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
         self.state.scalar_functions().get(name).cloned()
+    }
+
+    fn get_lambda_meta(&self, name: &str) -> Option<Arc<dyn LambdaUDF>> {
+        self.state.lambda_functions().get(name).cloned()
     }
 
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
@@ -2027,6 +2075,37 @@ impl FunctionRegistry for SessionState {
         Ok(udwf)
     }
 
+    fn udlfs(&self) -> HashSet<String> {
+        self.lambda_functions.keys().cloned().collect()
+    }
+
+    fn udlf(&self, name: &str) -> datafusion_common::Result<Arc<dyn LambdaUDF>> {
+        self.lambda_functions
+            .get(name)
+            .cloned()
+            .ok_or_else(|| plan_datafusion_err!("Lambda Function {name} not found"))
+    }
+
+    fn register_udlf(
+        &mut self,
+        udlf: Arc<dyn LambdaUDF>,
+    ) -> datafusion_common::Result<Option<Arc<dyn LambdaUDF>>> {
+        Ok(self.lambda_functions.insert(udlf.name().into(), udlf))
+    }
+
+    fn deregister_udlf(
+        &mut self,
+        name: &str,
+    ) -> datafusion_common::Result<Option<Arc<dyn LambdaUDF>>> {
+        let udlf = self.lambda_functions.remove(name);
+        if let Some(udlf) = &udlf {
+            for alias in udlf.aliases() {
+                self.lambda_functions.remove(alias);
+            }
+        }
+        Ok(udlf)
+    }
+
     fn register_function_rewrite(
         &mut self,
         rewrite: Arc<dyn FunctionRewrite + Send + Sync>,
@@ -2089,6 +2168,7 @@ impl From<&SessionState> for TaskContext {
             state.session_id.clone(),
             state.config.clone(),
             state.scalar_functions.clone(),
+            state.lambda_functions.clone(),
             state.aggregate_functions.clone(),
             state.window_functions.clone(),
             Arc::clone(&state.runtime_env),
@@ -2190,6 +2270,7 @@ mod tests {
     use datafusion_optimizer::Optimizer;
     use datafusion_optimizer::optimizer::OptimizerRule;
     use datafusion_physical_plan::display::DisplayableExecutionPlan;
+    use datafusion_session::Session;
     use datafusion_sql::planner::{PlannerContext, SqlToRel};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2498,6 +2579,10 @@ mod tests {
 
         fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
             self.state.scalar_functions().get(name).cloned()
+        }
+
+        fn get_lambda_meta(&self, name: &str) -> Option<Arc<dyn datafusion_expr::LambdaUDF>> {
+            self.state.lambda_functions().get(name).cloned()
         }
 
         fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {

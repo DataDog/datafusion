@@ -98,6 +98,16 @@ pub fn expr_applicable_for_cols(col_names: &[&str], expr: &Expr) -> bool {
                 }
             }
         }
+        Expr::LambdaFunction(lambda_function) => {
+            match lambda_function.func.signature().volatility {
+                Volatility::Immutable => Ok(TreeNodeRecursion::Continue),
+                // TODO: Stable functions could be `applicable`, but that would require access to the context
+                Volatility::Stable | Volatility::Volatile => {
+                    is_applicable = false;
+                    Ok(TreeNodeRecursion::Stop)
+                }
+            }
+        }
 
         // TODO other expressions are not handled yet:
         // - AGGREGATE and WINDOW should not end up in filter conditions, except maybe in some edge cases
@@ -463,7 +473,11 @@ mod tests {
     use std::ops::Not;
 
     use super::*;
-    use datafusion_expr::{Expr, case, col, lit};
+    use datafusion_expr::{
+        case, col, lit, AggregateUDF, Expr, LambdaUDF, LogicalPlan, ScalarUDF, WindowUDF,
+    };
+    use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+    use datafusion_physical_plan::ExecutionPlan;
 
     #[test]
     fn test_split_files() {
@@ -719,5 +733,93 @@ mod tests {
             ),
             Some(Path::from("a=1970-01-05")),
         );
+    }
+
+    pub fn make_test_store_and_state(
+        files: &[(&str, u64)],
+    ) -> (Arc<InMemory>, Arc<dyn Session>) {
+        let memory = InMemory::new();
+
+        for (name, size) in files {
+            memory
+                .put(&Path::from(*name), vec![0; *size as usize].into())
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+        }
+
+        (Arc::new(memory), Arc::new(MockSession {}))
+    }
+
+    struct MockSession {}
+
+    #[async_trait]
+    impl Session for MockSession {
+        fn session_id(&self) -> &str {
+            unimplemented!()
+        }
+
+        fn config(&self) -> &SessionConfig {
+            unimplemented!()
+        }
+
+        async fn create_physical_plan(
+            &self,
+            _logical_plan: &LogicalPlan,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            unimplemented!()
+        }
+
+        fn create_physical_expr(
+            &self,
+            _expr: Expr,
+            _df_schema: &DFSchema,
+        ) -> Result<Arc<dyn PhysicalExpr>> {
+            unimplemented!()
+        }
+
+        fn scalar_functions(&self) -> &std::collections::HashMap<String, Arc<ScalarUDF>> {
+            unimplemented!()
+        }
+
+        fn lambda_functions(
+            &self,
+        ) -> &std::collections::HashMap<String, Arc<dyn LambdaUDF>> {
+            unimplemented!()
+        }
+
+        fn aggregate_functions(
+            &self,
+        ) -> &std::collections::HashMap<String, Arc<AggregateUDF>> {
+            unimplemented!()
+        }
+
+        fn window_functions(&self) -> &std::collections::HashMap<String, Arc<WindowUDF>> {
+            unimplemented!()
+        }
+
+        fn runtime_env(&self) -> &Arc<RuntimeEnv> {
+            unimplemented!()
+        }
+
+        fn execution_props(&self) -> &ExecutionProps {
+            unimplemented!()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            unimplemented!()
+        }
+
+        fn table_options(&self) -> &TableOptions {
+            unimplemented!()
+        }
+
+        fn table_options_mut(&mut self) -> &mut TableOptions {
+            unimplemented!()
+        }
+
+        fn task_ctx(&self) -> Arc<datafusion_execution::TaskContext> {
+            unimplemented!()
+        }
     }
 }

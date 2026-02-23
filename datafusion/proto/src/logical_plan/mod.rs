@@ -52,7 +52,7 @@ use datafusion_datasource_json::file_format::JsonFormat as OtherNdJsonFormat;
 #[cfg(feature = "parquet")]
 use datafusion_datasource_parquet::file_format::ParquetFormat;
 use datafusion_expr::{
-    AggregateUDF, DmlStatement, FetchType, RecursiveQuery, SkipType, TableSource, Unnest,
+    AggregateUDF, DmlStatement, FetchType, LambdaUDF, RecursiveQuery, SkipType, TableSource, Unnest,
 };
 use datafusion_expr::{
     DistinctOn, DropView, Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, SortExpr,
@@ -150,6 +150,14 @@ pub trait LogicalExtensionCodec: Debug + Send + Sync {
     }
 
     fn try_encode_udf(&self, _node: &ScalarUDF, _buf: &mut Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+    
+    fn try_decode_udlf(&self, name: &str, _buf: &[u8]) -> Result<Arc<dyn LambdaUDF>> {
+        not_impl_err!("LogicalExtensionCodec is not provided for lambda function {name}")
+    }
+
+    fn try_encode_udlf(&self, _node: &dyn LambdaUDF, _buf: &mut Vec<u8>) -> Result<()> {
         Ok(())
     }
 
