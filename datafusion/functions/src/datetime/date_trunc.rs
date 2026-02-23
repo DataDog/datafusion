@@ -897,7 +897,6 @@ mod tests {
                 )
                 .into(),
                 config_options: Arc::new(ConfigOptions::default()),
-                lambdas: None,
             };
             let result = DateTruncFunc::new().invoke_with_args(args).unwrap();
             if let ColumnarValue::Array(result) = result {
@@ -1086,7 +1085,6 @@ mod tests {
                 )
                 .into(),
                 config_options: Arc::new(ConfigOptions::default()),
-                lambdas: None,
             };
             let result = DateTruncFunc::new().invoke_with_args(args).unwrap();
             if let ColumnarValue::Array(result) = result {

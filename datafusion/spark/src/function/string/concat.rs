@@ -114,7 +114,6 @@ fn spark_concat(args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         number_rows,
         return_field,
         config_options,
-        lambdas,
     } = args;
 
     // Handle zero-argument case: return empty string
@@ -140,7 +139,6 @@ fn spark_concat(args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         number_rows,
         return_field,
         config_options,
-        lambdas,
     };
     let result = concat_func.invoke_with_args(func_args)?;
 

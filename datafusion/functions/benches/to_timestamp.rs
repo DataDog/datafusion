@@ -135,7 +135,6 @@ fn criterion_benchmark(c: &mut Criterion) {
                         number_rows: batch_len,
                         return_field: Arc::clone(&return_field),
                         config_options: Arc::clone(&config_options),
-                        lambdas: None,
                     })
                     .expect("to_timestamp should work on valid values"),
             )
@@ -157,7 +156,6 @@ fn criterion_benchmark(c: &mut Criterion) {
                         number_rows: batch_len,
                         return_field: Arc::clone(&return_field),
                         config_options: Arc::clone(&config_options),
-                        lambdas: None,
                     })
                     .expect("to_timestamp should work on valid values"),
             )
@@ -179,7 +177,6 @@ fn criterion_benchmark(c: &mut Criterion) {
                         number_rows: batch_len,
                         return_field: Arc::clone(&return_field),
                         config_options: Arc::clone(&config_options),
-                        lambdas: None,
                     })
                     .expect("to_timestamp should work on valid values"),
             )
@@ -214,7 +211,6 @@ fn criterion_benchmark(c: &mut Criterion) {
                         number_rows: batch_len,
                         return_field: Arc::clone(&return_field),
                         config_options: Arc::clone(&config_options),
-                        lambdas: None,
                     })
                     .expect("to_timestamp should work on valid values"),
             )
@@ -257,7 +253,6 @@ fn criterion_benchmark(c: &mut Criterion) {
                         number_rows: batch_len,
                         return_field: Arc::clone(&return_field),
                         config_options: Arc::clone(&config_options),
-                        lambdas: None,
                     })
                     .expect("to_timestamp should work on valid values"),
             )
@@ -301,7 +296,6 @@ fn criterion_benchmark(c: &mut Criterion) {
                         number_rows: batch_len,
                         return_field: Arc::clone(&return_field),
                         config_options: Arc::clone(&config_options),
-                        lambdas: None,
                     })
                     .expect("to_timestamp should work on valid values"),
             )

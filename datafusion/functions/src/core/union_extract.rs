@@ -216,7 +216,6 @@ mod tests {
             number_rows: 1,
             return_field: Field::new("f", DataType::Utf8, true).into(),
             config_options: Arc::new(ConfigOptions::default()),
-            lambdas: None,
         })?;
 
         assert_scalar(result, ScalarValue::Utf8(None));
@@ -240,7 +239,6 @@ mod tests {
             number_rows: 1,
             return_field: Field::new("f", DataType::Utf8, true).into(),
             config_options: Arc::new(ConfigOptions::default()),
-            lambdas: None,
         })?;
 
         assert_scalar(result, ScalarValue::Utf8(None));
@@ -264,7 +262,6 @@ mod tests {
             number_rows: 1,
             return_field: Field::new("f", DataType::Utf8, true).into(),
             config_options: Arc::new(ConfigOptions::default()),
-            lambdas: None,
         })?;
 
         assert_scalar(result, ScalarValue::new_utf8("42"));
