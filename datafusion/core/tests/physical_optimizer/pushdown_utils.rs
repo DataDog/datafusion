@@ -24,9 +24,11 @@ use datafusion_datasource::{
     file_scan_config::FileScanConfig, file_scan_config::FileScanConfigBuilder,
     file_stream::FileOpenFuture, file_stream::FileOpener, source::DataSourceExec,
 };
-use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+use datafusion_physical_expr::expressions::DynamicFilterRuntimeContext;
 use datafusion_physical_expr::projection::ProjectionExprs;
-use datafusion_physical_expr_common::physical_expr::fmt_sql;
+use datafusion_physical_expr_common::physical_expr::{
+    bind_runtime_physical_expr, fmt_sql,
+};
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_plan::filter::batch_filter;
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPhase, PushedDown};
@@ -75,15 +77,11 @@ impl FileOpener for TestOpener {
             batches = new_batches.into_iter().collect();
         }
 
+        let runtime_ctx = DynamicFilterRuntimeContext::for_partition(self.partition);
         let predicate = self
             .predicate
             .clone()
-            .map(|p| {
-                DynamicFilterPhysicalExpr::bind_for_partition_in_expr_tree(
-                    p,
-                    self.partition,
-                )
-            })
+            .map(|p| bind_runtime_physical_expr(p, &runtime_ctx))
             .transpose()?;
 
         let mut new_batches = Vec::new();

@@ -41,11 +41,11 @@ use datafusion_common::{
     ColumnStatistics, DataFusionError, Result, ScalarValue, Statistics, exec_err,
 };
 use datafusion_datasource::{PartitionedFile, TableSchema};
-use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+use datafusion_physical_expr::expressions::DynamicFilterRuntimeContext;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::{
-    PhysicalExpr, is_dynamic_physical_expr,
+    PhysicalExpr, bind_runtime_physical_expr, is_dynamic_physical_expr,
 };
 use datafusion_physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, PruningMetrics,
@@ -261,16 +261,13 @@ impl FileOpener for ParquetOpener {
                 .transpose()?;
         }
 
-        // Bind partition-local dynamic filters for this opener partition.
-        // For partition-index dynamic filters this binds probe partition `i` to
-        // build-side filter `i`.
+        // Bind runtime context for this opener partition.
+        // For partition-index dynamic filters this binds probe partition `i`
+        // to build-side filter `i`.
+        let runtime_ctx =
+            DynamicFilterRuntimeContext::for_partition(self.partition_index);
         predicate = predicate
-            .map(|p| {
-                DynamicFilterPhysicalExpr::bind_for_partition_in_expr_tree(
-                    p,
-                    self.partition_index,
-                )
-            })
+            .map(|p| bind_runtime_physical_expr(p, &runtime_ctx))
             .transpose()?;
 
         let reorder_predicates = self.reorder_filters;
