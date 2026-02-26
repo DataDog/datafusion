@@ -101,3 +101,8 @@ name = "sort_preserving_merge"
 harness = false
 name = "aggregate_vectorized"
 required-features = ["test_utils"]
+
+[[bench]]
+harness = false
+name = "dict_group_values"
+required-features = ["test_utils"]
