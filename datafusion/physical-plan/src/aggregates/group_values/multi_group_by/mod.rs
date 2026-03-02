@@ -248,8 +248,18 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     /// reused buffer to store hashes
     hashes_buffer: Vec<u64>,
 
+    /// Reused buffer for boundary detection in streaming mode
+    boundaries_buffer: Vec<bool>,
+
     /// Random state for creating hashes
     random_state: RandomState,
+
+    /// The group index assigned to the last row of the previous batch.
+    /// Used in streaming (sorted) mode to compare the first row of a new
+    /// batch with the current group, avoiding hash computation for rows
+    /// that belong to the same group as the previous row.
+    /// Set to `usize::MAX` when there is no previous group.
+    last_group_idx: usize,
 }
 
 /// Buffers to store intermediate results in `vectorized_append`
@@ -301,7 +311,9 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             map_size: 0,
             group_values: vec![],
             hashes_buffer: Default::default(),
+            boundaries_buffer: Default::default(),
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
+            last_group_idx: usize::MAX,
         })
     }
 
@@ -358,39 +370,76 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
         // tracks to which group each of the input rows belongs
         groups.clear();
 
-        // 1.1 Calculate the group keys for the group values
-        let batch_hashes = &mut self.hashes_buffer;
-        batch_hashes.clear();
-        batch_hashes.resize(n_rows, 0);
-        create_hashes(cols, &self.random_state, batch_hashes)?;
+        if n_rows == 0 {
+            return Ok(());
+        }
 
-        for (row, &target_hash) in batch_hashes.iter().enumerate() {
+        // Optimization for sorted/streaming aggregation:
+        // Since data arrives sorted, most consecutive rows belong to the same group.
+        // Instead of hashing ALL rows upfront (expensive for 150M+ rows),
+        // we detect group boundaries in batch (column-wise, vectorizable),
+        // then only hash+lookup the ~5% of rows that are boundary rows.
+
+        // Pass 1: Detect group boundaries by comparing adjacent rows.
+        // Each GroupColumn processes its entire column in a tight inner loop
+        // (one virtual call per column, NOT per row).
+        let boundaries = &mut self.boundaries_buffer;
+        boundaries.clear();
+        boundaries.resize(n_rows, false);
+
+        // Row 0: compare with stored group values from previous batch
+        if self.last_group_idx == usize::MAX
+            || !self
+                .group_values
+                .iter()
+                .enumerate()
+                .all(|(i, gv)| gv.equal_to(self.last_group_idx, &cols[i], 0))
+        {
+            boundaries[0] = true;
+        }
+
+        // Rows 1..n: compare adjacent rows within the batch (column-wise)
+        for (i, gv) in self.group_values.iter().enumerate() {
+            gv.compute_boundaries(&cols[i], boundaries);
+        }
+
+        // Pass 2: Process boundary rows (hash + map lookup).
+        // Non-boundary rows get the same group index as their predecessor.
+        let mut current_group_idx = self.last_group_idx;
+
+        for row in 0..n_rows {
+            if !boundaries[row] {
+                // Not a boundary - same group as previous row
+                groups.push(current_group_idx);
+                continue;
+            }
+
+            // Group boundary - compute hash for this single row
+            let target_hash = {
+                let mut h = 0u64;
+                for (i, gv) in self.group_values.iter().enumerate() {
+                    h = gv.hash_input_row(
+                        &cols[i],
+                        row,
+                        &self.random_state,
+                        i > 0,
+                        h,
+                    );
+                }
+                h
+            };
+
             let entry = self
                 .map
                 .find_mut(target_hash, |(exist_hash, group_idx_view)| {
-                    // It is ensured to be inlined in `scalarized_intern`
                     debug_assert!(!group_idx_view.is_non_inlined());
 
-                    // Somewhat surprisingly, this closure can be called even if the
-                    // hash doesn't match, so check the hash first with an integer
-                    // comparison first avoid the more expensive comparison with
-                    // group value. https://github.com/apache/datafusion/pull/11718
                     if target_hash != *exist_hash {
                         return false;
                     }
 
-                    fn check_row_equal(
-                        array_row: &dyn GroupColumn,
-                        lhs_row: usize,
-                        array: &ArrayRef,
-                        rhs_row: usize,
-                    ) -> bool {
-                        array_row.equal_to(lhs_row, array, rhs_row)
-                    }
-
                     for (i, group_val) in self.group_values.iter().enumerate() {
-                        if !check_row_equal(
-                            group_val.as_ref(),
+                        if !group_val.equal_to(
                             group_idx_view.value() as usize,
                             &cols[i],
                             row,
@@ -402,18 +451,13 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                     true
                 });
 
-            let group_idx = match entry {
-                // Existing group_index for this group value
+            current_group_idx = match entry {
                 Some((_hash, group_idx_view)) => group_idx_view.value() as usize,
-                //  1.2 Need to create new entry for the group
                 None => {
-                    // Add new entry to aggr_state and save newly created index
-                    // let group_idx = group_values.num_rows();
-                    // group_values.push(group_rows.row(row));
-
                     let mut checklen = 0;
                     let group_idx = self.group_values[0].len();
-                    for (i, group_value) in self.group_values.iter_mut().enumerate() {
+                    for (i, group_value) in self.group_values.iter_mut().enumerate()
+                    {
                         group_value.append_val(&cols[i], row)?;
                         let len = group_value.len();
                         if i == 0 {
@@ -423,18 +467,21 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                         }
                     }
 
-                    // for hasher function, use precomputed hash value
                     self.map.insert_accounted(
-                        (target_hash, GroupIndexView::new_inlined(group_idx as u64)),
+                        (
+                            target_hash,
+                            GroupIndexView::new_inlined(group_idx as u64),
+                        ),
                         |(hash, _group_index)| *hash,
                         &mut self.map_size,
                     );
                     group_idx
                 }
             };
-            groups.push(group_idx);
+            groups.push(current_group_idx);
         }
 
+        self.last_group_idx = current_group_idx;
         Ok(())
     }
 
@@ -1106,7 +1153,7 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
 
     fn size(&self) -> usize {
         let group_values_size: usize = self.group_values.iter().map(|v| v.size()).sum();
-        group_values_size + self.map_size + self.hashes_buffer.allocated_size()
+        group_values_size + self.map_size + self.hashes_buffer.allocated_size() + self.boundaries_buffer.allocated_size()
     }
 
     fn is_empty(&self) -> bool {
@@ -1122,6 +1169,19 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
     }
 
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        // Update last_group_idx for streaming mode
+        match emit_to {
+            EmitTo::All => {
+                self.last_group_idx = usize::MAX;
+            }
+            EmitTo::First(n) => {
+                if self.last_group_idx != usize::MAX {
+                    self.last_group_idx =
+                        self.last_group_idx.checked_sub(n).unwrap_or(usize::MAX);
+                }
+            }
+        }
+
         let mut output = match emit_to {
             EmitTo::All => {
                 let group_values = mem::take(&mut self.group_values);
@@ -1226,10 +1286,13 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
     fn clear_shrink(&mut self, num_rows: usize) {
         self.group_values.clear();
         self.map.clear();
+        self.last_group_idx = usize::MAX;
         self.map.shrink_to(num_rows, |_| 0); // hasher does not matter since the map is cleared
         self.map_size = self.map.capacity() * size_of::<(u64, usize)>();
         self.hashes_buffer.clear();
         self.hashes_buffer.shrink_to(num_rows);
+        self.boundaries_buffer.clear();
+        self.boundaries_buffer.shrink_to(num_rows);
 
         // Such structures are only used in `non-streaming` case
         if !STREAMING {
