@@ -26,6 +26,8 @@ use arrow::array::{
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{ByteArrayType, DataType, GenericBinaryType};
 use datafusion_common::utils::proxy::VecAllocExt;
+use ahash::RandomState;
+use datafusion_common::hash_utils::{HashValue, combine_hashes};
 use datafusion_common::{Result, exec_datafusion_err};
 use datafusion_physical_expr_common::binary_map::{INITIAL_BUFFER_CAPACITY, OutputType};
 use itertools::izip;
@@ -422,6 +424,95 @@ where
                 Arc::new(unsafe {
                     GenericStringArray::new_unchecked(offsets, values, null_buffer)
                 })
+            }
+            _ => unreachable!("View types should use `ArrowBytesViewMap`"),
+        }
+    }
+
+    fn input_rows_equal(&self, array: &ArrayRef, row_a: usize, row_b: usize) -> bool {
+        let a_null = array.is_null(row_a);
+        let b_null = array.is_null(row_b);
+        if a_null || b_null {
+            return a_null && b_null;
+        }
+        match self.output_type {
+            OutputType::Binary => {
+                let arr = array.as_bytes::<GenericBinaryType<O>>();
+                arr.value(row_a) == arr.value(row_b)
+            }
+            OutputType::Utf8 => {
+                let arr = array.as_bytes::<GenericStringType<O>>();
+                arr.value(row_a) == arr.value(row_b)
+            }
+            _ => unreachable!("View types should use `ArrowBytesViewMap`"),
+        }
+    }
+
+    fn hash_input_row(
+        &self,
+        array: &ArrayRef,
+        row: usize,
+        random_state: &RandomState,
+        rehash: bool,
+        current_hash: u64,
+    ) -> u64 {
+        if array.is_null(row) {
+            return current_hash;
+        }
+        let h = match self.output_type {
+            OutputType::Binary => {
+                let arr = array.as_bytes::<GenericBinaryType<O>>();
+                arr.value(row).hash_one(random_state)
+            }
+            OutputType::Utf8 => {
+                let arr = array.as_bytes::<GenericStringType<O>>();
+                arr.value(row).hash_one(random_state)
+            }
+            _ => unreachable!("View types should use `ArrowBytesViewMap`"),
+        };
+        if rehash {
+            combine_hashes(h, current_hash)
+        } else {
+            h
+        }
+    }
+
+    fn compute_boundaries(&self, array: &ArrayRef, boundaries: &mut [bool]) {
+        let has_nulls = array.null_count() > 0;
+        match self.output_type {
+            OutputType::Binary => {
+                let arr = array.as_bytes::<GenericBinaryType<O>>();
+                for row in 1..array.len() {
+                    if boundaries[row] {
+                        continue;
+                    }
+                    if has_nulls {
+                        let prev_null = array.is_null(row - 1);
+                        let curr_null = array.is_null(row);
+                        if prev_null != curr_null || (!prev_null && arr.value(row - 1) != arr.value(row)) {
+                            boundaries[row] = true;
+                        }
+                    } else if arr.value(row - 1) != arr.value(row) {
+                        boundaries[row] = true;
+                    }
+                }
+            }
+            OutputType::Utf8 => {
+                let arr = array.as_bytes::<GenericStringType<O>>();
+                for row in 1..array.len() {
+                    if boundaries[row] {
+                        continue;
+                    }
+                    if has_nulls {
+                        let prev_null = array.is_null(row - 1);
+                        let curr_null = array.is_null(row);
+                        if prev_null != curr_null || (!prev_null && arr.value(row - 1) != arr.value(row)) {
+                            boundaries[row] = true;
+                        }
+                    } else if arr.value(row - 1) != arr.value(row) {
+                        boundaries[row] = true;
+                    }
+                }
             }
             _ => unreachable!("View types should use `ArrowBytesViewMap`"),
         }

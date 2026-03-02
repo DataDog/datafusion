@@ -20,8 +20,10 @@ use std::sync::Arc;
 use crate::aggregates::group_values::multi_group_by::Nulls;
 use crate::aggregates::group_values::multi_group_by::{GroupColumn, nulls_equal_to};
 use crate::aggregates::group_values::null_builder::MaybeNullBufferBuilder;
+use ahash::RandomState;
 use arrow::array::{Array as _, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder};
 use datafusion_common::Result;
+use datafusion_common::hash_utils::{HashValue, combine_hashes};
 use itertools::izip;
 
 /// An implementation of [`GroupColumn`] for booleans
@@ -190,6 +192,60 @@ impl<const NULLABLE: bool> GroupColumn for BooleanGroupValueBuilder<NULLABLE> {
         new_builder.truncate(n);
 
         Arc::new(BooleanArray::new(new_builder.finish(), first_n_nulls))
+    }
+
+    fn input_rows_equal(&self, array: &ArrayRef, row_a: usize, row_b: usize) -> bool {
+        if NULLABLE {
+            let a_null = array.is_null(row_a);
+            let b_null = array.is_null(row_b);
+            if a_null || b_null {
+                return a_null && b_null;
+            }
+        }
+        let arr = array.as_boolean();
+        arr.value(row_a) == arr.value(row_b)
+    }
+
+    fn hash_input_row(
+        &self,
+        array: &ArrayRef,
+        row: usize,
+        random_state: &RandomState,
+        rehash: bool,
+        current_hash: u64,
+    ) -> u64 {
+        if NULLABLE && array.is_null(row) {
+            return current_hash;
+        }
+        let value = array.as_boolean().value(row);
+        let h = value.hash_one(random_state);
+        if rehash {
+            combine_hashes(h, current_hash)
+        } else {
+            h
+        }
+    }
+
+    fn compute_boundaries(&self, array: &ArrayRef, boundaries: &mut [bool]) {
+        let arr = array.as_boolean();
+        if NULLABLE && array.null_count() > 0 {
+            for row in 1..array.len() {
+                if boundaries[row] {
+                    continue;
+                }
+                let prev_null = array.is_null(row - 1);
+                let curr_null = array.is_null(row);
+                if prev_null != curr_null || (!prev_null && arr.value(row - 1) != arr.value(row)) {
+                    boundaries[row] = true;
+                }
+            }
+        } else {
+            for row in 1..array.len() {
+                if !boundaries[row] && arr.value(row - 1) != arr.value(row) {
+                    boundaries[row] = true;
+                }
+            }
+        }
     }
 }
 

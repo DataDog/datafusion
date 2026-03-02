@@ -21,8 +21,10 @@ use crate::aggregates::group_values::multi_group_by::{
 use crate::aggregates::group_values::null_builder::MaybeNullBufferBuilder;
 use arrow::array::{Array, ArrayRef, AsArray, ByteView, GenericByteViewArray, make_view};
 use arrow::buffer::{Buffer, ScalarBuffer};
+use ahash::RandomState;
 use arrow::datatypes::ByteViewType;
 use datafusion_common::Result;
+use datafusion_common::hash_utils::{HashValue, combine_hashes};
 use itertools::izip;
 use std::marker::PhantomData;
 use std::mem::{replace, size_of};
@@ -576,6 +578,146 @@ impl<B: ByteViewType> GroupColumn for ByteViewGroupValueBuilder<B> {
 
     fn take_n(&mut self, n: usize) -> ArrayRef {
         self.take_n_inner(n)
+    }
+
+    fn input_rows_equal(&self, array: &ArrayRef, row_a: usize, row_b: usize) -> bool {
+        let a_null = array.is_null(row_a);
+        let b_null = array.is_null(row_b);
+        if a_null || b_null {
+            return a_null && b_null;
+        }
+        // Use the raw bytes for comparison (works for both StringView and BinaryView)
+        // SAFETY: we checked for nulls above
+        let arr = array.as_byte_view::<B>();
+        let a_len = arr.views()[row_a] as u32;
+        let b_len = arr.views()[row_b] as u32;
+        if a_len != b_len {
+            return false;
+        }
+        if a_len <= 12 {
+            // Inlined: compare the view payloads directly (first 4 bytes of value are in high bits)
+            arr.views()[row_a] == arr.views()[row_b]
+        } else {
+            // Not inlined: compare prefixes first, then full data
+            let a_view = ByteView::from(arr.views()[row_a]);
+            let b_view = ByteView::from(arr.views()[row_b]);
+            if a_view.prefix != b_view.prefix {
+                return false;
+            }
+            let bufs = arr.data_buffers();
+            let a_bytes = unsafe {
+                bufs.get_unchecked(a_view.buffer_index as usize)
+                    .get_unchecked(a_view.offset as usize..(a_view.offset as usize + a_len as usize))
+            };
+            let b_bytes = unsafe {
+                bufs.get_unchecked(b_view.buffer_index as usize)
+                    .get_unchecked(b_view.offset as usize..(b_view.offset as usize + b_len as usize))
+            };
+            a_bytes == b_bytes
+        }
+    }
+
+    fn hash_input_row(
+        &self,
+        array: &ArrayRef,
+        row: usize,
+        random_state: &RandomState,
+        rehash: bool,
+        current_hash: u64,
+    ) -> u64 {
+        if array.is_null(row) {
+            return current_hash;
+        }
+        // Get raw bytes for hashing (matches create_hashes byte-view path)
+        let arr = array.as_byte_view::<B>();
+        let view_len = arr.views()[row] as u32;
+        let bytes: &[u8] = if view_len <= 12 {
+            // Inlined view
+            let view = arr.views()[row];
+            unsafe {
+                std::slice::from_raw_parts(
+                    ((&view) as *const u128 as *const u8).add(4),
+                    view_len as usize,
+                )
+            }
+        } else {
+            let view = ByteView::from(arr.views()[row]);
+            let bufs = arr.data_buffers();
+            unsafe {
+                bufs.get_unchecked(view.buffer_index as usize)
+                    .get_unchecked(view.offset as usize..(view.offset as usize + view_len as usize))
+            }
+        };
+        let h = bytes.hash_one(random_state);
+        if rehash {
+            combine_hashes(h, current_hash)
+        } else {
+            h
+        }
+    }
+
+    fn compute_boundaries(&self, array: &ArrayRef, boundaries: &mut [bool]) {
+        let arr = array.as_byte_view::<B>();
+        let views = arr.views();
+        let has_nulls = array.null_count() > 0;
+        let bufs = arr.data_buffers();
+
+        for row in 1..array.len() {
+            if boundaries[row] {
+                continue;
+            }
+
+            if has_nulls {
+                let prev_null = array.is_null(row - 1);
+                let curr_null = array.is_null(row);
+                if prev_null != curr_null {
+                    boundaries[row] = true;
+                    continue;
+                }
+                if prev_null {
+                    // both null => same group, not a boundary
+                    continue;
+                }
+            }
+
+            // Compare the two views
+            let prev_view = views[row - 1];
+            let curr_view = views[row];
+
+            let prev_len = prev_view as u32;
+            let curr_len = curr_view as u32;
+
+            if prev_len != curr_len {
+                boundaries[row] = true;
+                continue;
+            }
+
+            if prev_len <= 12 {
+                // Both inlined: compare the full u128 views
+                if prev_view != curr_view {
+                    boundaries[row] = true;
+                }
+            } else {
+                // Both non-inlined: compare prefixes, then full data if needed
+                let pv = ByteView::from(prev_view);
+                let cv = ByteView::from(curr_view);
+                if pv.prefix != cv.prefix {
+                    boundaries[row] = true;
+                } else {
+                    let prev_bytes = unsafe {
+                        bufs.get_unchecked(pv.buffer_index as usize)
+                            .get_unchecked(pv.offset as usize..(pv.offset as usize + prev_len as usize))
+                    };
+                    let curr_bytes = unsafe {
+                        bufs.get_unchecked(cv.buffer_index as usize)
+                            .get_unchecked(cv.offset as usize..(cv.offset as usize + curr_len as usize))
+                    };
+                    if prev_bytes != curr_bytes {
+                        boundaries[row] = true;
+                    }
+                }
+            }
+        }
     }
 }
 

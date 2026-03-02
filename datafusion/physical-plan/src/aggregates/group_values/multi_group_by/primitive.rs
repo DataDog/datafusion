@@ -19,11 +19,13 @@ use crate::aggregates::group_values::multi_group_by::{
     GroupColumn, Nulls, nulls_equal_to,
 };
 use crate::aggregates::group_values::null_builder::MaybeNullBufferBuilder;
+use ahash::RandomState;
 use arrow::array::ArrowNativeTypeOp;
 use arrow::array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, cast::AsArray};
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::DataType;
 use datafusion_common::Result;
+use datafusion_common::hash_utils::{HashValue, combine_hashes};
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use itertools::izip;
 use std::iter;
@@ -139,6 +141,8 @@ where
 
 impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
     for PrimitiveGroupValueBuilder<T, NULLABLE>
+where
+    T::Native: HashValue,
 {
     fn equal_to(&self, lhs_row: usize, array: &ArrayRef, rhs_row: usize) -> bool {
         // Perf: skip null check (by short circuit) if input is not nullable
@@ -273,6 +277,61 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
             PrimitiveArray::<T>::new(ScalarBuffer::from(first_n), first_n_nulls)
                 .with_data_type(self.data_type.clone()),
         )
+    }
+
+    fn input_rows_equal(&self, array: &ArrayRef, row_a: usize, row_b: usize) -> bool {
+        if NULLABLE {
+            let a_null = array.is_null(row_a);
+            let b_null = array.is_null(row_b);
+            if a_null || b_null {
+                return a_null && b_null;
+            }
+        }
+        let arr = array.as_primitive::<T>();
+        arr.value(row_a).is_eq(arr.value(row_b))
+    }
+
+    fn hash_input_row(
+        &self,
+        array: &ArrayRef,
+        row: usize,
+        random_state: &RandomState,
+        rehash: bool,
+        current_hash: u64,
+    ) -> u64 {
+        if NULLABLE && array.is_null(row) {
+            return current_hash;
+        }
+        let value = array.as_primitive::<T>().value(row);
+        let h = value.hash_one(random_state);
+        if rehash {
+            combine_hashes(h, current_hash)
+        } else {
+            h
+        }
+    }
+
+    fn compute_boundaries(&self, array: &ArrayRef, boundaries: &mut [bool]) {
+        let arr = array.as_primitive::<T>();
+        let values = arr.values();
+        if NULLABLE && array.null_count() > 0 {
+            for row in 1..values.len() {
+                if boundaries[row] {
+                    continue;
+                }
+                let prev_null = array.is_null(row - 1);
+                let curr_null = array.is_null(row);
+                if prev_null != curr_null || (!prev_null && !values[row - 1].is_eq(values[row])) {
+                    boundaries[row] = true;
+                }
+            }
+        } else {
+            for row in 1..values.len() {
+                if !boundaries[row] && !values[row - 1].is_eq(values[row]) {
+                    boundaries[row] = true;
+                }
+            }
+        }
     }
 }
 

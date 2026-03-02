@@ -40,6 +40,7 @@ use arrow::datatypes::{
     TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type, UInt32Type,
     UInt64Type,
 };
+use ahash::RandomState as AHashRandomState;
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::{Result, internal_datafusion_err, not_impl_err};
 use datafusion_execution::memory_pool::proxy::{HashTableAllocExt, VecAllocExt};
@@ -105,6 +106,32 @@ pub trait GroupColumn: Send + Sync {
     /// Builds a new array from the first `n` stored rows, shifting the
     /// remaining rows to the start of the builder
     fn take_n(&mut self, n: usize) -> ArrayRef;
+
+    /// Compare two rows within the same input array for equality.
+    /// Used for detecting group boundaries in sorted streaming aggregation.
+    /// Returns true if both are null, false if only one is null,
+    /// and compares values otherwise.
+    fn input_rows_equal(&self, array: &ArrayRef, row_a: usize, row_b: usize) -> bool;
+
+    /// Hash a single row from the input array.
+    /// When `rehash` is true, combines with `current_hash` using `combine_hashes`.
+    /// When `rehash` is false, returns the hash of the value directly.
+    /// For null values, returns `current_hash` unchanged (matches `create_hashes` behavior).
+    fn hash_input_row(
+        &self,
+        array: &ArrayRef,
+        row: usize,
+        random_state: &AHashRandomState,
+        rehash: bool,
+        current_hash: u64,
+    ) -> u64;
+
+    /// Mark group boundaries by comparing adjacent rows in the input array.
+    /// For each row i > 0 where `boundaries[i]` is still false, sets
+    /// `boundaries[i] = true` if `array[i] != array[i-1]`.
+    /// Processes the entire column in a tight inner loop to avoid
+    /// per-row virtual dispatch overhead.
+    fn compute_boundaries(&self, array: &ArrayRef, boundaries: &mut [bool]);
 }
 
 /// Determines if the nullability of the existing and new input array can be used
