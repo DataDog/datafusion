@@ -20,6 +20,7 @@
 mod boolean;
 mod bytes;
 pub mod bytes_view;
+mod fixed_size_binary;
 pub mod primitive;
 
 use std::mem::{self, size_of};
@@ -27,7 +28,9 @@ use std::mem::{self, size_of};
 use crate::aggregates::group_values::GroupValues;
 use crate::aggregates::group_values::multi_group_by::{
     boolean::BooleanGroupValueBuilder, bytes::ByteGroupValueBuilder,
-    bytes_view::ByteViewGroupValueBuilder, primitive::PrimitiveGroupValueBuilder,
+    bytes_view::ByteViewGroupValueBuilder,
+    fixed_size_binary::FixedSizeBinaryGroupValueBuilder,
+    primitive::PrimitiveGroupValueBuilder,
 };
 use ahash::RandomState;
 use arrow::array::{Array, ArrayRef};
@@ -1073,6 +1076,19 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                             v.push(Box::new(b) as _)
                         }
                     }
+                    DataType::FixedSizeBinary(size) => {
+                        if nullable {
+                            let b = FixedSizeBinaryGroupValueBuilder::<true>::new(
+                                *size as usize,
+                            );
+                            v.push(Box::new(b) as _)
+                        } else {
+                            let b = FixedSizeBinaryGroupValueBuilder::<false>::new(
+                                *size as usize,
+                            );
+                            v.push(Box::new(b) as _)
+                        }
+                    }
                     dt => {
                         return not_impl_err!("{dt} not supported in GroupValuesColumn");
                     }
@@ -1262,6 +1278,7 @@ fn supported_type(data_type: &DataType) -> bool {
             | DataType::Utf8View
             | DataType::BinaryView
             | DataType::Boolean
+            | DataType::FixedSizeBinary(_)
     )
 }
 
