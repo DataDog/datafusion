@@ -36,7 +36,7 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::{
     self, AggregateFunctionParams, Alias, Between, BinaryExpr, Case, Exists, InList,
-    InSubquery, Like, ScalarFunction, Sort, WindowFunction,
+    InSubquery, LambdaFunction, Like, ScalarFunction, Sort, WindowFunction,
 };
 use datafusion_expr::expr_rewriter::coerce_plan_expr_for_schema;
 use datafusion_expr::expr_schema::cast_subquery;
@@ -49,9 +49,10 @@ use datafusion_expr::type_coercion::other::{
 use datafusion_expr::type_coercion::{is_datetime, is_utf8_or_utf8view_or_large_utf8};
 use datafusion_expr::utils::merge_schema;
 use datafusion_expr::{
-    AggregateUDF, Cast, Expr, ExprSchemable, Join, Limit, LogicalPlan, Operator,
-    Projection, ScalarUDF, Union, WindowFrame, WindowFrameBound, WindowFrameUnits,
     is_false, is_not_false, is_not_true, is_not_unknown, is_true, is_unknown, lit, not,
+    AggregateUDF, Cast, Expr, ExprSchemable, Join, LambdaTypeSignature, Limit, LogicalPlan,
+    Operator, Projection, ScalarUDF, Union, ValueOrLambdaParameter, WindowFrame,
+    WindowFrameBound, WindowFrameUnits,
 };
 
 /// Performs type coercion by determining the schema
@@ -715,6 +716,62 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                 });
                 Ok(Transformed::yes(new_expr))
             }
+            Expr::LambdaFunction(LambdaFunction { func, args }) => {
+                match func.signature().type_signature {
+                    LambdaTypeSignature::UserDefined => {
+                        let args_types = args
+                            .iter()
+                            .map(|arg| match arg {
+                                Expr::Lambda(_) => Ok(ValueOrLambdaParameter::Lambda),
+                                _ => Ok(ValueOrLambdaParameter::Value(
+                                    arg.get_type(self.schema)?,
+                                )),
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        let value_types = func.coerce_value_types(&args_types)?;
+
+                        if args_types.iter().eq_by(&value_types, |a, b| match (a, b) {
+                            (ValueOrLambdaParameter::Value(_type), None) => false,
+                            (ValueOrLambdaParameter::Value(from), Some(to)) => from == to,
+                            (ValueOrLambdaParameter::Lambda, None) => true,
+                            (ValueOrLambdaParameter::Lambda, Some(_ty)) => false,
+                        }) {
+                            return Ok(Transformed::no(Expr::LambdaFunction(
+                                LambdaFunction::new(func, args),
+                            )));
+                        }
+
+                        let args = std::iter::zip(args, value_types)
+                            .map(|(arg, ty)| match (&arg, ty) {
+                                (Expr::Lambda(_), None) => Ok(arg),
+                                (Expr::Lambda(_), Some(_ty)) => plan_err!("{} coerce_value_types returned Some for a lambda argument", func.name()),
+                                (_, Some(ty)) => arg.cast_to(&ty, self.schema),
+                                (_, None) => plan_err!("{} coerce_value_types returned None for a value argument", func.name()),
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        Ok(Transformed::yes(Expr::LambdaFunction(LambdaFunction::new(
+                            func, args,
+                        ))))
+                    }
+                    LambdaTypeSignature::VariadicAny => Ok(Transformed::no(
+                        Expr::LambdaFunction(LambdaFunction::new(func, args)),
+                    )),
+                    LambdaTypeSignature::Any(number) => {
+                        if args.len() != number {
+                            return plan_err!(
+                                "The function '{}' expected {number} arguments but received {}",
+                                func.name(), args.len()
+                            );
+                        }
+
+                        Ok(Transformed::no(Expr::LambdaFunction(LambdaFunction::new(
+                            func, args,
+                        ))))
+                    }
+                }
+            }
             // TODO: remove the next line after `Expr::Wildcard` is removed
             #[expect(deprecated)]
             Expr::Alias(_)
@@ -731,7 +788,6 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
             | Expr::GroupingSet(_)
             | Expr::Placeholder(_)
             | Expr::OuterReferenceColumn(_, _)
-            | Expr::LambdaFunction(_)
             | Expr::Lambda(_)
             | Expr::LambdaVariable(_) => Ok(Transformed::no(expr)),
         }
