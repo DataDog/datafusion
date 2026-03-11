@@ -36,14 +36,28 @@ pub(crate) fn from_substrait_field_reference(
 ) -> datafusion::common::Result<Expr> {
     match &field_ref.reference_type {
         Some(DirectReference(direct)) => match &direct.reference_type.as_ref() {
-            Some(StructField(x)) => match &x.child.as_ref() {
-                Some(_) => not_impl_err!(
-                    "Direct reference StructField with child is not supported"
-                ),
-                None => Ok(Expr::Column(Column::from(
-                    input_schema.qualified_field(x.field as usize),
-                ))),
-            },
+            Some(StructField(struct_field)) => {
+                if struct_field.child.is_some() {
+                    return not_impl_err!(
+                        "Direct reference StructField with child is not supported"
+                    );
+                }
+                let field_idx = struct_field.field as usize;
+                match &field_ref.root_type {
+                    Some(RootType::RootReference(_)) | None => Ok(Expr::Column(
+                        Column::from(input_schema.qualified_field(field_idx)),
+                    )),
+                    Some(RootType::OuterReference(outer_ref)) => {
+                        resolve_outer_reference(consumer, outer_ref, field_idx)
+                    }
+                    Some(RootType::Expression(_)) => not_impl_err!(
+                        "Expression root type in field reference is not supported"
+                    ),
+                    Some(RootType::LambdaParameterReference(_)) => not_impl_err!(
+                        "Lambda parameter reference in field reference is not yet supported"
+                    ),
+                }
+            }
             _ => not_impl_err!(
                 "Direct reference with types other than StructField is not supported"
             ),

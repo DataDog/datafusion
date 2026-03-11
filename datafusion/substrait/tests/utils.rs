@@ -485,6 +485,7 @@ pub mod test {
                 RexType::DynamicParameter(_) => {}
                 // Enum is deprecated
                 RexType::Enum(_) => {}
+                RexType::Lambda(_) | RexType::LambdaInvocation(_) => {}
             }
             Ok(())
         }
