@@ -1284,6 +1284,10 @@ mod tests {
             Vec::new()
         }
 
+        fn udlf_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+
         fn udaf_names(&self) -> Vec<String> {
             vec!["sum".to_string()]
         }
