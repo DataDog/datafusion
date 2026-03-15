@@ -17,15 +17,15 @@
 
 //! Expression simplification API
 
-use std::collections::HashSet;
-use std::ops::Not;
-use std::{borrow::Cow, sync::Arc};
-
 use arrow::{
     array::{AsArray, new_null_array},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::ops::Not;
+use std::sync::Arc;
 
 use datafusion_common::{
     DFSchema, DataFusionError, Result, ScalarValue, exec_datafusion_err, internal_err,
@@ -37,8 +37,7 @@ use datafusion_common::{
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
 };
 use datafusion_common::{
-    exec_datafusion_err, internal_err, DFSchema, DataFusionError, Result,
-    ScalarValue,
+    exec_datafusion_err, internal_err, DFSchema, DataFusionError, Result, ScalarValue,
 };
 use datafusion_expr::expr::LambdaFunction;
 use datafusion_expr::{
