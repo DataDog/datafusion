@@ -3314,7 +3314,7 @@ impl Display for SchemaDisplay<'_> {
                 )
             }
             Expr::LambdaVariable(c) => {
-                write!(f, "{}", c.name)
+                f.write_str(&c.name)
             }
         }
     }
