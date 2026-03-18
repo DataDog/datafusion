@@ -45,6 +45,14 @@ pub async fn from_scalar_function(
     let fn_name = substrait_fun_name(fn_signature);
     let args = from_substrait_func_args(consumer, &f.arguments, input_schema).await?;
 
+    let udlf_func = consumer.get_function_registry().udlf(fn_name).or_else(|e| {
+        if let Some(alt_name) = substrait_to_df_name(fn_name) {
+            consumer.get_function_registry().udlf(alt_name).or(Err(e))
+        } else {
+            Err(e)
+        }
+    });
+
     let udf_func = consumer.get_function_registry().udf(fn_name).or_else(|e| {
         if let Some(alt_name) = substrait_to_df_name(fn_name) {
             consumer.get_function_registry().udf(alt_name).or(Err(e))
@@ -53,9 +61,14 @@ pub async fn from_scalar_function(
         }
     });
 
-    // try to first match the requested function into registered udfs, then built-in ops
+    // try to first match the requested function into registered udlfs, then udfs, built-in ops
     // and finally built-in expressions
-    if let Ok(func) = udf_func {
+    if let Ok(func) = udlf_func {
+        Ok(Expr::LambdaFunction(expr::LambdaFunction::new(
+            func.to_owned(),
+            args,
+        )))
+    } else if let Ok(func) = udf_func {
         Ok(Expr::ScalarFunction(expr::ScalarFunction::new_udf(
             func.to_owned(),
             args,

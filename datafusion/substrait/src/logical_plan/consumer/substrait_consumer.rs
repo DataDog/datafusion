@@ -23,21 +23,24 @@ use super::{
     from_substrait_rex, from_window_function,
 };
 use crate::extensions::Extensions;
+use crate::logical_plan::consumer::from_substrait_type_without_names;
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::catalog::TableProvider;
 use datafusion::common::{
     DFSchema, ScalarValue, TableReference, not_impl_err, substrait_err,
 };
 use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan};
-use std::sync::Arc;
-use substrait::proto;
+use datafusion::prelude::{lambda, lambda_var};
+use std::collections::VecDeque;
+use std::sync::{Arc, RwLock};
 use substrait::proto::expression as substrait_expression;
 use substrait::proto::expression::{
     Enum, FieldReference, IfThen, Literal, MultiOrList, Nested, ScalarFunction,
     SingularOrList, SwitchExpression, WindowFunction,
 };
+use substrait::proto::{self, Type};
 use substrait::proto::{
     AggregateRel, ConsistentPartitionWindowRel, CrossRel, DynamicParameter, ExchangeRel,
     Expression, ExtensionLeafRel, ExtensionMultiRel, ExtensionSingleRel, FetchRel,
@@ -372,6 +375,36 @@ pub trait SubstraitConsumer: Send + Sync + Sized {
         not_impl_err!("Dynamic Parameter expression not supported")
     }
 
+
+    async fn consume_lambda(
+        &self,
+        expr: &proto::expression::Lambda,
+        input_schema: &DFSchema,
+    ) -> datafusion::common::Result<Expr> {
+        from_lambda(self, expr, input_schema).await
+    }
+
+    // Outer Schema Stack
+    // These methods manage a stack of outer schemas for correlated subquery support.
+    // When entering a subquery, the enclosing query's schema is pushed onto the stack.
+    // Field references with OuterReference root_type use these to resolve columns.
+
+    /// Push an outer schema onto the stack when entering a subquery.
+    fn push_outer_schema(&self, _schema: Arc<DFSchema>) {}
+
+    /// Pop an outer schema from the stack when leaving a subquery.
+    fn pop_outer_schema(&self) {}
+
+    /// Get the outer schema at the given nesting depth.
+    /// `steps_out = 1` is the immediately enclosing query, `steps_out = 2`
+    /// is two levels out, etc. Returns `None` if `steps_out` is 0 or
+    /// exceeds the current nesting depth (the caller should treat this as
+    /// an error in the Substrait plan).
+    fn get_outer_schema(&self, _steps_out: usize) -> Option<Arc<DFSchema>> {
+        None
+    }
+
+
     // User-Defined Functionality
 
     // The details of extension relations, and how to handle them, are fully up to users to specify.
@@ -449,6 +482,32 @@ pub trait SubstraitConsumer: Send + Sync + Sized {
         };
         substrait_err!("Missing handler for user-defined literals {}", type_ref)
     }
+
+    fn with_lambda_parameters(
+        &self,
+        lambda_parameters: &[Type],
+    ) -> datafusion::common::Result<(Vec<String>, Self)>;
+
+    fn lambda_variable(
+        &self,
+        steps_out: usize,
+        field_idx: usize,
+    ) -> datafusion::common::Result<Expr>;
+}
+
+async fn from_lambda(
+    consumer: &impl SubstraitConsumer,
+    expr: &proto::expression::Lambda,
+    input_schema: &DFSchema,
+) -> datafusion::common::Result<Expr> {
+    let parameters = expr.parameters.as_ref().unwrap();
+
+    let (names, consumer) = consumer.with_lambda_parameters(&parameters.types)?;
+
+    let body = expr.body.as_ref().unwrap();
+    let body = consumer.consume_expression(body, input_schema).await?;
+
+    Ok(lambda(names, body))
 }
 
 /// Default SubstraitConsumer for converting standard Substrait without user-defined extensions.
@@ -457,16 +516,72 @@ pub trait SubstraitConsumer: Send + Sync + Sized {
 pub struct DefaultSubstraitConsumer<'a> {
     pub(super) extensions: &'a Extensions,
     pub(super) state: &'a SessionState,
+    outer_schemas: RwLock<Vec<Arc<DFSchema>>>,
+    lambdas_parameters: VecDeque<Vec<FieldRef>>,
+    num_lambda_parameters: usize,
 }
 
 impl<'a> DefaultSubstraitConsumer<'a> {
     pub fn new(extensions: &'a Extensions, state: &'a SessionState) -> Self {
-        DefaultSubstraitConsumer { extensions, state }
+        DefaultSubstraitConsumer {
+            extensions,
+            state,
+            outer_schemas: RwLock::new(Vec::new()),
+            lambdas_parameters: VecDeque::new(),
+            num_lambda_parameters: 0,
+        }
     }
 }
 
 #[async_trait]
 impl SubstraitConsumer for DefaultSubstraitConsumer<'_> {
+    fn with_lambda_parameters(
+        &self,
+        lambda_parameters: &[Type],
+    ) -> datafusion::common::Result<(Vec<String>, Self)> {
+        let mut lambdas_parameters = self.lambdas_parameters.clone();
+
+        let lambda_parameters = lambda_parameters
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                let dt = from_substrait_type_without_names(self, ty)?;
+
+                Ok(Arc::new(Field::new(
+                    format!("p{}", i + self.num_lambda_parameters),
+                    dt,
+                    true,
+                )))
+            })
+            .collect::<datafusion::common::Result<Vec<_>>>()?;
+
+        let names = lambda_parameters.iter().map(|f| f.name().clone()).collect();
+        let num_lambda_parameters = self.num_lambda_parameters + lambda_parameters.len();
+
+        lambdas_parameters.push_front(lambda_parameters);
+
+        Ok((
+            names,
+            Self {
+                extensions: self.extensions,
+                state: self.state,
+                outer_schemas: RwLock::new(self.outer_schemas.read().unwrap().clone()),
+                lambdas_parameters,
+                num_lambda_parameters,
+            },
+        ))
+    }
+
+    fn lambda_variable(
+        &self,
+        steps_out: usize,
+        field_idx: usize,
+    ) -> datafusion::common::Result<Expr> {
+        let var = &self.lambdas_parameters[steps_out][field_idx];
+
+        Ok(lambda_var(var.name(), Arc::clone(var)))
+    }
+
     async fn resolve_table_ref(
         &self,
         table_ref: &TableReference,

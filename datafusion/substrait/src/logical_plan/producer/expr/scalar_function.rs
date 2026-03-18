@@ -35,7 +35,37 @@ pub fn from_lambda_function(
     fun: &expr::LambdaFunction,
     schema: &DFSchemaRef,
 ) -> datafusion::common::Result<Expression> {
-    from_function(producer, fun.name(), &fun.args, schema)
+    let lambdas_parameters = fun.lambdas_parameters(schema)?;
+
+    let arguments = std::iter::zip(&fun.args, lambdas_parameters)
+        .map(|(arg, lambda_parameters)| {
+            let arg = match lambda_parameters {
+                Some(lambda_parameters) => {
+                    let mut producer =
+                        producer.with_lambda_parameters(lambda_parameters)?;
+
+                    producer.handle_expr(arg, schema)?
+                }
+                None => producer.handle_expr(arg, schema)?,
+            };
+
+            Ok(FunctionArgument {
+                arg_type: Some(ArgType::Value(arg)),
+            })
+        })
+        .collect::<datafusion::common::Result<_>>()?;
+
+    let function_anchor = producer.register_function(fun.name().to_string());
+    #[expect(deprecated)]
+    Ok(Expression {
+        rex_type: Some(RexType::ScalarFunction(ScalarFunction {
+            function_reference: function_anchor,
+            arguments,
+            output_type: None,
+            options: vec![],
+            args: vec![],
+        })),
+    })
 }
 
 fn from_function(

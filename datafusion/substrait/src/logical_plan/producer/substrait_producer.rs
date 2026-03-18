@@ -15,14 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use crate::extensions::Extensions;
 use crate::logical_plan::producer::{
-    from_aggregate, from_aggregate_function, from_alias, from_between, from_binary_expr, from_case, from_cast, from_column, from_distinct, from_empty_relation, from_filter, from_in_list, from_in_subquery, from_join, from_lambda_function, from_like, from_limit, from_literal, from_projection, from_repartition, from_scalar_function, from_sort, from_subquery_alias, from_table_scan, from_try_cast, from_unary_expr, from_union, from_values, from_window, from_window_function, to_substrait_rel, to_substrait_rex
+    from_aggregate, from_aggregate_function, from_alias, from_between, from_binary_expr,
+    from_case, from_cast, from_column, from_distinct, from_empty_relation, from_exists,
+    from_filter, from_in_list, from_in_subquery, from_join, from_lambda_function,
+    from_like, from_limit, from_literal, from_projection, from_repartition,
+    from_scalar_function, from_scalar_subquery, from_set_comparison, from_sort,
+    from_subquery_alias, from_table_scan, from_try_cast, from_unary_expr, from_union,
+    from_values, from_window, from_window_function, to_substrait_rel, to_substrait_rex,
+    to_substrait_type_from_field,
 };
-use datafusion::common::{Column, DFSchemaRef, ScalarValue, substrait_err};
+use datafusion::arrow::datatypes::Field;
+use datafusion::common::{
+    Column, DFSchemaRef, HashMap, ScalarValue, substrait_datafusion_err, substrait_err,
+};
 use datafusion::execution::SessionState;
 use datafusion::execution::registry::SerializerRegistry;
-use datafusion::logical_expr::expr::{Alias, InList, InSubquery, WindowFunction};
+use datafusion::logical_expr::Subquery;
+use datafusion::logical_expr::expr::{
+    Alias, Exists, InList, InSubquery, Lambda, LambdaVariable, SetComparison,
+    WindowFunction,
+};
 use datafusion::logical_expr::{
     Aggregate, Between, BinaryExpr, Case, Cast, Distinct, EmptyRelation, Expr, Extension,
     Filter, Join, Like, Limit, LogicalPlan, Projection, Repartition, Sort, SubqueryAlias,
@@ -30,7 +46,13 @@ use datafusion::logical_expr::{
 };
 use pbjson_types::Any as ProtoAny;
 use substrait::proto::aggregate_rel::Measure;
+use substrait::proto::expression::field_reference::{
+    LambdaParameterReference, ReferenceType, RootType,
+};
+use substrait::proto::expression::reference_segment::{self, StructField};
+use substrait::proto::expression::{FieldReference, ReferenceSegment, RexType};
 use substrait::proto::rel::RelType;
+use substrait::proto::r#type::Struct;
 use substrait::proto::{
     Expression, ExtensionLeafRel, ExtensionMultiRel, ExtensionSingleRel, Rel,
 };
@@ -364,11 +386,108 @@ pub trait SubstraitProducer: Send + Sync + Sized {
     ) -> datafusion::common::Result<Expression> {
         from_in_subquery(self, in_subquery, schema)
     }
+
+
+    fn handle_set_comparison(
+        &mut self,
+        set_comparison: &SetComparison,
+        schema: &DFSchemaRef,
+    ) -> datafusion::common::Result<Expression> {
+        from_set_comparison(self, set_comparison, schema)
+    }
+    fn handle_scalar_subquery(
+        &mut self,
+        subquery: &Subquery,
+        schema: &DFSchemaRef,
+    ) -> datafusion::common::Result<Expression> {
+        from_scalar_subquery(self, subquery, schema)
+    }
+
+    fn handle_exists(
+        &mut self,
+        exists: &Exists,
+        schema: &DFSchemaRef,
+    ) -> datafusion::common::Result<Expression> {
+        from_exists(self, exists, schema)
+    }
+
+    fn handle_lambda(
+        &mut self,
+        lambda: &Lambda,
+        schema: &DFSchemaRef,
+    ) -> datafusion::common::Result<Expression> {
+        from_lambda(self, lambda, schema)
+    }
+
+    fn handle_lambda_variable(
+        &mut self,
+        lambda_variable: &LambdaVariable,
+        schema: &DFSchemaRef,
+    ) -> datafusion::common::Result<Expression> {
+        from_lambda_variable(self, lambda_variable, schema)
+    }
+
+    fn with_lambda_parameters(
+        &mut self,
+        lambda_parameters: Vec<Field>,
+    ) -> datafusion::common::Result<Self>;
+
+    fn lambda_variable(&self, name: &str) -> datafusion::common::Result<(i32, u32)>;
+
+    fn lambda_parameter_type(
+        &self,
+        name: &str,
+    ) -> datafusion::common::Result<substrait::proto::Type>;
+}
+
+fn from_lambda_variable(
+    producer: &mut impl SubstraitProducer,
+    lambda_variable: &LambdaVariable,
+    _schema: &datafusion::common::DFSchema,
+) -> Result<Expression, datafusion::error::DataFusionError> {
+    let (field, steps_out) = producer.lambda_variable(&lambda_variable.name)?;
+
+    Ok(Expression {
+        rex_type: Some(RexType::Selection(Box::new(FieldReference {
+            reference_type: Some(ReferenceType::DirectReference(ReferenceSegment {
+                reference_type: Some(reference_segment::ReferenceType::StructField(
+                    Box::new(StructField { field, child: None }),
+                )),
+            })),
+            root_type: Some(RootType::LambdaParameterReference(
+                LambdaParameterReference { steps_out },
+            )),
+        }))),
+    })
+}
+
+fn from_lambda(
+    producer: &mut impl SubstraitProducer,
+    lambda: &Lambda,
+    schema: &DFSchemaRef,
+) -> Result<Expression, datafusion::error::DataFusionError> {
+    Ok(Expression {
+        rex_type: Some(RexType::Lambda(Box::new(
+            substrait::proto::expression::Lambda {
+                parameters: Some(Struct {
+                    nullability: 1,
+                    type_variation_reference: 0,
+                    types: lambda
+                        .params
+                        .iter()
+                        .map(|p| producer.lambda_parameter_type(p))
+                        .collect::<datafusion::error::Result<_>>()?,
+                }),
+                body: Some(Box::new(producer.handle_expr(&lambda.body, schema)?)),
+            },
+        ))),
+    })
 }
 
 pub struct DefaultSubstraitProducer<'a> {
     extensions: Extensions,
     serializer_registry: &'a dyn SerializerRegistry,
+    lambdas_variables: HashMap<String, (i32, u32, substrait::proto::Type)>,
 }
 
 impl<'a> DefaultSubstraitProducer<'a> {
@@ -376,6 +495,7 @@ impl<'a> DefaultSubstraitProducer<'a> {
         DefaultSubstraitProducer {
             extensions: Extensions::default(),
             serializer_registry: state.serializer_registry().as_ref(),
+            lambdas_variables: HashMap::new(),
         }
     }
 }
@@ -429,5 +549,52 @@ impl SubstraitProducer for DefaultSubstraitProducer<'_> {
         Ok(Box::new(Rel {
             rel_type: Some(rel_type),
         }))
+    }
+
+    fn with_lambda_parameters(
+        &mut self,
+        lambda_parameters: Vec<Field>,
+    ) -> datafusion::common::Result<Self> {
+        let mut lambdas_variables = self.lambdas_variables.clone();
+
+        for (_field_idx, hops_out, _type) in lambdas_variables.values_mut() {
+            *hops_out += 1;
+        }
+
+        for (field_idx, field) in lambda_parameters.iter().enumerate() {
+            let hops_out = 0;
+
+            lambdas_variables.insert(
+                field.name().clone(),
+                (
+                    field_idx as i32,
+                    hops_out,
+                    to_substrait_type_from_field(self, &Arc::new(field.clone()))?,
+                ),
+            );
+        }
+
+        Ok(Self {
+            extensions: self.extensions.clone(),
+            serializer_registry: self.serializer_registry,
+            lambdas_variables,
+        })
+    }
+
+    fn lambda_variable(&self, name: &str) -> datafusion::common::Result<(i32, u32)> {
+        self.lambdas_variables
+            .get(name)
+            .map(|(field, steps_out, _type)| (*field, *steps_out))
+            .ok_or_else(|| substrait_datafusion_err!("unknow lambda variable {name}"))
+    }
+
+    fn lambda_parameter_type(
+        &self,
+        name: &str,
+    ) -> datafusion::common::Result<substrait::proto::Type> {
+        self.lambdas_variables
+            .get(name)
+            .map(|(_field, _steps_out, type_)| type_.clone())
+            .ok_or_else(|| substrait_datafusion_err!("unknow lambda variable {name}"))
     }
 }
