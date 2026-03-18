@@ -65,11 +65,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 planner_context.lambdas_parameters().get(&normalize_ident)
             {
                 let mut lambda_var =
-                    LambdaVariable::new(normalize_ident, Some(Arc::clone(field)));
-                if self.options.collect_spans {
-                    if let Some(span) = Span::try_from_sqlparser_span(id_span) {
-                        lambda_var.spans_mut().add_span(span);
-                    }
+                    LambdaVariable::new(normalize_ident, Arc::clone(field));
+                if self.options.collect_spans
+                    && let Some(span) = Span::try_from_sqlparser_span(id_span)
+                {
+                    lambda_var.spans_mut().add_span(span);
                 }
                 return Ok(Expr::LambdaVariable(lambda_var));
             }
