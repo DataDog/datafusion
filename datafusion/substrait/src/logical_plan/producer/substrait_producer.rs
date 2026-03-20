@@ -29,9 +29,7 @@ use crate::logical_plan::producer::{
     to_substrait_type_from_field,
 };
 use datafusion::arrow::datatypes::Field;
-use datafusion::common::{
-    Column, DFSchemaRef, HashMap, ScalarValue, substrait_datafusion_err, substrait_err,
-};
+use datafusion::common::{Column, DFSchemaRef, HashMap, ScalarValue, substrait_err};
 use datafusion::execution::SessionState;
 use datafusion::execution::registry::SerializerRegistry;
 use datafusion::logical_expr::Subquery;
@@ -52,7 +50,7 @@ use substrait::proto::expression::field_reference::{
 use substrait::proto::expression::reference_segment::{self, StructField};
 use substrait::proto::expression::{FieldReference, ReferenceSegment, RexType};
 use substrait::proto::rel::RelType;
-use substrait::proto::r#type::Struct;
+use substrait::proto::r#type::{Nullability, Struct};
 use substrait::proto::{
     Expression, ExtensionLeafRel, ExtensionMultiRel, ExtensionSingleRel, Rel,
 };
@@ -427,12 +425,14 @@ pub trait SubstraitProducer: Send + Sync + Sized {
         from_lambda_variable(self, lambda_variable, schema)
     }
 
-    fn with_lambda_parameters(
+    fn push_lambda_parameters(
         &mut self,
         lambda_parameters: Vec<Field>,
-    ) -> datafusion::common::Result<Self>;
+    ) -> datafusion::common::Result<()>;
 
-    fn lambda_variable(&self, name: &str) -> datafusion::common::Result<(i32, u32)>;
+    fn pop_lambda_parameters(&mut self) -> datafusion::common::Result<()>;
+
+    fn lambda_variable(&self, name: &str) -> datafusion::common::Result<(u32, i32)>;
 
     fn lambda_parameter_type(
         &self,
@@ -445,7 +445,7 @@ fn from_lambda_variable(
     lambda_variable: &LambdaVariable,
     _schema: &datafusion::common::DFSchema,
 ) -> Result<Expression, datafusion::error::DataFusionError> {
-    let (field, steps_out) = producer.lambda_variable(&lambda_variable.name)?;
+    let (steps_out, field) = producer.lambda_variable(&lambda_variable.name)?;
 
     Ok(Expression {
         rex_type: Some(RexType::Selection(Box::new(FieldReference {
@@ -470,7 +470,7 @@ fn from_lambda(
         rex_type: Some(RexType::Lambda(Box::new(
             substrait::proto::expression::Lambda {
                 parameters: Some(Struct {
-                    nullability: 1,
+                    nullability: Nullability::Required as i32,
                     type_variation_reference: 0,
                     types: lambda
                         .params
@@ -487,7 +487,7 @@ fn from_lambda(
 pub struct DefaultSubstraitProducer<'a> {
     extensions: Extensions,
     serializer_registry: &'a dyn SerializerRegistry,
-    lambdas_variables: HashMap<String, (i32, u32, substrait::proto::Type)>,
+    lambdas_variables: Vec<HashMap<String, (usize, substrait::proto::Type)>>,
 }
 
 impl<'a> DefaultSubstraitProducer<'a> {
@@ -495,7 +495,7 @@ impl<'a> DefaultSubstraitProducer<'a> {
         DefaultSubstraitProducer {
             extensions: Extensions::default(),
             serializer_registry: state.serializer_registry().as_ref(),
-            lambdas_variables: HashMap::new(),
+            lambdas_variables: Vec::new(),
         }
     }
 }
@@ -551,50 +551,58 @@ impl SubstraitProducer for DefaultSubstraitProducer<'_> {
         }))
     }
 
-    fn with_lambda_parameters(
+    fn push_lambda_parameters(
         &mut self,
         lambda_parameters: Vec<Field>,
-    ) -> datafusion::common::Result<Self> {
-        let mut lambdas_variables = self.lambdas_variables.clone();
+    ) -> datafusion::common::Result<()> {
+        let vars = lambda_parameters
+            .into_iter()
+            .enumerate()
+            .map(|(field_idx, field)| {
+                Ok((
+                    field.name().clone(),
+                    (
+                        field_idx,
+                        to_substrait_type_from_field(self, &Arc::new(field))?,
+                    ),
+                ))
+            })
+            .collect::<datafusion::common::Result<_>>()?;
 
-        for (_field_idx, hops_out, _type) in lambdas_variables.values_mut() {
-            *hops_out += 1;
-        }
+        self.lambdas_variables.push(vars);
 
-        for (field_idx, field) in lambda_parameters.iter().enumerate() {
-            let hops_out = 0;
-
-            lambdas_variables.insert(
-                field.name().clone(),
-                (
-                    field_idx as i32,
-                    hops_out,
-                    to_substrait_type_from_field(self, &Arc::new(field.clone()))?,
-                ),
-            );
-        }
-
-        Ok(Self {
-            extensions: self.extensions.clone(),
-            serializer_registry: self.serializer_registry,
-            lambdas_variables,
-        })
+        Ok(())
     }
 
-    fn lambda_variable(&self, name: &str) -> datafusion::common::Result<(i32, u32)> {
-        self.lambdas_variables
-            .get(name)
-            .map(|(field, steps_out, _type)| (*field, *steps_out))
-            .ok_or_else(|| substrait_datafusion_err!("unknow lambda variable {name}"))
+    fn pop_lambda_parameters(&mut self) -> datafusion::common::Result<()> {
+        match self.lambdas_variables.pop() {
+            Some(_) => Ok(()),
+            None => substrait_err!("no lambda_parameters to pop"),
+        }
+    }
+
+    fn lambda_variable(&self, name: &str) -> datafusion::common::Result<(u32, i32)> {
+        for (steps_out, lambda_parameters) in
+            self.lambdas_variables.iter().rev().enumerate()
+        {
+            if let Some((field_idx, _type)) = lambda_parameters.get(name) {
+                return Ok((steps_out as u32, *field_idx as i32));
+            }
+        }
+
+        substrait_err!("unknow lambda variable {name}")
     }
 
     fn lambda_parameter_type(
         &self,
         name: &str,
     ) -> datafusion::common::Result<substrait::proto::Type> {
-        self.lambdas_variables
-            .get(name)
-            .map(|(_field, _steps_out, type_)| type_.clone())
-            .ok_or_else(|| substrait_datafusion_err!("unknow lambda variable {name}"))
+        for lambda_parameters in self.lambdas_variables.iter().rev() {
+            if let Some((_field_idx, type_)) = lambda_parameters.get(name) {
+                return Ok(type_.clone());
+            }
+        }
+
+        substrait_err!("unknow lambda variable {name}")
     }
 }

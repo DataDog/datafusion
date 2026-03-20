@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::logical_plan::producer::{SubstraitProducer, to_substrait_literal_expr};
-use datafusion::common::{DFSchemaRef, ScalarValue, not_impl_err};
+use datafusion::common::{DFSchemaRef, ScalarValue, not_impl_err, substrait_err};
 use datafusion::logical_expr::{Between, BinaryExpr, Expr, Like, Operator, expr};
 use substrait::proto::expression::{RexType, ScalarFunction};
 use substrait::proto::function_argument::ArgType;
@@ -39,15 +39,31 @@ pub fn from_lambda_function(
 
     let arguments = std::iter::zip(&fun.args, lambdas_parameters)
         .map(|(arg, lambda_parameters)| {
-            let arg = match lambda_parameters {
-                Some(lambda_parameters) => {
-                    let mut producer =
-                        producer.with_lambda_parameters(lambda_parameters)?;
+            let arg = match (arg, lambda_parameters) {
+                (Expr::Lambda(l), Some(lambda_parameters)) => {
+                    let named_lambda_parameters =
+                        std::iter::zip(&l.params, lambda_parameters)
+                            .map(|(name, parameter)| parameter.with_name(name))
+                            .collect();
 
-                    producer.handle_expr(arg, schema)?
+                    producer.push_lambda_parameters(named_lambda_parameters)?;
+
+                    let arg = producer.handle_expr(arg, schema)?;
+
+                    producer.pop_lambda_parameters()?;
+
+                    Ok(arg)
                 }
-                None => producer.handle_expr(arg, schema)?,
-            };
+                (Expr::Lambda(_), None) => substrait_err!(
+                    "{} lambdas_parameters returned None for a lambda",
+                    fun.name()
+                ),
+                (_, Some(_)) => substrait_err!(
+                    "{} lambdas_parameters returned Some for a value",
+                    fun.name()
+                ),
+                (_, None) => producer.handle_expr(arg, schema),
+            }?;
 
             Ok(FunctionArgument {
                 arg_type: Some(ArgType::Value(arg)),
