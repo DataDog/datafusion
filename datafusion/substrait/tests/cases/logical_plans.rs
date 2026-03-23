@@ -20,8 +20,8 @@
 #[cfg(test)]
 mod tests {
     use crate::utils::test::{add_plan_schemas_to_ctx, read_json};
-    use datafusion::common::test_util::format_batches;
     use datafusion::common::Result;
+    use datafusion::common::test_util::format_batches;
     use datafusion::dataframe::DataFrame;
     use datafusion::prelude::SessionContext;
     use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
