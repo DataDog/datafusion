@@ -20,11 +20,13 @@
 #[cfg(test)]
 mod tests {
     use crate::utils::test::{add_plan_schemas_to_ctx, read_json};
+    use datafusion::common::test_util::format_batches;
     use datafusion::common::Result;
     use datafusion::dataframe::DataFrame;
     use datafusion::prelude::SessionContext;
     use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
     use insta::assert_snapshot;
+    use std::collections::HashSet;
 
     #[tokio::test]
     async fn scalar_function_compound_signature() -> Result<()> {
