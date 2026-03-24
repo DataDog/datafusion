@@ -739,9 +739,9 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                     })
                     .collect::<Result<_>>()?;
 
-                Ok(Transformed::yes(Expr::LambdaFunction(
-                    LambdaFunction::new(func, new_args)
-                )))
+                Ok(Transformed::yes(Expr::LambdaFunction(LambdaFunction::new(
+                    func, new_args,
+                ))))
             }
             // TODO: remove the next line after `Expr::Wildcard` is removed
             #[expect(deprecated)]
