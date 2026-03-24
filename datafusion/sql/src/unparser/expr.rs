@@ -1910,8 +1910,8 @@ mod tests {
 
         fn lambdas_parameters(
             &self,
-            _args: &[datafusion_expr::ValueOrLambda<FieldRef, ()>],
-        ) -> Result<Vec<Option<Vec<Field>>>> {
+            _value_fields: &[FieldRef],
+        ) -> Result<Vec<Vec<Field>>> {
             unimplemented!()
         }
 
