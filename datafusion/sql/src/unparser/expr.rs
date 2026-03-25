@@ -546,6 +546,7 @@ impl Unparser<'_> {
                         params.iter().map(|param| param.as_str().into()).collect(),
                     ),
                     body: Box::new(self.expr_to_sql_inner(body)?),
+                    syntax: ast::LambdaSyntax::Arrow,
                 }))
             }
             Expr::LambdaVariable(l) => Ok(ast::Expr::Identifier(
