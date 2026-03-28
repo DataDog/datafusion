@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::logical_plan::producer::{SubstraitProducer, to_substrait_literal_expr};
-use datafusion::common::{DFSchemaRef, ScalarValue, not_impl_err, substrait_err};
+use datafusion::common::{DFSchemaRef, ScalarValue, not_impl_err};
 use datafusion::logical_expr::{Between, BinaryExpr, Expr, Like, Operator, expr};
 use substrait::proto::expression::{RexType, ScalarFunction};
 use substrait::proto::function_argument::ArgType;
@@ -35,12 +35,23 @@ pub fn from_lambda_function(
     fun: &expr::LambdaFunction,
     schema: &DFSchemaRef,
 ) -> datafusion::common::Result<Expression> {
-    let lambdas_parameters = fun.lambdas_parameters(schema)?;
+    // lambdas_parameters returns one Vec<Field> per lambda arg (values are excluded)
+    let mut lambdas_parameters = fun.lambdas_parameters(schema)?.into_iter();
 
-    let arguments = std::iter::zip(&fun.args, lambdas_parameters)
-        .map(|(arg, lambda_parameters)| {
-            let arg = match (arg, lambda_parameters) {
-                (Expr::Lambda(l), Some(lambda_parameters)) => {
+    let arguments = fun
+        .args
+        .iter()
+        .map(|arg| {
+            let arg = match arg {
+                Expr::Lambda(l) => {
+                    let lambda_parameters =
+                        lambdas_parameters.next().ok_or_else(|| {
+                            datafusion::common::DataFusionError::Substrait(format!(
+                                "{} lambdas_parameters returned fewer entries than lambdas",
+                                fun.name()
+                            ))
+                        })?;
+
                     let named_lambda_parameters =
                         std::iter::zip(&l.params, lambda_parameters)
                             .map(|(name, parameter)| parameter.with_name(name))
@@ -54,15 +65,7 @@ pub fn from_lambda_function(
 
                     Ok(arg)
                 }
-                (Expr::Lambda(_), None) => substrait_err!(
-                    "{} lambdas_parameters returned None for a lambda",
-                    fun.name()
-                ),
-                (_, Some(_)) => substrait_err!(
-                    "{} lambdas_parameters returned Some for a value",
-                    fun.name()
-                ),
-                (_, None) => producer.handle_expr(arg, schema),
+                _ => producer.handle_expr(arg, schema),
             }?;
 
             Ok(FunctionArgument {

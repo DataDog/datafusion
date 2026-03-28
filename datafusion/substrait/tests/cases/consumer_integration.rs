@@ -700,4 +700,17 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_any_match() -> Result<()> {
+        let plan_str = test_plan_to_string("any_match.substrait.json").await?;
+        assert_snapshot!(
+            plan_str,
+            @r"
+        Projection: any_match(list_data.list_col, (p0) -> p0 > Int32(0))
+          TableScan: list_data
+        "
+        );
+        Ok(())
+    }
 }

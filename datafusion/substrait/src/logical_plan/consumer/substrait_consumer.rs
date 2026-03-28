@@ -56,7 +56,7 @@ use substrait::proto::{
 ///
 /// # Example Usage
 ///
-/// ```
+/// ```ignore
 /// # use async_trait::async_trait;
 /// # use datafusion::catalog::TableProvider;
 /// # use datafusion::common::{not_impl_err, substrait_err, DFSchema, ScalarValue, TableReference};

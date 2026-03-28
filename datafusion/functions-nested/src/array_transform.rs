@@ -287,8 +287,7 @@ fn value_lambda_pair<'a, V: Debug, L: Debug>(
     Ok((value, lambda))
 }
 
-//todo: make this function public and move to a more generic crate like datafusion-common
-fn remove_list_null_values(list: &dyn Array) -> Result<ArrayRef> {
+pub(crate) fn remove_list_null_values(list: &dyn Array) -> Result<ArrayRef> {
     match list.data_type() {
         DataType::List(_) => Ok(Arc::new(truncate_nulls(list.as_list::<i32>())?)),
         DataType::LargeList(_) => Ok(Arc::new(truncate_nulls(list.as_list::<i64>())?)),

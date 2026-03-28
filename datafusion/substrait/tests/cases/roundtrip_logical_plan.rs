@@ -2141,3 +2141,46 @@ async fn create_all_type_context() -> Result<SessionContext> {
 
     Ok(ctx)
 }
+
+async fn create_lambda_context() -> Result<SessionContext> {
+    let cfg = SessionConfig::new().set(
+        "datafusion.sql_parser.dialect",
+        &ScalarValue::from("Databricks"),
+    );
+    let ctx = SessionContext::new_with_config(cfg);
+
+    let schema = Schema::new(vec![
+        Field::new_list("list_col", Field::new_list_field(DataType::Int32, true), true),
+    ]);
+    let mut options = CsvReadOptions::new();
+    options.schema = Some(&schema);
+    options.has_header = false;
+    ctx.register_csv("list_data", "tests/testdata/empty.csv", options)
+        .await?;
+
+    Ok(ctx)
+}
+
+#[tokio::test]
+async fn roundtrip_any_match() -> Result<()> {
+    // Note: substrait does not preserve lambda parameter names; the consumer assigns p0, p1, etc.
+    // Using p0 as the parameter name here makes the roundtrip stable.
+    roundtrip_with_ctx(
+        "SELECT any_match(list_col, p0 -> p0 > 0) FROM list_data",
+        create_lambda_context().await?,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn roundtrip_array_transform() -> Result<()> {
+    // Note: substrait does not preserve lambda parameter names; the consumer assigns p0, p1, etc.
+    // Using p0 as the parameter name here makes the roundtrip stable.
+    roundtrip_with_ctx(
+        "SELECT array_transform(list_col, p0 -> p0 * 2) FROM list_data",
+        create_lambda_context().await?,
+    )
+    .await?;
+    Ok(())
+}

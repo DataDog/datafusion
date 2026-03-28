@@ -183,6 +183,78 @@ SELECT array_transform([1], v -> v -> v+1);
 query error DataFusion error: SQL error: ParserError\("Expected: an expression, found: \) at Line: 1, Column: 30"\)
 SELECT array_transform([1], () -> 1);
 
+###############
+## any_match Tests
+###############
+
+query B
+SELECT any_match([1, 2, 3], x -> x > 2);
+----
+true
+
+query B
+SELECT any_match([1, 2, 3], x -> x > 10);
+----
+false
+
+query B
+SELECT any_match([], x -> x > 0);
+----
+false
+
+query B
+SELECT any_match([-1, -2, 0], x -> x > 0);
+----
+false
+
+# null list row returns null
+query B
+SELECT any_match(arrow_cast(null, 'List(Int32)'), x -> x > 0);
+----
+NULL
+
+# works on a column: t has [1,50], [4,50], [7,50] — all contain 50 which is > 5
+query B
+SELECT any_match(list, x -> x > 5) from t;
+----
+true
+true
+true
+
+# works with string predicate
+query B
+SELECT any_match(['foo', 'bar', 'baz'], x -> x = 'bar');
+----
+true
+
+# coercion: ListView -> List
+query B
+select any_match(arrow_cast([1, 2, 3], 'ListView(Int32)'), x -> x > 2);
+----
+true
+
+query error DataFusion error: Error during planning: any_match function requires 1 value arguments, got 0
+select any_match();
+
+# predicate should not be evaluated on values underlying a null sublist
+# row 0: [4, 2]  -> 100/4=25 > 10 true
+# row 1: NULL    -> underlying buffer has [0, 1], would divide by zero if evaluated
+# row 2: [20]    -> 100/20=5 > 10 false
+query B
+SELECT any_match(col, x -> 100 / x > 10)
+FROM (VALUES
+    (arrow_cast([4, 2], 'List(Int32)')),
+    (arrow_cast(null, 'List(Int32)')),
+    (arrow_cast([20], 'List(Int32)'))
+) t(col);
+----
+true
+NULL
+false
+
+query error DataFusion error: Error during planning: any_match expected a list as first argument, got Int64
+select any_match(1, v -> v > 0);
+
 statement ok
 drop table t;
 

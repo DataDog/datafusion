@@ -42,6 +42,7 @@ pub mod macros;
 #[macro_use]
 pub mod macros_lambda;
 
+pub mod array_any_match;
 pub mod array_has;
 pub mod array_transform;
 pub mod cardinality;
@@ -85,6 +86,7 @@ pub mod expr_fn {
     pub use super::array_has::array_has;
     pub use super::array_has::array_has_all;
     pub use super::array_has::array_has_any;
+    pub use super::array_any_match::any_match;
     pub use super::array_transform::array_transform;
     pub use super::cardinality::cardinality;
     pub use super::concat::array_append;
@@ -183,7 +185,10 @@ pub fn all_default_nested_functions() -> Vec<Arc<ScalarUDF>> {
 }
 
 pub fn all_default_lambda_functions() -> Vec<Arc<dyn LambdaUDF>> {
-    vec![array_transform::array_transform_udlf()]
+    vec![
+        array_transform::array_transform_udlf(),
+        array_any_match::any_match_udlf(),
+    ]
 }
 
 /// Registers all enabled packages with a [`FunctionRegistry`]

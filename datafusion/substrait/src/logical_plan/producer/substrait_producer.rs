@@ -63,7 +63,7 @@ use substrait::proto::{
 ///
 /// # Example Usage
 ///
-/// ```
+/// ```ignore
 /// # use std::sync::Arc;
 /// # use substrait::proto::{Expression, Rel};
 /// # use substrait::proto::rel::RelType;

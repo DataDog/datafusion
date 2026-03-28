@@ -1,0 +1,123 @@
+{
+  "version": {
+    "minorNumber": 85,
+    "producer": "datafusion"
+  },
+  "extensions": [
+    {
+      "extensionFunction": {
+        "extensionUrnReference": 4294967295,
+        "functionAnchor": 1,
+        "name": "any_match"
+      }
+    },
+    {
+      "extensionFunction": {
+        "extensionUrnReference": 4294967295,
+        "name": "gt"
+      }
+    }
+  ],
+  "relations": [
+    {
+      "root": {
+        "input": {
+          "project": {
+            "common": {
+              "emit": {
+                "outputMapping": [1]
+              }
+            },
+            "input": {
+              "read": {
+                "common": {
+                  "direct": {}
+                },
+                "baseSchema": {
+                  "names": ["list_col"],
+                  "struct": {
+                    "types": [
+                      {
+                        "list": {
+                          "type": {
+                            "i32": {
+                              "nullability": "NULLABILITY_NULLABLE"
+                            }
+                          },
+                          "nullability": "NULLABILITY_NULLABLE"
+                        }
+                      }
+                    ],
+                    "nullability": "NULLABILITY_REQUIRED"
+                  }
+                },
+                "namedTable": {
+                  "names": ["list_data"]
+                }
+              }
+            },
+            "expressions": [
+              {
+                "scalarFunction": {
+                  "functionReference": 1,
+                  "arguments": [
+                    {
+                      "value": {
+                        "selection": {
+                          "directReference": {
+                            "structField": {}
+                          },
+                          "rootReference": {}
+                        }
+                      }
+                    },
+                    {
+                      "value": {
+                        "lambda": {
+                          "parameters": {
+                            "types": [
+                              {
+                                "i32": {
+                                  "nullability": "NULLABILITY_NULLABLE"
+                                }
+                              }
+                            ],
+                            "nullability": "NULLABILITY_REQUIRED"
+                          },
+                          "body": {
+                            "scalarFunction": {
+                              "arguments": [
+                                {
+                                  "value": {
+                                    "selection": {
+                                      "directReference": {
+                                        "structField": {}
+                                      },
+                                      "lambdaParameterReference": {}
+                                    }
+                                  }
+                                },
+                                {
+                                  "value": {
+                                    "literal": {
+                                      "i32": 0
+                                    }
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        "names": ["any_match(list_data.list_col,(p0) -> p0 > Int32(0))"]
+      }
+    }
+  ]
+}
