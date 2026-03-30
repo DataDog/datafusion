@@ -36,9 +36,7 @@ use datafusion_expr::expr::{
     Alias, Cast, InList, Lambda, LambdaFunction, LambdaVariable, Placeholder,
     ScalarFunction,
 };
-use datafusion_expr::var_provider::is_system_variables;
-use datafusion_expr::var_provider::VarType;
-use datafusion_expr::var_provider::is_system_variables;
+use datafusion_expr::var_provider::{VarType, is_system_variables};
 use datafusion_expr::{
     Between, BinaryExpr, Expr, Like, Operator, TryCast, binary_expr, lit,
 };

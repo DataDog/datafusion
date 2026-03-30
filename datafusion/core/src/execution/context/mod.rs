@@ -83,7 +83,6 @@ use datafusion_execution::disk_manager::{
     DEFAULT_MAX_TEMP_DIRECTORY_SIZE, DiskManagerBuilder,
 };
 use datafusion_execution::registry::SerializerRegistry;
-pub use datafusion_execution::TaskContext;
 use datafusion_expr::LambdaUDF;
 pub use datafusion_expr::execution_props::ExecutionProps;
 #[cfg(feature = "sql")]

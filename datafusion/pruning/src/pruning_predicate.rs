@@ -43,9 +43,10 @@ use datafusion_common::{
     ScalarValue,
 };
 use datafusion_expr_common::operator::Operator;
+use datafusion_physical_expr::expressions::CastColumnExpr;
 use datafusion_physical_expr::utils::{collect_columns, Guarantee, LiteralGuarantee};
 use datafusion_physical_expr::{expressions as phys_expr, PhysicalExprRef};
-use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr;
+use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr_opt;
 use datafusion_physical_plan::{ColumnarValue, PhysicalExpr};
 
 /// Used to prove that arbitrary predicates (boolean expression) can not
@@ -473,7 +474,7 @@ impl PruningPredicate {
             // children after snapshotting and previously `replace_columns_with_literals` may have been called with partition values
             // the expression we have now is `8 < 5 and col < 10`.
             // Thus we need as simplifier pass to get `false and col < 10` => `false` here.
-            let simplifier = PhysicalExprSimplifier::new(&schema);
+            let mut simplifier = PhysicalExprSimplifier::new(&schema);
             expr = simplifier.simplify(tf.data)?;
         } else {
             expr = tf.data;

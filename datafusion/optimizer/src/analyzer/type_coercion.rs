@@ -43,7 +43,7 @@ use datafusion_expr::expr_schema::cast_subquery;
 use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::type_coercion::binary::{comparison_coercion, like_coercion};
 use datafusion_expr::type_coercion::functions::{
-    data_types_with_scalar_udf, fields_with_aggregate_udf, value_fields_with_lambda_udf,
+    data_types_with_scalar_udf, fields_with_udf, value_fields_with_lambda_udf,
 };
 use datafusion_expr::type_coercion::other::{
     get_coerce_type_for_case_expression, get_coerce_type_for_list,

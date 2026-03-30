@@ -51,7 +51,7 @@ use object_store::{ObjectMeta, ObjectStore};
 pub fn expr_applicable_for_cols(col_names: &[&str], expr: &Expr) -> bool {
     let mut is_applicable = true;
     expr.apply(|expr| match expr {
-        Expr::Column(Column { ref name, .. }) => {
+        Expr::Column(Column { name, .. }) => {
             is_applicable &= col_names.contains(&name.as_str());
             if is_applicable {
                 Ok(TreeNodeRecursion::Jump)

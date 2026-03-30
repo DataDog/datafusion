@@ -439,7 +439,7 @@ impl RecursiveUnnestRewriter<'_> {
                 );
                 self.columns_unnestings
                     .insert(Column::from_name(placeholder_name.clone()), None);
-                Ok(get_struct_unnested_columns(&placeholder_name, inner_fields)
+                Ok(get_struct_unnested_columns(&placeholder_name, &inner_fields)
                     .into_iter()
                     .map(Expr::Column)
                     .collect())

@@ -15,27 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{Between, Expr, Like};
+use super::{Between, Expr, Like, predicate_bounds};
 use crate::expr::{
     AggregateFunction, AggregateFunctionParams, Alias, BinaryExpr, Cast, InList,
     InSubquery, Lambda, Placeholder, ScalarFunction, TryCast, Unnest, WindowFunction,
     WindowFunctionParams,
 };
 use crate::expr::{FieldMetadata, LambdaVariable};
-use crate::type_coercion::functions::{
-    fields_with_aggregate_udf, fields_with_window_udf, value_fields_with_lambda_udf,
-};
+use crate::type_coercion::functions::{fields_with_udf, value_fields_with_lambda_udf};
 use crate::udlf::LambdaReturnFieldArgs;
 use crate::ValueOrLambda;
-use crate::{
-    type_coercion::functions::data_types_with_scalar_udf, udf::ReturnFieldArgs, utils,
-    LogicalPlan, Projection, Subquery, WindowFunctionDefinition,
-};
+use crate::{udf::ReturnFieldArgs, utils, LogicalPlan, Projection, Subquery, WindowFunctionDefinition};
 use arrow::datatypes::FieldRef;
 use arrow::{
     compute::can_cast_types,
     datatypes::{DataType, Field},
 };
+use datafusion_common::datatype::FieldExt;
+use datafusion_common::metadata::FieldMetadata as _;
 use datafusion_common::{
     Column, DataFusionError, ExprSchema, Result, ScalarValue, Spans, TableReference,
     not_impl_err, plan_datafusion_err, plan_err,

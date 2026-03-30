@@ -42,7 +42,6 @@ use datafusion_common::{
     Column, DataFusionError, Result, ScalarValue, TableReference, assert_or_internal_err,
     internal_err, not_impl_err,
     tree_node::{TransformedResult, TreeNode},
-    Column, DataFusionError, Result, ScalarValue, TableReference,
 };
 use datafusion_expr::expr::OUTER_REFERENCE_COLUMN_PREFIX;
 use datafusion_expr::{

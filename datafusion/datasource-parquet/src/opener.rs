@@ -398,7 +398,7 @@ impl FileOpener for ParquetOpener {
                 Arc::clone(&logical_file_schema),
                 Arc::clone(&physical_file_schema),
             );
-            let simplifier = PhysicalExprSimplifier::new(&physical_file_schema);
+            let mut simplifier = PhysicalExprSimplifier::new(&physical_file_schema);
             predicate = predicate
                 .map(|p| simplifier.simplify(rewriter.rewrite(p)?))
                 .transpose()?;

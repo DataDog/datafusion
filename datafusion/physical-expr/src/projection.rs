@@ -20,7 +20,7 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::expressions::Column;
+use crate::expressions::{Column, Literal};
 use crate::utils::collect_columns;
 use crate::PhysicalExpr;
 
@@ -28,7 +28,10 @@ use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion_common::stats::{ColumnStatistics, Precision};
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{internal_datafusion_err, internal_err, plan_err, Result};
+use datafusion_common::{
+    Result, ScalarValue, assert_or_internal_err, internal_datafusion_err, internal_err,
+    plan_err,
+};
 
 use datafusion_physical_expr_common::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_expr_common::metrics::ExpressionEvaluatorMetrics;

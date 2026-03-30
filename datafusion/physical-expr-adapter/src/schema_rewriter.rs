@@ -28,11 +28,14 @@ use arrow::array::RecordBatch;
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion_common::{
-    exec_err,
+    Result, ScalarValue, exec_err,
+    nested_struct::validate_struct_compatibility,
     tree_node::{Transformed, TransformedResult, TreeNode},
-    Result, ScalarValue,
 };
 use datafusion_functions::core::getfield::GetFieldFunc;
+use datafusion_physical_expr::PhysicalExprSimplifier;
+use datafusion_physical_expr::expressions::CastColumnExpr;
+use datafusion_physical_expr::projection::{ProjectionExprs, Projector};
 use datafusion_physical_expr::{
     ScalarFunctionExpr,
     expressions::{self, Column},
@@ -570,7 +573,7 @@ impl BatchAdapterFactory {
             .expr_adapter_factory
             .create(Arc::clone(&self.target_schema), Arc::clone(&source_schema));
 
-        let simplifier = PhysicalExprSimplifier::new(&self.target_schema);
+        let mut simplifier = PhysicalExprSimplifier::new(&self.target_schema);
 
         let projection = ProjectionExprs::from_indices(
             &(0..self.target_schema.fields().len()).collect_vec(),

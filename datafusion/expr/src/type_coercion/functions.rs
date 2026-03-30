@@ -16,10 +16,7 @@
 // under the License.
 
 use super::binary::binary_numeric_coercion;
-use crate::{
-    AggregateUDF, LambdaTypeSignature, LambdaUDF, ScalarUDF, Signature, TypeSignature,
-    ValueOrLambda, WindowUDF,
-};
+use crate::{AggregateUDF, LambdaTypeSignature, LambdaUDF, ScalarUDF, Signature, TypeSignature, ValueOrLambda, WindowUDF};
 use arrow::datatypes::{Field, FieldRef};
 use arrow::{
     compute::can_cast_types,
@@ -119,70 +116,6 @@ pub fn data_types_with_scalar_udf(
         .collect())
 }
 
-/// Performs type coercion for lambda function arguments.
-///
-/// For value arguments, returns the field to which each
-/// argument must be coerced to match `signature`.
-/// For lambda arguments, returns a clone of the associated data
-///
-/// For more details on coercion in general, please see the
-/// [`type_coercion`](crate::type_coercion) module.
-pub fn value_fields_with_lambda_udf<L: Clone>(
-    current_fields: &[ValueOrLambda<FieldRef, L>],
-    func: &dyn LambdaUDF,
-) -> Result<Vec<ValueOrLambda<FieldRef, L>>> {
-    match func.signature().type_signature {
-        LambdaTypeSignature::UserDefined => {
-            let arg_types = current_fields
-                .iter()
-                .map(|p| match p {
-                    ValueOrLambda::Value(field) => {
-                        ValueOrLambda::Value(field.data_type().clone())
-                    }
-                    ValueOrLambda::Lambda(_) => ValueOrLambda::Lambda(()),
-                })
-                .collect::<Vec<_>>();
-
-            let coerced_types = func.coerce_value_types(&arg_types)?;
-
-            std::iter::zip(current_fields, coerced_types)
-                .map(|(field, coerce_to)| match (field, coerce_to) {
-                    (ValueOrLambda::Value(field), Some(coerce_to)) => {
-                        Ok(ValueOrLambda::Value(Arc::new(
-                            field.as_ref().clone().with_data_type(coerce_to),
-                        )))
-                    }
-                    (ValueOrLambda::Lambda(v), None) => {
-                        Ok(ValueOrLambda::Lambda(v.clone()))
-                    }
-                    (ValueOrLambda::Value(_), None) => plan_err!(
-                        "{} coerce_values_types returned None for a value",
-                        func.name()
-                    ),
-                    (ValueOrLambda::Lambda(_), Some(_)) => plan_err!(
-                        "{} coerce_values_types returned Some for a lambda",
-                        func.name()
-                    ),
-                })
-                .collect()
-        }
-        LambdaTypeSignature::VariadicAny => {
-            Ok(current_fields.to_vec())
-        }
-        LambdaTypeSignature::Any(number) => {
-            if current_fields.len() != number {
-                return plan_err!(
-                    "The function '{}' expected {number} arguments but received {}",
-                    func.name(),
-                    current_fields.len()
-                );
-            }
-
-            Ok(current_fields.to_vec())
-        }
-    }
-}
-
 /// Performs type coercion for aggregate function arguments.
 ///
 /// Returns the fields to which each argument must be coerced to
@@ -266,134 +199,6 @@ pub fn fields_with_udf<F: UDFCoercionExt>(
         .map(Arc::new)
         .collect())
 }
-
-/// Performs type coercion for lambda function arguments.
-///
-/// For value arguments, returns the field to which each
-/// argument must be coerced to match `signature`.
-/// For lambda arguments, returns a clone of the associated data
-///
-/// For more details on coercion in general, please see the
-/// [`type_coercion`](crate::type_coercion) module.
-pub fn value_fields_with_lambda_udf<L: Clone>(
-    current_fields: &[ValueOrLambda<FieldRef, L>],
-    func: &dyn LambdaUDF,
-) -> Result<Vec<ValueOrLambda<FieldRef, L>>> {
-    match func.signature().type_signature {
-        LambdaTypeSignature::UserDefined => {
-            let arg_types = current_fields
-                .iter()
-                .filter_map(|p| match p {
-                    ValueOrLambda::Value(field) => Some(field.data_type().clone()),
-                    ValueOrLambda::Lambda(_) => None,
-                })
-                .collect::<Vec<_>>();
-
-            let coerced_types = func.coerce_value_types(&arg_types)?;
-
-            if coerced_types.len() != arg_types.len() {
-                return plan_err!(
-                    "{} coerce_value_types should have returned {} items but returned {}",
-                    func.name(),
-                    arg_types.len(),
-                    coerced_types.len()
-                );
-            }
-
-            // coerced_types has been partitioned from current_fields
-            // and refers only to values and not to lambdas, so instead
-            // of zipping them, we iterate over current_fields and only
-            // consume from coerced_types when a given argument is a value
-            // to reconstruct the arguments list with the correct order
-            // this supports any value and lambda positioning including
-            // multiple lambdas interleaved with values
-            let mut coerced_types = coerced_types.into_iter();
-
-            Ok(current_fields
-                .iter()
-                .map(|current_field| match current_field {
-                    ValueOrLambda::Value(field) => {
-                        let data_type = coerced_types
-                            .next()
-                            .expect("coerced_types len should have been checked above");
-
-                        ValueOrLambda::Value(Arc::new(
-                            field.as_ref().clone().with_data_type(data_type),
-                        ))
-                    }
-                    ValueOrLambda::Lambda(lambda) => {
-                        ValueOrLambda::Lambda(lambda.clone())
-                    }
-                })
-                .collect())
-        }
-        LambdaTypeSignature::VariadicAny => Ok(current_fields.to_vec()),
-        LambdaTypeSignature::Any(number) => {
-            if current_fields.len() != number {
-                return plan_err!(
-                    "The function '{}' expected {number} arguments but received {}",
-                    func.name(),
-                    current_fields.len()
-                );
-            }
-
-            Ok(current_fields.to_vec())
-        }
-    }
-}
-
-/// Performs type coercion for scalar function arguments.
-///
-/// Returns the data types to which each argument must be coerced to
-/// match `signature`.
-///
-/// For more details on coercion in general, please see the
-/// [`type_coercion`](crate::type_coercion) module.
-#[deprecated(since = "52.0.0", note = "use fields_with_udf")]
-pub fn data_types_with_scalar_udf(
-    current_types: &[DataType],
-    func: &ScalarUDF,
-) -> Result<Vec<DataType>> {
-    let current_fields = current_types
-        .iter()
-        .map(|dt| Arc::new(Field::new("f", dt.clone(), true)))
-        .collect::<Vec<_>>();
-    Ok(fields_with_udf(&current_fields, func)?
-        .iter()
-        .map(|f| f.data_type().clone())
-        .collect())
-}
-
-/// Performs type coercion for aggregate function arguments.
-///
-/// Returns the fields to which each argument must be coerced to
-/// match `signature`.
-///
-/// For more details on coercion in general, please see the
-/// [`type_coercion`](crate::type_coercion) module.
-#[deprecated(since = "52.0.0", note = "use fields_with_udf")]
-pub fn fields_with_aggregate_udf(
-    current_fields: &[FieldRef],
-    func: &AggregateUDF,
-) -> Result<Vec<FieldRef>> {
-    fields_with_udf(current_fields, func)
-}
-
-/// Performs type coercion for window function arguments.
-///
-/// Returns the data types to which each argument must be coerced to
-/// match `signature`.
-///
-/// For more details on coercion in general, please see the
-/// [`type_coercion`](crate::type_coercion) module.
-#[deprecated(since = "52.0.0", note = "use fields_with_udf")]
-pub fn fields_with_window_udf(
-    current_fields: &[FieldRef],
-    func: &WindowUDF,
-) -> Result<Vec<FieldRef>> {
-    fields_with_udf(current_fields, func)
-}
-
 
 /// Performs type coercion for function arguments.
 ///
@@ -1612,3 +1417,59 @@ mod tests {
         Ok(())
     }
 }
+
+pub fn value_fields_with_lambda_udf<L: Clone>(
+    current_fields: &[ValueOrLambda<FieldRef, L>],
+    func: &dyn LambdaUDF,
+) -> Result<Vec<ValueOrLambda<FieldRef, L>>> {
+    match func.signature().type_signature {
+        LambdaTypeSignature::UserDefined => {
+            // Collect only value types (lambdas are skipped)
+            let value_types = current_fields
+                .iter()
+                .filter_map(|p| match p {
+                    ValueOrLambda::Value(field) => Some(field.data_type().clone()),
+                    ValueOrLambda::Lambda(_) => None,
+                })
+                .collect::<Vec<_>>();
+
+            let coerced_types = func.coerce_value_types(&value_types)?;
+
+            // Zip coerced types back over value slots only
+            let mut coerced_iter = coerced_types.into_iter();
+            current_fields
+                .iter()
+                .map(|field| match field {
+                    ValueOrLambda::Value(f) => {
+                        let coerce_to = coerced_iter.next().ok_or_else(|| {
+                            datafusion_common::error::DataFusionError::Internal(format!(
+                                "{} coerce_value_types returned fewer types than value arguments",
+                                func.name()
+                            ))
+                        })?;
+                        Ok(ValueOrLambda::Value(Arc::new(
+                            f.as_ref().clone().with_data_type(coerce_to),
+                        )))
+                    }
+                    ValueOrLambda::Lambda(v) => Ok(ValueOrLambda::Lambda(v.clone())),
+                })
+                .collect()
+        }
+        LambdaTypeSignature::VariadicAny => {
+            Ok(current_fields.to_vec())
+        }
+        LambdaTypeSignature::Any(number) => {
+            if current_fields.len() != number {
+                return plan_err!(
+                    "The function '{}' expected {number} arguments but received {}",
+                    func.name(),
+                    current_fields.len()
+                );
+            }
+
+            Ok(current_fields.to_vec())
+        }
+    }
+}
+
+

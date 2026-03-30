@@ -23,7 +23,7 @@ use crate::logical_plan::producer::{
     from_case, from_cast, from_column, from_distinct, from_empty_relation, from_exists,
     from_filter, from_in_list, from_in_subquery, from_join, from_lambda_function,
     from_like, from_limit, from_literal, from_projection, from_repartition,
-    from_scalar_function, from_scalar_subquery, from_set_comparison, from_sort,
+    from_scalar_function, from_scalar_subquery, from_sort,
     from_subquery_alias, from_table_scan, from_try_cast, from_unary_expr, from_union,
     from_values, from_window, from_window_function, to_substrait_rel, to_substrait_rex,
     to_substrait_type_from_field,
@@ -34,7 +34,7 @@ use datafusion::execution::SessionState;
 use datafusion::execution::registry::SerializerRegistry;
 use datafusion::logical_expr::Subquery;
 use datafusion::logical_expr::expr::{
-    Alias, Exists, InList, InSubquery, Lambda, LambdaVariable, SetComparison,
+    Alias, Exists, InList, InSubquery, Lambda, LambdaVariable,
     WindowFunction,
 };
 use datafusion::logical_expr::{
@@ -386,13 +386,6 @@ pub trait SubstraitProducer: Send + Sync + Sized {
     }
 
 
-    fn handle_set_comparison(
-        &mut self,
-        set_comparison: &SetComparison,
-        schema: &DFSchemaRef,
-    ) -> datafusion::common::Result<Expression> {
-        from_set_comparison(self, set_comparison, schema)
-    }
     fn handle_scalar_subquery(
         &mut self,
         subquery: &Subquery,

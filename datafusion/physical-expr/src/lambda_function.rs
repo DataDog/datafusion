@@ -107,7 +107,7 @@ impl LambdaFunctionExpr {
             .collect::<Result<Vec<_>>>()?;
 
         // verify that input data types is consistent with function's `LambdaTypeSignature`
-        value_fields_with_lambda_udf(&arg_fields, func.as_ref())?;
+        value_fields_with_lambda_udf(&arg_fields, fun.as_ref())?;
 
         let arguments = args
             .iter()

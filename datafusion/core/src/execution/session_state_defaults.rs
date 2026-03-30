@@ -37,7 +37,7 @@ use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_expr::planner::ExprPlanner;
 use datafusion_expr::{AggregateUDF, LambdaUDF, ScalarUDF, WindowUDF};
-use datafusion_functions_nested::array_transform::ArrayTransform;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;

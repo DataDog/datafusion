@@ -30,7 +30,8 @@ use datafusion_expr::planner::PlannerResult;
 use datafusion_expr::planner::{RawAggregateExpr, RawWindowExpr};
 use datafusion_expr::type_coercion::functions::value_fields_with_lambda_udf;
 use datafusion_expr::{
-    expr, Expr, ExprSchemable, ValueOrLambda, WindowFrame, WindowFunctionDefinition,
+    expr, Expr, ExprSchemable, SortExpr, ValueOrLambda, WindowFrame, WindowFunctionDefinition,
+    arguments::ArgumentName,
 };
 use sqlparser::ast::{
     DuplicateTreatment, Expr as SQLExpr, Function as SQLFunction, FunctionArg,

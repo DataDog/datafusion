@@ -22,6 +22,7 @@ pub mod memory;
 pub mod proxy;
 pub mod string_utils;
 
+use crate::assert_or_internal_err;
 use crate::error::{
     _exec_datafusion_err, _exec_err, _internal_datafusion_err, _internal_err,
 };

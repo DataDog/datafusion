@@ -20,11 +20,12 @@ use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use crate::stream::RecordBatchStreamAdapter;
 use crate::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    RecordBatchStream,
 };
 use arrow::array::RecordBatch;
 use arrow_schema::{Fields, Schema, SchemaRef};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion_common::{internal_err, Result};
+use datafusion_common::{assert_eq_or_internal_err, internal_err, Result};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::async_scalar_function::AsyncFuncExpr;
 use datafusion_physical_expr::equivalence::ProjectionMapping;

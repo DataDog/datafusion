@@ -28,16 +28,11 @@ use std::ops::Not;
 use std::sync::Arc;
 
 use datafusion_common::{
-    DFSchema, DataFusionError, Result, ScalarValue, exec_datafusion_err, internal_err,
-};
-use datafusion_common::{
-    HashMap,
+    DFSchema, DataFusionError, HashMap, Result, ScalarValue, exec_datafusion_err,
+    internal_err,
     cast::{as_large_list_array, as_list_array},
     metadata::FieldMetadata,
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
-};
-use datafusion_common::{
-    exec_datafusion_err, internal_err, DFSchema, DataFusionError, Result, ScalarValue,
 };
 use datafusion_expr::expr::LambdaFunction;
 use datafusion_expr::{
