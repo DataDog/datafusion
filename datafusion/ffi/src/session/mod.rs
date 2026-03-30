@@ -33,7 +33,7 @@ use datafusion_execution::config::SessionConfig;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::{
-    AggregateUDF, AggregateUDFImpl, Expr, LogicalPlan, ScalarUDF, ScalarUDFImpl,
+    AggregateUDF, AggregateUDFImpl, Expr, LambdaUDF, LogicalPlan, ScalarUDF, ScalarUDFImpl,
     WindowUDF, WindowUDFImpl,
 };
 use datafusion_physical_expr::PhysicalExpr;
@@ -513,6 +513,10 @@ impl Session for ForeignSession {
 
     fn window_functions(&self) -> &HashMap<String, Arc<WindowUDF>> {
         &self.window_functions
+    }
+
+    fn lambda_functions(&self) -> &HashMap<String, Arc<dyn LambdaUDF>> {
+        unimplemented!("ForeignSession does not support lambda functions")
     }
 
     fn runtime_env(&self) -> &Arc<RuntimeEnv> {
