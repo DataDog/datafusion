@@ -1825,7 +1825,7 @@ mod tests {
 
     use crate::unparser::dialect::SqliteDialect;
     use arrow::array::{LargeListArray, ListArray};
-    use arrow::datatypes::{DataType::Int8, Field, Int32Type, Schema, TimeUnit};
+    use arrow::datatypes::{DataType::Int8, Field, FieldRef, Int32Type, Schema, TimeUnit};
     use ast::ObjectName;
     use datafusion_common::datatype::DataTypeExt;
     use datafusion_common::{Spans, TableReference};

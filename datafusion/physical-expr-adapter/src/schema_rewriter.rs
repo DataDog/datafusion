@@ -615,8 +615,11 @@ impl BatchAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{RecordBatch, RecordBatchOptions};
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::array::{
+        BooleanArray, Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
+        StringViewArray, StructArray,
+    };
+    use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
     use datafusion_common::{assert_contains, record_batch, Result, ScalarValue};
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{Column, Literal, col, lit};

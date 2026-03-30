@@ -469,15 +469,23 @@ pub fn describe_partition(partition: &Partition) -> (&str, usize, Vec<&str>) {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use datafusion_datasource::file_groups::FileGroup;
+    use futures::FutureExt;
+    use std::any::Any;
     use std::ops::Not;
 
     use super::*;
+    use datafusion_common::config::{ConfigOptions, TableOptions};
+    use datafusion_execution::runtime_env::RuntimeEnv;
     use datafusion_expr::{
         case, col, lit, AggregateUDF, Expr, LambdaUDF, LogicalPlan, ScalarUDF, WindowUDF,
     };
+    use datafusion_expr::planner::ExprPlanner;
     use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
     use datafusion_physical_plan::ExecutionPlan;
+    use object_store::memory::InMemory;
+    use datafusion_execution::config::SessionConfig;
 
     #[test]
     fn test_split_files() {
