@@ -330,7 +330,6 @@ impl ShreddedJsonRewriter {
                 if let Some(column) = func.args()[1]
                     .as_any()
                     .downcast_ref::<expressions::Column>()
-                    .filter(|col| !lambdas_params.contains(col.name()))
                 {
                     let column_name = column.name();
                     // Check if there's a flat column with underscore prefix

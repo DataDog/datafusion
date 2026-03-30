@@ -59,7 +59,7 @@ use std::error::Error;
 use std::fmt::Formatter;
 use std::ops::Range;
 use std::sync::Arc;
-use std::task::Poll;
+use std::task::Poll::{self, Pending, Ready};
 use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
 use tokio::select;
