@@ -41,7 +41,7 @@ use substrait::proto::expression::{
     Enum, FieldReference, IfThen, Literal, MultiOrList, Nested, ScalarFunction,
     SingularOrList, SwitchExpression, WindowFunction,
 };
-use substrait::proto::{self, Type};
+use substrait::proto::Type;
 use substrait::proto::{
     AggregateRel, ConsistentPartitionWindowRel, CrossRel, DynamicParameter, ExchangeRel,
     Expression, ExtensionLeafRel, ExtensionMultiRel, ExtensionSingleRel, FetchRel,

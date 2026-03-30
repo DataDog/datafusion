@@ -78,9 +78,9 @@ mod tests {
                   Aggregate: groupBy=[[]], aggr=[[min(PARTSUPP.PS_SUPPLYCOST)]]
                     Projection: PARTSUPP.PS_SUPPLYCOST
                       Filter: outer_ref(PART.P_PARTKEY) = PARTSUPP.PS_PARTKEY AND SUPPLIER.S_SUPPKEY = PARTSUPP.PS_SUPPKEY AND SUPPLIER.S_NATIONKEY = NATION.N_NATIONKEY AND NATION.N_REGIONKEY = REGION.R_REGIONKEY AND REGION.R_NAME = Utf8("EUROPE")
-                        Cross Join:
-                          Cross Join:
-                            Cross Join:
+                        Cross Join: 
+                          Cross Join: 
+                            Cross Join: 
                               TableScan: PARTSUPP
                               TableScan: SUPPLIER
                             TableScan: NATION
@@ -369,7 +369,7 @@ mod tests {
                       Projection: LINEITEM.L_QUANTITY
                         Filter: LINEITEM.L_PARTKEY = outer_ref(PART.P_PARTKEY)
                           TableScan: LINEITEM
-                Cross Join:
+                Cross Join: 
                   TableScan: LINEITEM
                   TableScan: PART
         "#
