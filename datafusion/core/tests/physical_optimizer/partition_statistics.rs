@@ -387,17 +387,17 @@ mod test {
             column_statistics: vec![
                 ColumnStatistics {
                     null_count: Precision::Exact(0),
-                    max_value: Precision::Exact(ScalarValue::Null),
-                    min_value: Precision::Exact(ScalarValue::Null),
-                    sum_value: Precision::Exact(ScalarValue::Null),
+                    max_value: Precision::Exact(ScalarValue::Int32(None)),
+                    min_value: Precision::Exact(ScalarValue::Int32(None)),
+                    sum_value: Precision::Exact(ScalarValue::Int32(None)),
                     distinct_count: Precision::Exact(0),
                     byte_size: Precision::Exact(16),
                 },
                 ColumnStatistics {
                     null_count: Precision::Exact(0),
-                    max_value: Precision::Exact(ScalarValue::Null),
-                    min_value: Precision::Exact(ScalarValue::Null),
-                    sum_value: Precision::Exact(ScalarValue::Null),
+                    max_value: Precision::Exact(ScalarValue::Date32(None)),
+                    min_value: Precision::Exact(ScalarValue::Date32(None)),
+                    sum_value: Precision::Exact(ScalarValue::Date32(None)),
                     distinct_count: Precision::Exact(0),
                     byte_size: Precision::Exact(16), // 4 rows * 4 bytes (Date32)
                 },
@@ -416,17 +416,17 @@ mod test {
             column_statistics: vec![
                 ColumnStatistics {
                     null_count: Precision::Exact(0),
-                    max_value: Precision::Exact(ScalarValue::Null),
-                    min_value: Precision::Exact(ScalarValue::Null),
-                    sum_value: Precision::Exact(ScalarValue::Null),
+                    max_value: Precision::Exact(ScalarValue::Int32(None)),
+                    min_value: Precision::Exact(ScalarValue::Int32(None)),
+                    sum_value: Precision::Exact(ScalarValue::Int32(None)),
                     distinct_count: Precision::Exact(0),
                     byte_size: Precision::Exact(8),
                 },
                 ColumnStatistics {
                     null_count: Precision::Exact(0),
-                    max_value: Precision::Exact(ScalarValue::Null),
-                    min_value: Precision::Exact(ScalarValue::Null),
-                    sum_value: Precision::Exact(ScalarValue::Null),
+                    max_value: Precision::Exact(ScalarValue::Date32(None)),
+                    min_value: Precision::Exact(ScalarValue::Date32(None)),
+                    sum_value: Precision::Exact(ScalarValue::Date32(None)),
                     distinct_count: Precision::Exact(0),
                     byte_size: Precision::Exact(8), // 2 rows * 4 bytes (Date32)
                 },
@@ -864,7 +864,7 @@ mod test {
         let plan_string = get_plan_string(&aggregate_exec_partial).swap_remove(0);
         assert_snapshot!(
             plan_string,
-            @"AggregateExec: mode=Partial, gby=[id@0 as id, 1 + id@0 as expr], aggr=[COUNT(c)], ordering_mode=Sorted"
+            @"AggregateExec: mode=Partial, gby=[id@0 as id, 1 + id@0 as expr], aggr=[COUNT(c)]"
         );
 
         let p0_statistics = aggregate_exec_partial.partition_statistics(Some(0))?;
