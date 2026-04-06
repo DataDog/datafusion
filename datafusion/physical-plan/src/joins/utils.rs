@@ -1065,7 +1065,12 @@ pub(crate) fn build_batch_empty_build_side(
     // The remaining joins return right-side rows and nulls for the left side.
     let num_rows = probe_batch.num_rows();
     if schema.fields().is_empty() {
-        return new_empty_schema_batch(schema, num_rows);
+        return RecordBatch::try_new_with_options(
+            Arc::new(schema.clone()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+        )
+        .map_err(Into::into);
     }
 
     let columns = column_indices

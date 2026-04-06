@@ -410,7 +410,7 @@ impl HashJoinStream {
         join_type: JoinType,
         left_data: &JoinLeftData,
     ) -> HashJoinStreamState {
-        if left_data.map().is_empty()
+        if left_data.hash_map().is_empty()
             && join_type.empty_build_side_produces_empty_result()
         {
             HashJoinStreamState::Completed
@@ -606,47 +606,9 @@ impl HashJoinStream {
 
         let timer = self.join_metrics.join_time.timer();
 
-        // Null-aware anti join semantics:
-        // For LeftAnti: output LEFT (build) rows where LEFT.key NOT IN RIGHT.key
-        // 1. If RIGHT (probe) contains NULL in any batch, no LEFT rows should be output
-        // 2. LEFT rows with NULL keys should not be output (handled in final stage)
-        if self.null_aware {
-            // Mark that we've seen a probe batch with actual rows (probe side is non-empty)
-            // Only set this if batch has rows - empty batches don't count
-            // Use shared atomic state so all partitions can see this global information
-            if state.batch.num_rows() > 0 {
-                build_side
-                    .left_data
-                    .probe_side_non_empty
-                    .store(true, Ordering::Relaxed);
-            }
-
-            // Check if probe side (RIGHT) contains NULL
-            // Since null_aware validation ensures single column join, we only check the first column
-            let probe_key_column = &state.values[0];
-            if probe_key_column.null_count() > 0 {
-                // Found NULL in probe side - set shared flag to prevent any output
-                build_side
-                    .left_data
-                    .probe_side_has_null
-                    .store(true, Ordering::Relaxed);
-            }
-
-            // If probe side has NULL (detected in this or any other partition), return empty result
-            if build_side
-                .left_data
-                .probe_side_has_null
-                .load(Ordering::Relaxed)
-            {
-                timer.done();
-                self.state = HashJoinStreamState::FetchProbeBatch;
-                return Ok(StatefulStreamResult::Continue);
-            }
-        }
-
         // If the build side is empty, this stream only reaches ProcessProbeBatch for
         // join types whose output still depends on probe rows.
-        let is_empty = build_side.left_data.map().is_empty();
+        let is_empty = build_side.left_data.hash_map().is_empty();
 
         if is_empty {
             // Invariant: state_after_build_ready should have already completed

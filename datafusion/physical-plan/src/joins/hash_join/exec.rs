@@ -1749,7 +1749,6 @@ mod tests {
             None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
-            false,
         )?;
         join.dynamic_filter = Some(HashJoinExecDynamicFilter {
             filter: Arc::clone(&dynamic_filter),
