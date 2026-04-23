@@ -16,7 +16,7 @@
 # under the License.
 
 sphinx
-pydata-sphinx-theme==0.8.0
+pydata-sphinx-theme==0.8.1
 myst-parser
 maturin
 jinja2
