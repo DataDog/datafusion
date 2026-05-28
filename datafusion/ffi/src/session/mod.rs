@@ -372,7 +372,7 @@ pub struct ForeignSession {
     session: FFI_SessionRef,
     config: SessionConfig,
     scalar_functions: HashMap<String, Arc<ScalarUDF>>,
-    higher_order_functions: HashMap<String, Arc<dyn HigherOrderUDF>>,
+    higher_order_functions: HashMap<String, Arc<HigherOrderUDF>>,
     aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
     window_functions: HashMap<String, Arc<WindowUDF>>,
     table_options: TableOptions,
@@ -582,7 +582,7 @@ impl Session for ForeignSession {
         &self.scalar_functions
     }
 
-    fn higher_order_functions(&self) -> &HashMap<String, Arc<dyn HigherOrderUDF>> {
+    fn higher_order_functions(&self) -> &HashMap<String, Arc<HigherOrderUDF>> {
         &self.higher_order_functions
     }
 

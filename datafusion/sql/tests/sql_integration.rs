@@ -30,7 +30,7 @@ use common::MockContextProvider;
 use datafusion_common::{DataFusionError, Result, assert_contains};
 use datafusion_expr::{
     ColumnarValue, CreateIndex, DdlStatement, Expr, HigherOrderFunctionArgs,
-    HigherOrderReturnFieldArgs, HigherOrderSignature, HigherOrderUDF,
+    HigherOrderReturnFieldArgs, HigherOrderSignature, HigherOrderUDF, HigherOrderUDFImpl,
     LambdaParametersProgress, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
     ValueOrLambda, Volatility, col,
     expr::{HigherOrderFunction, LambdaVariable, ScalarFunction},
@@ -3242,7 +3242,9 @@ fn logical_plan_with_options(sql: &str, options: ParserOptions) -> Result<Logica
 fn logical_plan_with_dialect(sql: &str, dialect: &dyn Dialect) -> Result<LogicalPlan> {
     let state = MockSessionState::default()
         .with_aggregate_function(sum_udaf())
-        .with_higher_order_function(Arc::new(MockArrayReduce::new()))
+        .with_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(
+            MockArrayReduce::new(),
+        )))
         .with_scalar_function(make_array_udf())
         .with_expr_planner(Arc::new(CustomExprPlanner {})); // plan array literal
     let context = MockContextProvider { state };
@@ -4954,7 +4956,7 @@ fn test_progressive_lambda_parameters() {
     assert_eq!(
         expr,
         Expr::HigherOrderFunction(HigherOrderFunction::new(
-            Arc::new(MockArrayReduce::new()),
+            Arc::new(HigherOrderUDF::new_from_impl(MockArrayReduce::new())),
             vec![
                 Expr::ScalarFunction(ScalarFunction::new_udf(
                     make_array_udf(),
@@ -4998,7 +5000,7 @@ impl MockArrayReduce {
     }
 }
 
-impl HigherOrderUDF for MockArrayReduce {
+impl HigherOrderUDFImpl for MockArrayReduce {
     fn name(&self) -> &str {
         "array_reduce"
     }

@@ -54,7 +54,7 @@ use datafusion_expr::{
 /// Physical expression of a higher order function
 pub struct HigherOrderFunctionExpr {
     /// A shared instance of the higher-order function
-    fun: Arc<dyn HigherOrderUDF>,
+    fun: Arc<HigherOrderUDF>,
     /// The name of the higher-order function
     name: String,
     /// List of expressions to feed to the function as arguments
@@ -109,7 +109,7 @@ impl HigherOrderFunctionExpr {
     /// Note that lambda arguments must be present directly in args as [LambdaExpr],
     /// and not as a wrapped child of any arg
     pub fn try_new_with_schema(
-        fun: Arc<dyn HigherOrderUDF>,
+        fun: Arc<HigherOrderUDF>,
         args: Vec<Arc<dyn PhysicalExpr>>,
         schema: &Schema,
         config_options: Arc<ConfigOptions>,
@@ -159,7 +159,7 @@ impl HigherOrderFunctionExpr {
     }
 
     /// Get the higher order function implementation
-    pub fn fun(&self) -> &dyn HigherOrderUDF {
+    pub fn fun(&self) -> &HigherOrderUDF {
         self.fun.as_ref()
     }
 
@@ -186,8 +186,41 @@ impl HigherOrderFunctionExpr {
         &self.config_options
     }
 
-    pub fn lambda_positions(&self) -> &[usize] {
-        &self.lambda_positions
+    /// Resolve every lambda's parameter list. Returns an empty `Vec` when
+    /// there are no lambdas, avoiding the [`HigherOrderUDFImpl::lambda_parameters`]
+    /// virtual call entirely.
+    fn resolve_lambda_parameters(
+        &self,
+        fields: &[ValueOrLambda<FieldRef, Option<FieldRef>>],
+    ) -> Result<Vec<Vec<FieldRef>>> {
+        let num_lambdas = self
+            .slots
+            .iter()
+            .filter(|s| matches!(s, ArgSlot::Lambda(_)))
+            .count();
+        if num_lambdas == 0 {
+            return Ok(Vec::new());
+        }
+        match self.fun().lambda_parameters(0, fields)? {
+            LambdaParametersProgress::Partial(_) => plan_err!(
+                "{} lambda_parameters returned a partial result when the return type of all it's lambdas were provided",
+                self.name()
+            ),
+            LambdaParametersProgress::Complete(items) => {
+                // functions can support multiple lambdas where some trailing ones are optional,
+                // but to simplify the implementor, lambda_parameters returns the parameters of all of them,
+                // so we can't do equality check. one example is spark reduce:
+                // https://spark.apache.org/docs/latest/api/sql/index.html#reduce
+                if items.len() < num_lambdas {
+                    return exec_err!(
+                        "{} invocation defined {num_lambdas} but lambda_parameters returned only {}",
+                        self.name(),
+                        items.len()
+                    );
+                }
+                Ok(items)
+            }
+        }
     }
 }
 
@@ -509,7 +542,7 @@ mod tests {
     use datafusion_common::Result;
     use datafusion_common::assert_contains;
     use datafusion_expr::{
-        HigherOrderFunctionArgs, HigherOrderSignature, HigherOrderUDF,
+        HigherOrderFunctionArgs, HigherOrderSignature, HigherOrderUDF, HigherOrderUDFImpl,
     };
     use datafusion_expr_common::columnar_value::ColumnarValue;
     use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
@@ -521,7 +554,7 @@ mod tests {
         signature: HigherOrderSignature,
     }
 
-    impl HigherOrderUDF for MockHigherOrderUDF {
+    impl HigherOrderUDFImpl for MockHigherOrderUDF {
         fn name(&self) -> &str {
             "mock_function"
         }
@@ -568,14 +601,14 @@ mod tests {
     #[test]
     fn test_higher_order_function_volatile_node() {
         // Create a volatile UDF
-        let volatile_udf = Arc::new(MockHigherOrderUDF {
+        let volatile_udf = Arc::new(HigherOrderUDF::new_from_impl(MockHigherOrderUDF {
             signature: HigherOrderSignature::variadic_any(Volatility::Volatile),
-        });
+        }));
 
         // Create a non-volatile UDF
-        let stable_udf = Arc::new(MockHigherOrderUDF {
+        let stable_udf = Arc::new(HigherOrderUDF::new_from_impl(MockHigherOrderUDF {
             signature: HigherOrderSignature::variadic_any(Volatility::Stable),
-        });
+        }));
 
         let schema = Schema::new(vec![Field::new("a", DataType::Float32, false)]);
         let args = vec![Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>];
@@ -610,9 +643,9 @@ mod tests {
 
     #[test]
     fn test_higher_order_function_wrapped_lambda() {
-        let fun = Arc::new(MockHigherOrderUDF {
+        let fun = Arc::new(HigherOrderUDF::new_from_impl(MockHigherOrderUDF {
             signature: HigherOrderSignature::variadic_any(Volatility::Stable),
-        });
+        }));
 
         let expected = ScalarValue::Int32(Some(42));
 
@@ -647,9 +680,9 @@ mod tests {
 
     #[test]
     fn test_higher_order_function_badly_wrapped_lambda() {
-        let fun = Arc::new(MockHigherOrderUDF {
+        let fun = Arc::new(HigherOrderUDF::new_from_impl(MockHigherOrderUDF {
             signature: HigherOrderSignature::variadic_any(Volatility::Stable),
-        });
+        }));
 
         let hof = HigherOrderFunctionExpr::try_new_with_schema(
             fun,
@@ -684,9 +717,9 @@ mod tests {
 
     #[test]
     fn test_higher_order_function_unexpected_lambda() {
-        let fun = Arc::new(MockHigherOrderUDF {
+        let fun = Arc::new(HigherOrderUDF::new_from_impl(MockHigherOrderUDF {
             signature: HigherOrderSignature::variadic_any(Volatility::Stable),
-        });
+        }));
 
         let hof = HigherOrderFunctionExpr::try_new_with_schema(
             fun,
