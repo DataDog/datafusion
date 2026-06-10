@@ -1949,6 +1949,7 @@ async fn roundtrip_placeholder_typed_utf8() -> Result<()> {
 
     assert_eq!(plan.schema(), plan2.schema());
     Ok(())
+}
 
 #[tokio::test]
 async fn roundtrip_array_transform_higher_order_function() -> Result<()> {

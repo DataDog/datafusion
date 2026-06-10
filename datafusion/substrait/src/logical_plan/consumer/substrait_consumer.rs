@@ -403,8 +403,8 @@ pub trait SubstraitConsumer: Send + Sync + Sized {
             .r#type
             .as_ref()
             .map(|t| {
-                super::from_substrait_type_without_names(self, t).map(|dt| {
-                    Arc::new(datafusion::arrow::datatypes::Field::new(&id, dt, true))
+                from_substrait_type_without_names(self, t).map(|dt| {
+                    Arc::new(Field::new(&id, dt, true))
                 })
             })
             .transpose()?;
