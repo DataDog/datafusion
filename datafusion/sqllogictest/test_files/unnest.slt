@@ -1419,6 +1419,7 @@ FROM (
 
 statement ok
 DROP TABLE unused_unnest_pruning;
+
 ## Regression: pushing a leaf-extracted projection (containing get_field,
 ## which has MoveTowardsLeafNodes placement) through an `Unnest` used to
 ## trip `Assertion failed: expr.is_empty(): Unnest` inside
