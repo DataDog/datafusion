@@ -2068,7 +2068,7 @@ pub(crate) async fn higher_order_function_ctx() -> Result<SessionContext> {
 
     ctx.register_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(
         ArrayTransform::new(),
-    )))?;
+    )));
 
     let data3_fields = vec![
         Field::new("p1", DataType::Int64, true), // lambda parameters should not conflict with this column
