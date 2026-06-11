@@ -22,8 +22,8 @@ use datafusion::execution::FunctionRegistry;
 use datafusion::functions_nested::map::map;
 use datafusion::logical_expr::{
     ColumnarValue, HigherOrderFunctionArgs, HigherOrderReturnFieldArgs,
-    HigherOrderSignature, HigherOrderUDF, LambdaParametersProgress, LogicalPlanBuilder,
-    ValueOrLambda,
+    HigherOrderSignature, HigherOrderUDF, HigherOrderUDFImpl, LambdaParametersProgress,
+    LogicalPlanBuilder, ValueOrLambda,
 };
 use datafusion::physical_plan::Accumulator;
 use datafusion::scalar::ScalarValue;
@@ -2066,7 +2066,9 @@ async fn roundtrip_array_transform_higher_order_function() -> Result<()> {
 pub(crate) async fn higher_order_function_ctx() -> Result<SessionContext> {
     let mut ctx = create_context_with_dialect(Some(Dialect::Databricks)).await?;
 
-    ctx.register_higher_order_function(Arc::new(ArrayTransform::new()))?;
+    ctx.register_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(
+        ArrayTransform::new(),
+    )))?
 
     let data3_fields = vec![
         Field::new("p1", DataType::Int64, true), // lambda parameters should not conflict with this column
@@ -2095,7 +2097,7 @@ impl ArrayTransform {
     }
 }
 
-impl HigherOrderUDF for ArrayTransform {
+impl HigherOrderUDFImpl for ArrayTransform {
     fn name(&self) -> &str {
         "array_transform2"
     }
@@ -2158,7 +2160,6 @@ impl HigherOrderUDF for ArrayTransform {
             args.return_type(),
         )?))
     }
-
 }
 
 fn check_post_join_filters(rel: &Rel) -> Result<()> {
