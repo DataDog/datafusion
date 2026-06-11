@@ -18,7 +18,6 @@
 use crate::utils::test::read_json;
 use datafusion::arrow::array::ArrayRef;
 use datafusion::config::Dialect;
-use datafusion::execution::FunctionRegistry;
 use datafusion::functions_nested::map::map;
 use datafusion::logical_expr::{
     ColumnarValue, HigherOrderFunctionArgs, HigherOrderReturnFieldArgs,
@@ -2064,7 +2063,7 @@ async fn roundtrip_array_transform_higher_order_function() -> Result<()> {
 }
 
 pub(crate) async fn higher_order_function_ctx() -> Result<SessionContext> {
-    let mut ctx = create_context_with_dialect(Some(Dialect::Databricks)).await?;
+    let ctx = create_context_with_dialect(Some(Dialect::Databricks)).await?;
 
     ctx.register_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(
         ArrayTransform::new(),
