@@ -123,6 +123,18 @@ use datafusion_physical_plan::filter_pushdown::{
 ///    └─────────────────────┘
 /// ```
 pub trait DataSource: Any + Send + Sync + Debug {
+    /// Optionally delegates downcast identity to an inner [`DataSource`].
+    ///
+    /// Wrapper types (e.g. a partitioning adapter that wraps a [`FileScanConfig`])
+    /// can implement this to make `is` and `downcast_ref` transparently see
+    /// through to the inner source, exactly as [`ExecutionPlan::downcast_delegate`]
+    /// does for execution plans.
+    ///
+    /// Implementations should return the inner source, not `self`.
+    fn downcast_delegate(&self) -> Option<&dyn DataSource> {
+        None
+    }
+
     /// Open the specified output partition and return its stream of
     /// [`RecordBatch`]es.
     ///
@@ -292,11 +304,17 @@ impl OpenArgs {
 
 impl dyn DataSource {
     pub fn is<T: DataSource>(&self) -> bool {
-        (self as &dyn Any).is::<T>()
+        match self.downcast_delegate() {
+            Some(delegate) => delegate.is::<T>(),
+            None => (self as &dyn Any).is::<T>(),
+        }
     }
 
     pub fn downcast_ref<T: DataSource>(&self) -> Option<&T> {
-        (self as &dyn Any).downcast_ref()
+        match self.downcast_delegate() {
+            Some(delegate) => delegate.downcast_ref::<T>(),
+            None => (self as &dyn Any).downcast_ref(),
+        }
     }
 }
 
