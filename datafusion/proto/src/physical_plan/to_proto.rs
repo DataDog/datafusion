@@ -786,6 +786,11 @@ pub fn serialize_file_scan_config(
             serialize_physical_sort_exprs(order.to_vec(), codec, proto_converter)?;
         output_orderings.push(ordering)
     }
+    let output_partitioning = conf
+        .output_partitioning
+        .as_ref()
+        .map(|partitioning| serialize_partitioning(partitioning, codec, proto_converter))
+        .transpose()?;
 
     // Fields must be added to the schema so that they can persist in the protobuf,
     // and then they are to be removed from the schema in `parse_protobuf_file_scan_config`
@@ -845,6 +850,8 @@ pub fn serialize_file_scan_config(
         constraints: Some(conf.constraints.clone().into()),
         batch_size: conf.batch_size.map(|s| s as u64),
         projection_exprs,
+        partitioned_by_file_group: Some(conf.partitioned_by_file_group),
+        output_partitioning,
     })
 }
 
