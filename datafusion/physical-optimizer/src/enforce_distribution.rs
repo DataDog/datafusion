@@ -888,7 +888,7 @@ fn add_hash_on_top(
         return Ok(input);
     }
 
-    let dist = Distribution::HashPartitioned(hash_exprs);
+    let dist = Distribution::KeyPartitioned(hash_exprs);
     let current_partitions = input.plan.output_partitioning().partition_count();
     let satisfaction = input.plan.output_partitioning().satisfaction(
         &dist,
@@ -1326,6 +1326,10 @@ fn partitioned_join_distribution(
 /// This function is intended to be used in a bottom up traversal, as it
 /// can first repartition (or newly partition) at the datasources -- these
 /// source partitions may be later repartitioned with additional data exchange operators.
+#[expect(
+    deprecated,
+    reason = "HashPartitioned is accepted during the KeyPartitioned migration"
+)]
 pub fn ensure_distribution(
     dist_context: DistributionContext,
     config: &ConfigOptions,

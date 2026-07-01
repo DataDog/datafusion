@@ -1279,17 +1279,10 @@ impl ExecutionPlan for HashJoinExec {
                     .iter()
                     .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
                     .unzip();
-                if self.join_type == JoinType::Inner {
-                    vec![
-                        Distribution::KeyPartitioned(left_expr),
-                        Distribution::KeyPartitioned(right_expr),
-                    ]
-                } else {
-                    vec![
-                        Distribution::HashPartitioned(left_expr),
-                        Distribution::HashPartitioned(right_expr),
-                    ]
-                }
+                vec![
+                    Distribution::KeyPartitioned(left_expr),
+                    Distribution::KeyPartitioned(right_expr),
+                ]
             }
             PartitionMode::Auto => vec![
                 Distribution::UnspecifiedDistribution,

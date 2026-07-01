@@ -142,6 +142,10 @@ fn is_prunable(join: &SymmetricHashJoinExec) -> bool {
 
 /// Ensures that the plan is pipeline friendly and the order and
 /// distribution requirements from its children are satisfied.
+#[expect(
+    deprecated,
+    reason = "HashPartitioned is accepted during the KeyPartitioned migration"
+)]
 pub fn check_plan_sanity(
     plan: &Arc<dyn ExecutionPlan>,
     optimizer_options: &OptimizerOptions,
