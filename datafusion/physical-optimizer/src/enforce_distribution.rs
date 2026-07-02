@@ -28,8 +28,9 @@ use std::sync::Arc;
 use crate::optimizer::PhysicalOptimizerRule;
 use crate::output_requirements::OutputRequirementExec;
 use crate::utils::{
-    add_sort_above_with_check, is_coalesce_partitions, is_repartition,
-    is_sort_preserving_merge,
+    add_sort_above_with_check, aggregate_can_reuse_range_partitioning,
+    is_coalesce_partitions, is_repartition, is_sort_preserving_merge,
+    range_partitioning_satisfies_key_partitioning,
 };
 
 use arrow::compute::SortOptions;
@@ -926,6 +927,49 @@ fn add_hash_on_top(
     Ok(input)
 }
 
+// TODO: remove this private helper once Range generally satisfies
+// KeyPartitioned requirements through Partitioning::satisfaction.
+// See <https://github.com/apache/datafusion/issues/23266>.
+//
+// Partial aggregates do not require key partitioning, but they preserve their
+// input partitioning for the final aggregate. Until Range satisfies
+// KeyPartitioned generally, this check keeps preserve_file_partitions from
+// inserting RoundRobin between a reusable Range input and the partial aggregate.
+fn partial_aggregate_preserves_reusable_partitioning(
+    plan: &Arc<dyn ExecutionPlan>,
+    child: &Arc<dyn ExecutionPlan>,
+    allow_subset_satisfy_partitioning: bool,
+) -> bool {
+    let Some(aggregate) = plan.downcast_ref::<AggregateExec>() else {
+        return false;
+    };
+    if aggregate.mode() != &AggregateMode::Partial
+        || aggregate.group_expr().is_empty()
+        || aggregate.group_expr().has_grouping_set()
+    {
+        return false;
+    }
+
+    let group_exprs = aggregate.group_expr().input_exprs();
+    let output_partitioning = child.output_partitioning();
+    let eq_properties = child.equivalence_properties();
+    let key_distribution = Distribution::KeyPartitioned(group_exprs.clone());
+
+    output_partitioning
+        .satisfaction(
+            &key_distribution,
+            eq_properties,
+            allow_subset_satisfy_partitioning,
+        )
+        .is_satisfied()
+        || range_partitioning_satisfies_key_partitioning(
+            output_partitioning,
+            &group_exprs,
+            eq_properties,
+            allow_subset_satisfy_partitioning,
+        )
+}
+
 /// Adds a [`SortPreservingMergeExec`] or a [`CoalescePartitionsExec`] operator
 /// on top of the given plan node to satisfy a single partition requirement
 /// while preserving ordering constraints.
@@ -1398,21 +1442,14 @@ pub fn ensure_distribution(
                 force_hash_to_target,
             },
         )| {
-            let increases_partition_count =
-                child.plan.output_partitioning().partition_count() < target_partitions;
-
-            let add_roundrobin = enable_round_robin
-                // Operator benefits from partitioning (e.g. filter):
-                && roundrobin_beneficial
-                && roundrobin_beneficial_stats
-                // Unless partitioning increases the partition count, it is not beneficial:
-                && increases_partition_count;
-
             // Allow subset satisfaction when:
             // 1. Current partition count >= threshold
             // 2. Not a partitioned join since must use exact hash matching for joins
             // 3. Not a grouping set aggregate (requires exact hash including __grouping_id)
             let current_partitions = child.plan.output_partitioning().partition_count();
+            let preserve_file_partition_threshold_met =
+                config.optimizer.preserve_file_partitions > 0
+                    && current_partitions >= config.optimizer.preserve_file_partitions;
 
             let allow_subset_satisfy_partitioning = (current_partitions
                 >= subset_satisfaction_threshold
@@ -1420,10 +1457,28 @@ pub fn ensure_distribution(
                 // partitioning to the optimizer. Respect it when the only
                 // reason to repartition would be to increase partition count
                 // beyond the preserved file-group count.
-                || (config.optimizer.preserve_file_partitions > 0
+                || (preserve_file_partition_threshold_met
                     && current_partitions < target_partitions))
                 && !is_partitioned_join
                 && !requirement_includes_grouping_id(&requirement);
+
+            let increases_partition_count = current_partitions < target_partitions;
+
+            let preserve_partial_aggregate_partitioning =
+                preserve_file_partition_threshold_met
+                    && partial_aggregate_preserves_reusable_partitioning(
+                        &plan,
+                        &child.plan,
+                        allow_subset_satisfy_partitioning,
+                    );
+
+            let add_roundrobin = enable_round_robin
+                // Operator benefits from partitioning (e.g. filter):
+                && roundrobin_beneficial
+                && roundrobin_beneficial_stats
+                // Unless partitioning increases the partition count, it is not beneficial:
+                && increases_partition_count
+                && !preserve_partial_aggregate_partitioning;
 
             // When `repartition_file_scans` is set, attempt to increase
             // parallelism at the source.
@@ -1446,9 +1501,18 @@ pub fn ensure_distribution(
                 }
                 Distribution::HashPartitioned(exprs)
                 | Distribution::KeyPartitioned(exprs) => {
+                    let range_satisfied_for_aggregate =
+                        aggregate_can_reuse_range_partitioning(&plan)
+                            && range_partitioning_satisfies_key_partitioning(
+                                child.plan.output_partitioning(),
+                                exprs,
+                                child.plan.equivalence_properties(),
+                                allow_subset_satisfy_partitioning,
+                            );
+
                     // See https://github.com/apache/datafusion/issues/18341#issuecomment-3503238325 for background
                     // When inserting hash is necessary to satisfy hash requirement, insert hash repartition.
-                    if hash_necessary {
+                    if hash_necessary && !range_satisfied_for_aggregate {
                         child = add_hash_on_top(
                             child,
                             exprs.to_vec(),
