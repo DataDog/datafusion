@@ -2592,6 +2592,16 @@ mod tests {
         ))
     }
 
+    fn make_file_with_empty_column_stats(name: &str) -> PartitionedFile {
+        PartitionedFile::new(name.to_string(), 1024).with_statistics(Arc::new(
+            Statistics {
+                num_rows: Precision::Absent,
+                total_byte_size: Precision::Absent,
+                column_statistics: vec![],
+            },
+        ))
+    }
+
     #[derive(Clone)]
     struct ExactSortPushdownSource {
         metrics: ExecutionPlanMetricsSet,
@@ -2950,6 +2960,32 @@ mod tests {
         let files1 = pushed_config.file_groups[1].files();
         assert_eq!(files1[0].object_meta.location.as_ref(), "file_d");
         assert_eq!(files1[1].object_meta.location.as_ref(), "file_c");
+        Ok(())
+    }
+
+    #[test]
+    fn sort_pushdown_unsupported_source_empty_column_statistics() -> Result<()> {
+        let file_schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Float64, false)]));
+        let table_schema = TableSchema::new(Arc::clone(&file_schema), vec![]);
+        let file_source = Arc::new(MockSource::new(table_schema));
+
+        let file_groups = vec![FileGroup::new(vec![
+            make_file_with_empty_column_stats("file_b"),
+            make_file_with_empty_column_stats("file_a"),
+        ])];
+
+        let sort_expr = PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)));
+        let config =
+            FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), file_source)
+                .with_file_groups(file_groups)
+                .build();
+
+        let result = config.try_pushdown_sort(&[sort_expr])?;
+        assert!(
+            matches!(result, SortOrderPushdownResult::Unsupported),
+            "expected missing file statistics to skip sort pushdown"
+        );
         Ok(())
     }
 

@@ -97,7 +97,10 @@ impl MinMaxStatistics {
                             .zip(s.column_statistics[i].max_value.get_value().cloned())
                             .ok_or_else(|| plan_datafusion_err!("statistics not found"))
                     } else {
-                        let partition_value = &pv[i - s.column_statistics.len()];
+                        let Some(partition_value) = pv.get(i - s.column_statistics.len())
+                        else {
+                            return Err(plan_datafusion_err!("statistics not found"));
+                        };
                         Ok((partition_value.clone(), partition_value.clone()))
                     }
                 })
@@ -623,6 +626,44 @@ mod tests {
     fn file_with_stats(path: &str, stats: Statistics) -> PartitionedFile {
         PartitionedFile::new(path, 1).with_statistics(Arc::new(stats))
     }
+
+    fn file_with_empty_column_stats(path: &str) -> PartitionedFile {
+        PartitionedFile::new(path, 1).with_statistics(Arc::new(Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![],
+        }))
+    }
+
+    #[test]
+    fn min_max_statistics_errors_when_column_and_partition_stats_are_missing() {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Float64, true)]));
+        let sort_order = LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(
+            Column::new("a", 0),
+        ))])
+        .unwrap();
+        let files = vec![
+            file_with_empty_column_stats("first.parquet"),
+            file_with_empty_column_stats("second.parquet"),
+        ];
+
+        let err = match MinMaxStatistics::new_from_files(
+            &sort_order,
+            &schema,
+            None,
+            files.iter(),
+        ) {
+            Ok(_) => panic!("expected missing statistics to return an error"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("statistics not found"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[tokio::test]
     #[expect(deprecated)]
     async fn test_get_statistics_with_limit_casts_first_file_sum_to_sum_type()
