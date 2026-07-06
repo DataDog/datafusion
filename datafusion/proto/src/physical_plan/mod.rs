@@ -105,7 +105,7 @@ mod file_scan_config_serde {
     use super::*;
     use arrow::datatypes::{DataType, Field};
     use datafusion_common::{Constraint, Constraints, ScalarValue, Statistics};
-    use datafusion_datasource::file::FileSource;
+    use datafusion_datasource::file::{FileSource, FileSourceArgs};
     use datafusion_datasource::file_groups::FileGroup;
     use datafusion_datasource::file_scan_config::{
         FileScanConfig, FileScanConfigBuilder,
@@ -121,7 +121,6 @@ mod file_scan_config_serde {
         LexOrdering, Partitioning, PhysicalSortExpr, RangePartitioning, SplitPoint,
     };
     use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
-    use object_store::ObjectStore;
 
     #[derive(Clone)]
     struct SerdeTestSource {
@@ -146,8 +145,7 @@ mod file_scan_config_serde {
     impl FileSource for SerdeTestSource {
         fn create_file_opener(
             &self,
-            _object_store: Arc<dyn ObjectStore>,
-            _base_config: &FileScanConfig,
+            _args: &FileSourceArgs,
             _partition: usize,
         ) -> Result<Arc<dyn FileOpener>> {
             internal_err!("not needed for FileScanConfig serde tests")
@@ -155,10 +153,6 @@ mod file_scan_config_serde {
 
         fn table_schema(&self) -> &TableSchema {
             &self.table_schema
-        }
-
-        fn with_batch_size(&self, _batch_size: usize) -> Arc<dyn FileSource> {
-            Arc::new(self.clone())
         }
 
         fn metrics(&self) -> &ExecutionPlanMetricsSet {

@@ -42,7 +42,7 @@ use datafusion_common::error::Result;
 use datafusion_common::exec_datafusion_err;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_datasource::PartitionedFile;
-use datafusion_datasource::file::FileSource;
+use datafusion_datasource::file::{FileSource, FileSourceArgs};
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -291,10 +291,10 @@ impl ArrowSource {
 impl FileSource for ArrowSource {
     fn create_file_opener(
         &self,
-        object_store: Arc<dyn ObjectStore>,
-        _base_config: &FileScanConfig,
+        args: &FileSourceArgs,
         _partition: usize,
     ) -> Result<Arc<dyn FileOpener>> {
+        let object_store = Arc::clone(&args.object_store);
         let split_projection = self.projection.clone();
 
         let opener: Arc<dyn FileOpener> = match self.format {
@@ -312,10 +312,6 @@ impl FileSource for ArrowSource {
             opener,
             self.table_schema.file_schema(),
         )
-    }
-
-    fn with_batch_size(&self, _batch_size: usize) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
     }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
@@ -552,13 +548,8 @@ mod tests {
                 Arc::new(ArrowSource::new_file_source(schema))
             };
 
-            let scan_config = FileScanConfigBuilder::new(
-                ObjectStoreUrl::local_filesystem(),
-                source.clone(),
-            )
-            .build();
-
-            let file_opener = source.create_file_opener(object_store, &scan_config, 0)?;
+            let file_opener =
+                source.create_file_opener(&FileSourceArgs::new(object_store, 8192), 0)?;
             let mut stream = file_opener.open(partitioned_file)?.await?;
 
             assert!(stream.next().await.is_some());
@@ -594,13 +585,8 @@ mod tests {
 
         let source = Arc::new(ArrowSource::new_file_source(schema));
 
-        let scan_config = FileScanConfigBuilder::new(
-            ObjectStoreUrl::local_filesystem(),
-            source.clone(),
-        )
-        .build();
-
-        let file_opener = source.create_file_opener(object_store, &scan_config, 0)?;
+        let file_opener =
+            source.create_file_opener(&FileSourceArgs::new(object_store, 8192), 0)?;
         let mut stream = file_opener.open(partitioned_file)?.await?;
 
         assert!(stream.next().await.is_some());
@@ -635,13 +621,8 @@ mod tests {
 
         let source = Arc::new(ArrowSource::new_stream_file_source(schema));
 
-        let scan_config = FileScanConfigBuilder::new(
-            ObjectStoreUrl::local_filesystem(),
-            source.clone(),
-        )
-        .build();
-
-        let file_opener = source.create_file_opener(object_store, &scan_config, 0)?;
+        let file_opener =
+            source.create_file_opener(&FileSourceArgs::new(object_store, 8192), 0)?;
         let result = file_opener.open(partitioned_file);
         assert!(result.is_err());
 
