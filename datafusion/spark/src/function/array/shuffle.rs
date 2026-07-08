@@ -193,7 +193,7 @@ fn general_array_shuffle<O: OffsetSizeTrait>(
         if array.is_null(row_index) {
             nulls.push(false);
             offsets.push(offsets[row_index] + O::one());
-            mutable.extend(0, 0, 1);
+            mutable.try_extend(0, 0, 1)?;
             continue;
         }
         nulls.push(true);
@@ -208,7 +208,7 @@ fn general_array_shuffle<O: OffsetSizeTrait>(
 
         // Add shuffled elements
         for &index in &indices {
-            mutable.extend(0, index, index + 1);
+            mutable.try_extend(0, index, index + 1)?;
         }
 
         offsets.push(offsets[row_index] + O::usize_as(length));
@@ -247,7 +247,7 @@ fn fixed_size_array_shuffle(
         // skip the null value
         if array.is_null(row_index) {
             nulls.push(false);
-            mutable.extend(0, 0, value_length);
+            mutable.try_extend(0, 0, value_length)?;
             continue;
         }
         nulls.push(true);
@@ -261,7 +261,7 @@ fn fixed_size_array_shuffle(
 
         // Add shuffled elements
         for &index in &indices {
-            mutable.extend(0, index, index + 1);
+            mutable.try_extend(0, index, index + 1)?;
         }
     }
 

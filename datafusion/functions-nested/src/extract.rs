@@ -264,7 +264,7 @@ where
 
         // array is null
         if array.is_null(row_index) {
-            mutable.extend_nulls(1);
+            mutable.try_extend_nulls(1)?;
             continue;
         }
 
@@ -272,10 +272,10 @@ where
 
         if let Some(index) = index {
             let start = start.as_usize() + index.as_usize();
-            mutable.extend(0, start, start + 1_usize);
+            mutable.try_extend(0, start, start + 1_usize)?;
         } else {
             // Index out of bounds
-            mutable.extend_nulls(1);
+            mutable.try_extend_nulls(1)?;
         }
     }
 
@@ -641,7 +641,7 @@ where
             || to_array.is_null(row_index)
             || stride.is_some_and(|s| s.is_null(row_index))
         {
-            mutable.extend_nulls(1);
+            mutable.try_extend_nulls(1)?;
             offsets.push(offsets[row_index] + O::usize_as(1));
             null_builder.append_null();
             continue;
@@ -669,14 +669,14 @@ where
             } => {
                 let start_index = (start + rel_start).to_usize().unwrap();
                 let end_index = (start + rel_start + slice_len).to_usize().unwrap();
-                mutable.extend(0, start_index, end_index);
+                mutable.try_extend(0, start_index, end_index)?;
                 offsets.push(offsets[row_index] + slice_len);
             }
             SlicePlan::Indices(indices) => {
                 let count = indices.len();
                 for rel_index in indices {
                     let absolute_index = (start + rel_index).to_usize().unwrap();
-                    mutable.extend(0, absolute_index, absolute_index + 1);
+                    mutable.try_extend(0, absolute_index, absolute_index + 1)?;
                 }
                 offsets.push(offsets[row_index] + O::usize_as(count));
             }
@@ -764,7 +764,7 @@ where
             } => {
                 let start_index = (start + rel_start).to_usize().unwrap();
                 let end_index = (start + rel_start + slice_len).to_usize().unwrap();
-                mutable.extend(0, start_index, end_index);
+                mutable.try_extend(0, start_index, end_index)?;
                 offsets.push(current_offset);
                 sizes.push(slice_len);
                 current_offset += slice_len;
@@ -773,7 +773,7 @@ where
                 let count = indices.len();
                 for rel_index in indices {
                     let absolute_index = (start + rel_index).to_usize().unwrap();
-                    mutable.extend(0, absolute_index, absolute_index + 1);
+                    mutable.try_extend(0, absolute_index, absolute_index + 1)?;
                 }
                 let length = O::usize_as(count);
                 offsets.push(current_offset);
@@ -1093,7 +1093,7 @@ where
 
         // array is null
         if array.is_null(row_index) {
-            mutable.extend_nulls(1);
+            mutable.try_extend_nulls(1)?;
             continue;
         }
 
@@ -1105,16 +1105,16 @@ where
                     row_nulls_buffer.valid_indices().next()
                 {
                     let index = start.as_usize() + first_non_null_index;
-                    mutable.extend(0, index, index + 1)
+                    mutable.try_extend(0, index, index + 1)?;
                 } else {
                     // all the elements in the array are null
-                    mutable.extend_nulls(1);
+                    mutable.try_extend_nulls(1)?;
                 }
             }
             None => {
                 // no nulls are present in the array so take the first element
                 let index = start.as_usize();
-                mutable.extend(0, index, index + 1);
+                mutable.try_extend(0, index, index + 1)?;
             }
         }
     }

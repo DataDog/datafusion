@@ -29,7 +29,7 @@ use arrow::datatypes::{
     SchemaRef, TimeUnit, UnionMode,
 };
 use arrow::ipc::writer::{
-    CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+    DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions,
 };
 use datafusion_common::{
     Column, ColumnStatistics, Constraint, Constraints, DFSchema, DFSchemaRef,
@@ -1054,7 +1054,7 @@ fn encode_scalar_nested_value(
         &mut dict_tracker,
         &write_options,
     );
-    let mut compression_context = CompressionContext::default();
+    let mut compression_context = IpcWriteContext::default();
     let (encoded_dictionaries, encoded_message) = ipc_gen
         .encode(
             &batch,

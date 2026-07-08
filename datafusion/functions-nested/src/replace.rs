@@ -370,11 +370,11 @@ fn general_replace<O: OffsetSizeTrait>(
 
         // All elements are false, no need to replace, just copy original data
         if eq_array.false_count() == eq_array.len() {
-            mutable.extend(
+            mutable.try_extend(
                 original_idx.to_usize().unwrap(),
                 start.to_usize().unwrap(),
                 end.to_usize().unwrap(),
-            );
+            )?;
             offsets.push(offsets[row_index] + (end - start));
             valid.append_non_null();
             continue;
@@ -383,24 +383,28 @@ fn general_replace<O: OffsetSizeTrait>(
         for (i, to_replace) in eq_array.iter().enumerate() {
             let i = O::usize_as(i);
             if let Some(true) = to_replace {
-                mutable.extend(replace_idx.to_usize().unwrap(), row_index, row_index + 1);
+                mutable.try_extend(
+                    replace_idx.to_usize().unwrap(),
+                    row_index,
+                    row_index + 1,
+                )?;
                 counter += 1;
                 if counter == n {
                     // copy original data for any matches past n
-                    mutable.extend(
+                    mutable.try_extend(
                         original_idx.to_usize().unwrap(),
                         (start + i).to_usize().unwrap() + 1,
                         end.to_usize().unwrap(),
-                    );
+                    )?;
                     break;
                 }
             } else {
                 // copy original data for false / null matches
-                mutable.extend(
+                mutable.try_extend(
                     original_idx.to_usize().unwrap(),
                     (start + i).to_usize().unwrap(),
                     (start + i).to_usize().unwrap() + 1,
-                );
+                )?;
             }
         }
 

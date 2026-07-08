@@ -247,14 +247,22 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
                     )
                 })?;
             let end = offset_window[1];
-            mutable.extend(0, (start).to_usize().unwrap(), (end).to_usize().unwrap());
+            mutable.try_extend(
+                0,
+                (start).to_usize().unwrap(),
+                (end).to_usize().unwrap(),
+            )?;
             // append default element
             for _ in 0..extra_count {
-                mutable.extend(1, row_index, row_index + 1);
+                mutable.try_extend(1, row_index, row_index + 1)?;
             }
         } else {
             let end = start + count;
-            mutable.extend(0, (start).to_usize().unwrap(), (end).to_usize().unwrap());
+            mutable.try_extend(
+                0,
+                (start).to_usize().unwrap(),
+                (end).to_usize().unwrap(),
+            )?;
         };
         offsets.push(offsets[row_index] + count);
     }
