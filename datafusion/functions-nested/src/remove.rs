@@ -425,7 +425,7 @@ fn general_remove<OffsetSize: OffsetSizeTrait>(
 
         // Fast path: no elements to remove, copy entire row
         if num_to_remove == 0 {
-            mutable.extend(0, start, end);
+            mutable.try_extend(0, start, end)?;
             offsets.push(offsets[row_index] + OffsetSize::usize_as(end - start));
             continue;
         }
@@ -440,7 +440,7 @@ fn general_remove<OffsetSize: OffsetSizeTrait>(
             if keep == Some(false) && removed < max_removals {
                 // Flush pending batch before skipping this element
                 if let Some(bs) = pending_batch_to_retain {
-                    mutable.extend(0, start + bs, start + i);
+                    mutable.try_extend(0, start + bs, start + i)?;
                     copied += i - bs;
                     pending_batch_to_retain = None;
                 }
@@ -452,7 +452,7 @@ fn general_remove<OffsetSize: OffsetSizeTrait>(
 
         // Flush remaining batch
         if let Some(bs) = pending_batch_to_retain {
-            mutable.extend(0, start + bs, start + eq_array.len());
+            mutable.try_extend(0, start + bs, start + eq_array.len())?;
             copied += eq_array.len() - bs;
         }
 
