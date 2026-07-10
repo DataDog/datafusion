@@ -802,7 +802,7 @@ impl ListingTable {
             .map(|part_file| async {
                 let part_file = part_file?;
                 let (statistics, ordering) = if self.options.collect_stat {
-                    self.do_collect_statistics_and_ordering(ctx, &store, &part_file)
+                    self.do_collect_statistics_and_ordering(ctx, store, &part_file)
                         .await?
                 } else {
                     (Arc::new(Statistics::new_unknown(&self.file_schema)), None)

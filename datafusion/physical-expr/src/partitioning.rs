@@ -244,35 +244,6 @@ impl RangePartitioning {
         self.split_points.len() + 1
     }
 
-    /// Returns true when `self` and `other` have the same range boundaries.
-    ///
-    /// Single-partition range partitionings always have the same boundaries. Otherwise,
-    /// the two partitionings must have identical split points, ordering width,
-    /// and sort options. This does not compare ordering expressions, callers
-    /// should validate the range keys separately.
-    fn same_boundaries(&self, other: &Self) -> bool {
-        if self.partition_count() == 1 && other.partition_count() == 1 {
-            return true;
-        }
-
-        if self.split_points != other.split_points
-            || self.ordering.len() != other.ordering.len()
-        {
-            return false;
-        }
-
-        if !self
-            .ordering
-            .iter()
-            .zip(other.ordering.iter())
-            .all(|(left, right)| left.options == right.options)
-        {
-            return false;
-        }
-
-        true
-    }
-
     /// Calculates the range partitioning after applying the given projection.
     ///
     /// Returns `None` if any range key cannot be projected or if projection
@@ -388,61 +359,6 @@ impl Partitioning {
         match self {
             RoundRobinBatch(n) | Hash(_, n) | UnknownPartitioning(n) => *n,
             Range(range) => range.partition_count(),
-        }
-    }
-
-    /// Returns true when two partitionings both satisfy their own distribution
-    /// requirements and can be paired by partition index.
-    ///
-    /// Use this for multi-input operators, such as partitioned joins, where
-    /// each child has a different schema, required [`Distribution`], and
-    /// expression-equivalence context.
-    ///
-    /// ```text
-    /// # co-partitioned: each side satisfies its own requirement, and boundaries match
-    /// left:  Range(left.a ASC,  [10, 20]), required KeyPartitioned(left.a)
-    /// right: Range(right.x ASC, [10, 20]), required KeyPartitioned(right.x)
-    ///
-    /// # not compatible: right side does not satisfy a hash-specific requirement
-    /// left:  Range(left.a ASC,  [10, 20]), required KeyPartitioned(left.a)
-    /// right: Range(right.x ASC, [10, 20]), required HashPartitioned(right.x)
-    ///
-    /// # not compatible: boundaries differ
-    /// left:  Range(left.a ASC,  [10, 20]), required KeyPartitioned(left.a)
-    /// right: Range(right.x ASC, [15, 20]), required KeyPartitioned(right.x)
-    /// ```
-    pub fn co_partitioned_with(
-        &self,
-        required: &Distribution,
-        eq_properties: &EquivalenceProperties,
-        other: &Self,
-        other_required: &Distribution,
-        other_eq_properties: &EquivalenceProperties,
-    ) -> bool {
-        if !self
-            .satisfaction(required, eq_properties, false)
-            .is_satisfied()
-            || !other
-                .satisfaction(other_required, other_eq_properties, false)
-                .is_satisfied()
-        {
-            return false;
-        }
-
-        if self.partition_count() == 1 && other.partition_count() == 1 {
-            return true;
-        }
-
-        if self.partition_count() != other.partition_count() {
-            return false;
-        }
-
-        match (self, other) {
-            (Partitioning::Hash(_, _), Partitioning::Hash(_, _)) => true,
-            (Partitioning::Range(left), Partitioning::Range(right)) => {
-                left.same_boundaries(right)
-            }
-            _ => false,
         }
     }
 
@@ -850,7 +766,7 @@ mod tests {
         let distribution_types = vec![
             Distribution::UnspecifiedDistribution,
             Distribution::SinglePartition,
-            fixture.hash_distribution([0, 1]),
+            Distribution::HashPartitioned(fixture.cols([0, 1])),
             Distribution::KeyPartitioned(fixture.cols([0, 1])),
         ];
 
@@ -887,9 +803,6 @@ mod tests {
                     assert_eq!(result, (true, false, false, false, false))
                 }
                 Distribution::HashPartitioned(_) | Distribution::KeyPartitioned(_) => {
-                    assert_eq!(result, (true, false, false, true, false))
-                }
-                Distribution::KeyPartitioned(_) => {
                     assert_eq!(result, (true, false, false, true, false))
                 }
             }
@@ -1472,148 +1385,15 @@ mod tests {
     }
 
     #[test]
-    fn range_partitionings_are_co_partitioned_by_boundaries() -> Result<()> {
-        let fixture = PartitioningTestFixture::int64(&["a", "b"])?;
-        let left = fixture
-            .range_partitioning([0], vec![int_split_point([10]), int_split_point([20])]);
-        let right_same_map = fixture
-            .range_partitioning([1], vec![int_split_point([10]), int_split_point([20])]);
-        let right_different_split = fixture
-            .range_partitioning([1], vec![int_split_point([15]), int_split_point([20])]);
-        let right_desc = fixture.range_partitioning_with_ordering(
-            [fixture.range_sort_expr(1, SortOptions::new(true, false))].into(),
-            vec![int_split_point([20]), int_split_point([10])],
-        );
-
-        let test_cases = [
-            (
-                "same boundaries with matching key requirements",
-                fixture.key_partitioned_distribution([0]),
-                right_same_map.clone(),
-                fixture.key_partitioned_distribution([1]),
-                true,
-            ),
-            (
-                "different split points",
-                fixture.key_partitioned_distribution([0]),
-                right_different_split,
-                fixture.key_partitioned_distribution([1]),
-                false,
-            ),
-            (
-                "different sort options",
-                fixture.key_partitioned_distribution([0]),
-                right_desc,
-                fixture.key_partitioned_distribution([1]),
-                false,
-            ),
-            (
-                "range cannot satisfy hash requirement",
-                fixture.hash_distribution([0]),
-                right_same_map,
-                fixture.key_partitioned_distribution([1]),
-                false,
-            ),
-        ];
-        for (desc, left_requirement, right, right_requirement, expected) in test_cases {
-            assert_eq!(
-                left.co_partitioned_with(
-                    &left_requirement,
-                    &fixture.eq_properties,
-                    &right,
-                    &right_requirement,
-                    &fixture.eq_properties,
-                ),
-                expected,
-                "Failed for {desc}"
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn co_partitioned_with_rejects_subset_key_satisfaction() -> Result<()> {
-        let fixture = PartitioningTestFixture::int64(&["a", "b"])?;
-        let left = fixture
-            .range_partitioning([0], vec![int_split_point([10]), int_split_point([20])]);
-        let right = fixture.range_partitioning([0, 1], vec![int_split_point([10, 100])]);
-
-        assert_eq!(
-            right.satisfaction(
-                &fixture.key_partitioned_distribution([0]),
-                &fixture.eq_properties,
-                false,
-            ),
-            PartitioningSatisfaction::NotSatisfied
-        );
-        assert_eq!(
-            left.satisfaction(
-                &fixture.key_partitioned_distribution([0, 1]),
-                &fixture.eq_properties,
-                true,
-            ),
-            PartitioningSatisfaction::Subset
-        );
-        assert!(!left.co_partitioned_with(
-            &fixture.key_partitioned_distribution([0, 1]),
-            &fixture.eq_properties,
-            &right,
-            &fixture.key_partitioned_distribution([0]),
-            &fixture.eq_properties,
-        ));
-
-        Ok(())
-    }
-
-    #[test]
-    fn hash_partitionings_are_co_partitioned_by_count() -> Result<()> {
-        let fixture = PartitioningTestFixture::int64(&["a", "b"])?;
-        let left = fixture.hash_partitioning([0], 2);
-
-        let test_cases = [
-            (
-                "same partition count",
-                fixture.hash_partitioning([1], 2),
-                fixture.key_partitioned_distribution([1]),
-                true,
-            ),
-            (
-                "different partition count",
-                fixture.hash_partitioning([1], 3),
-                fixture.key_partitioned_distribution([1]),
-                false,
-            ),
-            (
-                "mixed hash and range partitioning",
-                fixture.range_partitioning([1], vec![int_split_point([10])]),
-                fixture.key_partitioned_distribution([1]),
-                false,
-            ),
-        ];
-        for (desc, right, right_requirement, expected) in test_cases {
-            assert_eq!(
-                left.co_partitioned_with(
-                    &fixture.key_partitioned_distribution([0]),
-                    &fixture.eq_properties,
-                    &right,
-                    &right_requirement,
-                    &fixture.eq_properties,
-                ),
-                expected,
-                "Failed for {desc}"
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
+    #[expect(
+        deprecated,
+        reason = "test intentionally covers the hash-specific requirement"
+    )]
     fn test_multi_partition_range_does_not_satisfy_hash_distribution() -> Result<()> {
         let fixture = PartitioningTestFixture::int64(&["a", "b"])?;
         let range_partitioning =
             fixture.range_partitioning([0, 1], vec![int_split_point([10, 100])]);
-        let required = fixture.key_distribution([0, 1]);
+        let required = Distribution::HashPartitioned(fixture.cols([0, 1]));
 
         assert_eq!(
             range_partitioning.satisfaction(&required, &fixture.eq_properties, false),

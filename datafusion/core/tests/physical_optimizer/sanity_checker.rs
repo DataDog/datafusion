@@ -413,35 +413,32 @@ fn range_partitioned_exec(
         [sort_expr(key, schema)].into(),
         split_points,
     )?);
-    let input = memory_exec(schema);
-
-    RepartitionExec::try_new(input, partitioning)
+    RepartitionExec::try_new(memory_exec(schema), partitioning)
         .map(|exec| Arc::new(exec) as Arc<dyn ExecutionPlan>)
 }
 
 #[test]
 fn test_partitioned_hash_join_requires_co_partitioned_children() -> Result<()> {
     let schema = create_test_schema2();
-    let join_on = vec![(col("a", &schema)?, col("b", &schema)?)];
-    let right = range_partitioned_exec(&schema, "b", [10])?;
+    let join_on = vec![(col("a", &schema)?, col("a", &schema)?)];
 
-    let valid_join = hash_join_exec(
+    let compatible_join = hash_join_exec(
         range_partitioned_exec(&schema, "a", [10])?,
-        Arc::clone(&right),
+        range_partitioned_exec(&schema, "a", [10])?,
         join_on.clone(),
         None,
         &JoinType::Inner,
     )?;
-    assert_sanity_check(&valid_join, true);
+    assert_sanity_check(&compatible_join, true);
 
-    let invalid_join = hash_join_exec(
+    let incompatible_join = hash_join_exec(
+        range_partitioned_exec(&schema, "a", [10])?,
         range_partitioned_exec(&schema, "a", [20])?,
-        right,
         join_on,
         None,
         &JoinType::Inner,
     )?;
-    assert_sanity_check(&invalid_join, false);
+    assert_sanity_check(&incompatible_join, false);
 
     Ok(())
 }

@@ -147,7 +147,6 @@ mod tests {
     use datafusion_physical_expr::expressions::{Column, binary};
     use datafusion_physical_expr_common::sort_expr::LexOrdering;
     use datafusion_physical_plan::empty::EmptyExec;
-    use datafusion_physical_plan::statistics::StatisticsArgs;
     use datafusion_physical_plan::{
         ExecutionPlanProperties, Partitioning, RangePartitioning, SplitPoint, collect,
     };
