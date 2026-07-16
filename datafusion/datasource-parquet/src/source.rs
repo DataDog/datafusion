@@ -25,9 +25,9 @@ use crate::ParquetFileReaderFactory;
 use crate::opener::ParquetMorselizer;
 use crate::opener::build_pruning_predicates;
 use crate::row_filter::can_expr_be_pushed_down_with_schemas;
-use datafusion_common::config::ConfigOptions;
 #[cfg(feature = "parquet_encryption")]
 use datafusion_common::config::EncryptionFactoryOptions;
+use datafusion_common::config::{ConfigOptions, MetricsCardinality};
 use datafusion_datasource::as_file_source;
 use datafusion_datasource::file_stream::FileOpener;
 use datafusion_datasource::morsel::Morselizer;
@@ -49,8 +49,7 @@ use datafusion_physical_plan::filter_pushdown::PushedDown;
 use datafusion_physical_plan::filter_pushdown::{
     FilterPushdownPropagation, PushedDownPredicate,
 };
-use datafusion_physical_plan::metrics::Count;
-use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_plan::metrics::{Count, ExecutionPlanMetricsSet};
 use log::warn;
 
 #[cfg(feature = "parquet_encryption")]
@@ -280,6 +279,7 @@ pub struct ParquetSource {
     pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Optional user defined parquet file reader factory
     pub(crate) parquet_file_reader_factory: Option<Arc<dyn ParquetFileReaderFactory>>,
+
     /// Optional hint for the size of the parquet metadata
     pub(crate) metadata_size_hint: Option<usize>,
     /// Projection to apply to the output.
@@ -313,6 +313,7 @@ impl ParquetSource {
             metrics: ExecutionPlanMetricsSet::new(),
             predicate: None,
             parquet_file_reader_factory: None,
+
             metadata_size_hint: None,
             #[cfg(feature = "parquet_encryption")]
             encryption_factory: None,
@@ -579,6 +580,10 @@ impl FileSource for ParquetSource {
             );
         }
 
+        let metrics = self.metrics().clone();
+        let compact_metric_set = (args.metrics_cardinality
+            == MetricsCardinality::Compact)
+            .then(|| crate::ParquetMetricSet::new_compact(partition, &metrics));
         Ok(Box::new(ParquetMorselizer {
             partition_index: partition,
             projection: self.projection.clone(),
@@ -588,7 +593,8 @@ impl FileSource for ParquetSource {
             predicate: self.predicate.clone(),
             table_schema: self.table_schema.clone(),
             metadata_size_hint: self.metadata_size_hint,
-            metrics: self.metrics().clone(),
+            metrics,
+            compact_metric_set,
             parquet_file_reader_factory,
             pushdown_filters: self.pushdown_filters(),
             reorder_filters: self.reorder_filters(),

@@ -29,6 +29,7 @@ use crate::metrics::{MetricCategory, MetricType};
 use crate::{DisplayFormatType, ExecutionPlan, Partitioning};
 
 use arrow::{array::StringBuilder, datatypes::SchemaRef, record_batch::RecordBatch};
+use datafusion_common::config::MetricsCardinality;
 use datafusion_common::instant::Instant;
 use datafusion_common::{DataFusionError, Result, assert_eq_or_internal_err};
 use datafusion_execution::TaskContext;
@@ -179,6 +180,16 @@ impl ExecutionPlan for AnalyzeExec {
         let mut builder =
             RecordBatchReceiverStream::builder(self.schema(), num_input_partitions);
 
+        let context = if self.verbose {
+            // Override the child execution setting consumed by metric-producing operators.
+            let mut session_config = context.session_config().clone();
+            session_config.options_mut().execution.metrics_cardinality =
+                MetricsCardinality::Verbose;
+            Arc::new(context.fork_with_session_config(session_config))
+        } else {
+            context
+        };
+
         for input_partition in 0..num_input_partitions {
             builder.run_input(
                 Arc::clone(&self.input),
@@ -288,6 +299,7 @@ mod tests {
     use super::*;
     use crate::{
         collect,
+        empty::EmptyExec,
         test::{
             assert_is_pending,
             exec::{BlockingExec, assert_strong_count_converges_to_zero},
@@ -296,6 +308,88 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
     use futures::FutureExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    struct ContextObserverExec {
+        inner: EmptyExec,
+        saw_verbose: Arc<AtomicBool>,
+    }
+
+    impl DisplayAs for ContextObserverExec {
+        fn fmt_as(
+            &self,
+            t: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            self.inner.fmt_as(t, f)
+        }
+    }
+
+    impl ExecutionPlan for ContextObserverExec {
+        fn name(&self) -> &'static str {
+            "ContextObserverExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            self.saw_verbose.store(
+                context
+                    .session_config()
+                    .options()
+                    .execution
+                    .metrics_cardinality
+                    == MetricsCardinality::Verbose,
+                Ordering::Relaxed,
+            );
+            self.inner.execute(partition, context)
+        }
+    }
+
+    #[tokio::test]
+    async fn verbose_analyze_uses_verbose_metrics_cardinality() -> Result<()> {
+        let task_ctx = Arc::new(TaskContext::default());
+        let input_schema = Arc::new(Schema::empty());
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("plan_type", DataType::Utf8, false),
+            Field::new("plan", DataType::Utf8, false),
+        ]));
+        let saw_verbose = Arc::new(AtomicBool::new(false));
+        let input = Arc::new(ContextObserverExec {
+            inner: EmptyExec::new(input_schema),
+            saw_verbose: Arc::clone(&saw_verbose),
+        });
+        let analyze = Arc::new(AnalyzeExec::new(
+            true,
+            false,
+            vec![MetricType::Summary, MetricType::Dev],
+            None,
+            input,
+            output_schema,
+        ));
+
+        collect(analyze, task_ctx).await?;
+        assert!(saw_verbose.load(Ordering::Relaxed));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_drop_cancel() -> Result<()> {

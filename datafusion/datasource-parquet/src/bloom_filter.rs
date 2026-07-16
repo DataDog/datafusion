@@ -199,7 +199,7 @@ mod tests {
 
     use crate::reader::ParquetFileReader;
     use crate::test_util::ExpectedPruning;
-    use crate::{ParquetAccessPlan, ParquetFileMetrics, RowGroupAccessPlanFilter};
+    use crate::{ParquetAccessPlan, ParquetMetricSet, RowGroupAccessPlanFilter};
 
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::Result;
@@ -491,7 +491,7 @@ mod tests {
 
         let metrics = ExecutionPlanMetricsSet::new();
         let file_metrics =
-            ParquetFileMetrics::new(0, object_meta.location.as_ref(), &metrics);
+            ParquetMetricSet::new(0, object_meta.location.as_ref(), &metrics);
         let inner =
             ParquetObjectReader::new(Arc::new(in_memory), object_meta.location.clone())
                 .with_file_size(object_meta.size);

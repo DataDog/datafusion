@@ -456,6 +456,51 @@ impl Display for SpillCompression {
     }
 }
 
+/// Controls the cardinality of metrics produced during execution.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsCardinality {
+    /// Avoid high-cardinality dimensions and produce a compact set of metrics.
+    #[default]
+    Compact,
+    /// Permit operators to produce fine-grained metrics, such as per-file metrics.
+    Verbose,
+}
+
+impl FromStr for MetricsCardinality {
+    type Err = DataFusionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "compact" => Ok(Self::Compact),
+            "verbose" => Ok(Self::Verbose),
+            other => Err(DataFusionError::Configuration(format!(
+                "Invalid MetricsCardinality: {other}. Expected one of: compact, verbose"
+            ))),
+        }
+    }
+}
+
+impl ConfigField for MetricsCardinality {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        v.some(key, self, description)
+    }
+
+    fn set(&mut self, _: &str, value: &str) -> Result<()> {
+        *self = MetricsCardinality::from_str(value)?;
+        Ok(())
+    }
+}
+
+impl Display for MetricsCardinality {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let str = match self {
+            Self::Compact => "compact",
+            Self::Verbose => "verbose",
+        };
+        write!(f, "{str}")
+    }
+}
+
 impl From<SpillCompression> for Option<CompressionType> {
     fn from(c: SpillCompression) -> Self {
         match c {
@@ -539,6 +584,15 @@ config_namespace! {
         /// This is used to workaround bugs in the planner that are now caught by
         /// the new schema verification step.
         pub skip_physical_aggregate_schema_check: bool, default = false
+
+        /// Controls the cardinality of metrics produced by execution operators.
+        /// `compact` avoids high-cardinality metrics, while `verbose` permits
+        /// fine-grained metrics such as per-file metrics and can substantially increase
+        /// synchronization and memory overhead, especially for plans that scan many
+        /// files. `EXPLAIN ANALYZE VERBOSE` automatically sets this to `verbose`
+        /// in the child task context. This does not control which metric types are
+        /// included in EXPLAIN output; use `explain.analyze_level` for that.
+        pub metrics_cardinality: MetricsCardinality, default = MetricsCardinality::Compact
 
         /// Sets the compression codec used when spilling data to disk.
         ///
@@ -3983,6 +4037,31 @@ mod tests {
             )
             .unwrap();
         assert!(!config.execution.parquet.content_defined_chunking.enabled);
+    }
+
+    #[test]
+    fn metrics_cardinality_config() {
+        use crate::config::{ConfigOptions, MetricsCardinality};
+
+        let mut config = ConfigOptions::default();
+        assert_eq!(
+            config.execution.metrics_cardinality,
+            MetricsCardinality::Compact
+        );
+
+        config
+            .set("datafusion.execution.metrics_cardinality", "VERBOSE")
+            .unwrap();
+        assert_eq!(
+            config.execution.metrics_cardinality,
+            MetricsCardinality::Verbose
+        );
+        assert_eq!(config.execution.metrics_cardinality.to_string(), "verbose");
+
+        let err = config
+            .set("datafusion.execution.metrics_cardinality", "invalid")
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid MetricsCardinality"));
     }
 
     #[cfg(feature = "parquet")]

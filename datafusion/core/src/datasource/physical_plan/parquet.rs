@@ -64,9 +64,7 @@ mod tests {
     use datafusion_physical_expr::planner::logical2physical;
     use datafusion_physical_plan::analyze::AnalyzeExec;
     use datafusion_physical_plan::collect;
-    use datafusion_physical_plan::metrics::{
-        ExecutionPlanMetricsSet, MetricType, MetricValue, MetricsSet,
-    };
+    use datafusion_physical_plan::metrics::{MetricType, MetricValue, MetricsSet};
     use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
     use chrono::{TimeZone, Utc};
@@ -2453,7 +2451,7 @@ mod tests {
             partition_index: usize,
             partitioned_file: PartitionedFile,
             metadata_size_hint: Option<usize>,
-            metrics: &ExecutionPlanMetricsSet,
+            metrics: datafusion_datasource_parquet::ParquetMetricSet,
         ) -> Result<Box<dyn parquet::arrow::async_reader::AsyncFileReader + Send>>
         {
             self.metadata_size_hint_calls

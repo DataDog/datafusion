@@ -26,7 +26,6 @@ use arrow::datatypes::Schema;
 use datafusion_common::Result;
 use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
-use object_store::ObjectStore;
 
 /// Minimal [`crate::file::FileSource`] implementation for use in tests.
 #[derive(Clone)]

@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::metrics::ParquetFileMetrics;
+use super::metrics::ParquetMetricSet;
 use crate::ParquetAccessPlan;
 
 use arrow::array::BooleanArray;
@@ -179,7 +179,7 @@ impl PagePruningAccessPlanFilter {
         arrow_schema: &Schema,
         parquet_schema: &SchemaDescriptor,
         parquet_metadata: &ParquetMetaData,
-        file_metrics: &ParquetFileMetrics,
+        file_metrics: &ParquetMetricSet,
     ) -> ParquetAccessPlan {
         self.prune_plan_with_page_index_and_metrics(
             access_plan,
@@ -199,7 +199,7 @@ impl PagePruningAccessPlanFilter {
         arrow_schema: &Schema,
         parquet_schema: &SchemaDescriptor,
         parquet_metadata: &ParquetMetaData,
-        file_metrics: &ParquetFileMetrics,
+        file_metrics: &ParquetMetricSet,
     ) -> PagePruningResult {
         // scoped timer updates on drop
         let _timer_guard = file_metrics.page_index_eval_time.timer();
@@ -414,7 +414,7 @@ fn prune_pages_in_one_row_group(
     pruning_predicate: &PruningPredicate,
     converter: StatisticsConverter<'_>,
     parquet_metadata: &ParquetMetaData,
-    metrics: &ParquetFileMetrics,
+    metrics: &ParquetMetricSet,
 ) -> Option<(RowSelection, Vec<bool>)> {
     let pruning_stats =
         PagesPruningStatistics::try_new(row_group_index, converter, parquet_metadata)?;

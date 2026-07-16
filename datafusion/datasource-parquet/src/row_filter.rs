@@ -88,7 +88,7 @@ use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 
 use datafusion_physical_plan::metrics;
 
-use super::ParquetFileMetrics;
+use super::ParquetMetricSet;
 use super::supported_predicates::supports_list_predicates;
 
 /// A "compiled" predicate passed to `ParquetRecordBatchStream` to perform
@@ -1017,7 +1017,7 @@ pub fn build_row_filter(
     file_schema: &SchemaRef,
     metadata: &ParquetMetaData,
     reorder_predicates: bool,
-    file_metrics: &ParquetFileMetrics,
+    file_metrics: &ParquetMetricSet,
 ) -> Result<Option<RowFilter>> {
     let rows_pruned = &file_metrics.pushdown_rows_pruned;
     let rows_matched = &file_metrics.pushdown_rows_matched;
@@ -1093,7 +1093,7 @@ pub(crate) struct RowFilterGenerator<'a> {
     physical_file_schema: &'a SchemaRef,
     file_metadata: &'a ParquetMetaData,
     reorder_predicates: bool,
-    file_metrics: &'a ParquetFileMetrics,
+    file_metrics: &'a ParquetMetricSet,
     first_row_filter: Option<RowFilter>,
 }
 
@@ -1103,7 +1103,7 @@ impl<'a> RowFilterGenerator<'a> {
         physical_file_schema: &'a SchemaRef,
         file_metadata: &'a ParquetMetaData,
         reorder_predicates: bool,
-        file_metrics: &'a ParquetFileMetrics,
+        file_metrics: &'a ParquetMetricSet,
     ) -> Self {
         let mut generator = Self {
             predicate,
@@ -1433,7 +1433,7 @@ mod test {
 
         let metrics = ExecutionPlanMetricsSet::new();
         let file_metrics =
-            ParquetFileMetrics::new(0, &format!("{func_name}.parquet"), &metrics);
+            ParquetMetricSet::new(0, &format!("{func_name}.parquet"), &metrics);
 
         let row_filter =
             build_row_filter(&expr, &file_schema, &metadata, false, &file_metrics)
@@ -2011,7 +2011,7 @@ mod test {
         let expr = logical2physical(&predicate_expr, &file_schema);
 
         let metrics = ExecutionPlanMetricsSet::new();
-        let file_metrics = ParquetFileMetrics::new(0, "struct_e2e.parquet", &metrics);
+        let file_metrics = ParquetMetricSet::new(0, "struct_e2e.parquet", &metrics);
 
         let row_filter =
             build_row_filter(&expr, &file_schema, &metadata, false, &file_metrics)

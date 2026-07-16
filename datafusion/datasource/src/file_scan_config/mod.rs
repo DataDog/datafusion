@@ -593,7 +593,14 @@ impl DataSource for FileScanConfig {
             .with_limit(self.limit)
             .with_preserve_order(self.preserve_order)
             .with_file_compression_type(self.file_compression_type)
-            .with_expr_adapter_factory(self.expr_adapter_factory.clone());
+            .with_expr_adapter_factory(self.expr_adapter_factory.clone())
+            .with_metrics_cardinality(
+                context
+                    .session_config()
+                    .options()
+                    .execution
+                    .metrics_cardinality,
+            );
 
         let morselizer = self
             .file_source

@@ -29,7 +29,7 @@ use crate::file_stream::FileOpener;
 use crate::morsel::{FileOpenerMorselizer, Morselizer};
 #[expect(deprecated)]
 use crate::schema_adapter::SchemaAdapterFactory;
-use datafusion_common::config::ConfigOptions;
+use datafusion_common::config::{ConfigOptions, MetricsCardinality};
 use datafusion_common::{Result, not_impl_err};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
@@ -66,6 +66,8 @@ pub struct FileSourceArgs {
     pub file_compression_type: FileCompressionType,
     /// Adapter factory for rewriting expressions to the physical file schema.
     pub expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    /// Cardinality of execution metrics produced by the source.
+    pub metrics_cardinality: MetricsCardinality,
 }
 
 impl FileSourceArgs {
@@ -77,6 +79,7 @@ impl FileSourceArgs {
             preserve_order: false,
             file_compression_type: FileCompressionType::UNCOMPRESSED,
             expr_adapter_factory: None,
+            metrics_cardinality: MetricsCardinality::default(),
         }
     }
 
@@ -103,6 +106,14 @@ impl FileSourceArgs {
         expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
     ) -> Self {
         self.expr_adapter_factory = expr_adapter_factory;
+        self
+    }
+
+    pub fn with_metrics_cardinality(
+        mut self,
+        metrics_cardinality: MetricsCardinality,
+    ) -> Self {
+        self.metrics_cardinality = metrics_cardinality;
         self
     }
 }

@@ -120,6 +120,25 @@ impl TaskContext {
         &self.session_config
     }
 
+    /// Create a child [`TaskContext`] with a different [`SessionConfig`].
+    ///
+    /// The child preserves the session and task IDs, function registries, and
+    /// runtime environment from this context. Cloning a [`SessionConfig`] before
+    /// calling this method allows its configuration options to be changed using
+    /// copy-on-write semantics without modifying this context.
+    pub fn fork_with_session_config(&self, session_config: SessionConfig) -> Self {
+        Self {
+            session_id: self.session_id.clone(),
+            task_id: self.task_id.clone(),
+            session_config,
+            scalar_functions: self.scalar_functions.clone(),
+            higher_order_functions: self.higher_order_functions.clone(),
+            aggregate_functions: self.aggregate_functions.clone(),
+            window_functions: self.window_functions.clone(),
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+
     /// Return the `session_id` of this [TaskContext]
     pub fn session_id(&self) -> String {
         self.session_id.clone()
@@ -352,6 +371,69 @@ mod tests {
 
         assert_eq!(test.unwrap().value, 42);
         assert_eq!(test.unwrap().option_value, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn fork_with_session_config_preserves_context() -> Result<()> {
+        use datafusion_common::config::MetricsCardinality;
+
+        let runtime = Arc::new(RuntimeEnv::default());
+        let mut extensions = Extensions::new();
+        extensions.insert(TestExtension::default());
+        let session_extension = Arc::new(42_usize);
+        let session_config =
+            SessionConfig::from(ConfigOptions::new().with_extensions(extensions))
+                .with_extension(Arc::clone(&session_extension));
+
+        let task_context = TaskContext::new(
+            Some("task_id".to_string()),
+            "session_id".to_string(),
+            session_config,
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+            Arc::clone(&runtime),
+        );
+
+        let mut child_config = task_context.session_config().clone();
+        child_config.options_mut().execution.metrics_cardinality =
+            MetricsCardinality::Verbose;
+        let child = task_context.fork_with_session_config(child_config);
+
+        assert_eq!(child.session_id(), task_context.session_id());
+        assert_eq!(child.task_id(), task_context.task_id());
+        assert!(Arc::ptr_eq(&child.runtime_env(), &runtime));
+        assert_eq!(
+            task_context
+                .session_config()
+                .options()
+                .execution
+                .metrics_cardinality,
+            MetricsCardinality::Compact
+        );
+        assert_eq!(
+            child
+                .session_config()
+                .options()
+                .execution
+                .metrics_cardinality,
+            MetricsCardinality::Verbose
+        );
+        assert!(
+            child
+                .session_config()
+                .options()
+                .extensions
+                .get::<TestExtension>()
+                .is_some()
+        );
+        assert!(Arc::ptr_eq(
+            &child.session_config().get_extension::<usize>().unwrap(),
+            &session_extension
+        ));
 
         Ok(())
     }

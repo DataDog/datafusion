@@ -29,7 +29,7 @@ use crate::push_decoder::{DecoderBuilderConfig, PushDecoderStreamState};
 use crate::row_filter::{RowFilterGenerator, build_projection_read_plan};
 use crate::row_group_filter::{BloomFilterStatistics, RowGroupAccessPlanFilter};
 use crate::{
-    Int96Coercer, ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
+    Int96Coercer, ParquetAccessPlan, ParquetFileReaderFactory, ParquetMetricSet,
     apply_file_schema_type_coercions,
 };
 use arrow::array::RecordBatch;
@@ -56,9 +56,7 @@ use datafusion_physical_expr_common::physical_expr::{
     PhysicalExpr, is_dynamic_physical_expr,
 };
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
-use datafusion_physical_plan::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricCategory,
-};
+use datafusion_physical_plan::metrics::{Count, ExecutionPlanMetricsSet};
 use datafusion_pruning::{FilePruner, PruningPredicate, build_pruning_predicate};
 
 #[cfg(feature = "parquet_encryption")]
@@ -100,8 +98,10 @@ pub(super) struct ParquetMorselizer {
     /// Optional hint for how large the initial request to read parquet metadata
     /// should be
     pub metadata_size_hint: Option<usize>,
-    /// Metrics for reporting
+    /// Registry used to create metric sets.
     pub metrics: ExecutionPlanMetricsSet,
+    /// Shared metric set in compact mode; absent in verbose mode.
+    pub compact_metric_set: Option<ParquetMetricSet>,
     /// Factory for instantiating parquet reader
     pub parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
     /// Should the filters be evaluated during the parquet scan using
@@ -266,11 +266,9 @@ struct PreparedParquetOpen {
     file_range: Option<datafusion_datasource::FileRange>,
     extensions: datafusion_datasource::FileExtensions,
     file_name: String,
-    file_metrics: ParquetFileMetrics,
-    baseline_metrics: BaselineMetrics,
+    metric_set: ParquetMetricSet,
     file_pruner: Option<FilePruner>,
     metadata_size_hint: Option<usize>,
-    metrics: ExecutionPlanMetricsSet,
     parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
     async_file_reader: Box<dyn AsyncFileReader>,
     batch_size: usize,
@@ -289,7 +287,6 @@ struct PreparedParquetOpen {
     coerce_int96: Option<TimeUnit>,
     coerce_int96_tz: Option<Arc<str>>,
     expr_adapter_factory: Arc<dyn PhysicalExprAdapterFactory>,
-    predicate_creation_errors: Count,
     max_predicate_cache_size: Option<usize>,
     reverse_row_groups: bool,
     sort_order_for_reorder: Option<LexOrdering>,
@@ -537,6 +534,16 @@ impl MorselPlanner for ParquetMorselPlanner {
 }
 
 impl ParquetMorselizer {
+    fn metric_set_for_file(&self, file: &PartitionedFile) -> ParquetMetricSet {
+        self.compact_metric_set.clone().unwrap_or_else(|| {
+            ParquetMetricSet::new(
+                self.partition_index,
+                file.object_meta.location.as_ref(),
+                &self.metrics,
+            )
+        })
+    }
+
     /// Perform the CPU-only setup for opening a parquet file.
     fn prepare_open_file(
         &self,
@@ -545,21 +552,18 @@ impl ParquetMorselizer {
         let file_range = partitioned_file.range.clone();
         let extensions = partitioned_file.extensions.clone();
         let file_name = partitioned_file.object_meta.location.to_string();
-        let file_metrics =
-            ParquetFileMetrics::new(self.partition_index, &file_name, &self.metrics);
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, self.partition_index);
+        let metric_set = self.metric_set_for_file(&partitioned_file);
 
         let metadata_size_hint = partitioned_file
             .metadata_size_hint
             .or(self.metadata_size_hint);
 
-        let async_file_reader: Box<dyn AsyncFileReader> =
-            self.parquet_file_reader_factory.create_reader(
-                self.partition_index,
-                partitioned_file.clone(),
-                metadata_size_hint,
-                &self.metrics,
-            )?;
+        let async_file_reader = self.parquet_file_reader_factory.create_reader(
+            self.partition_index,
+            partitioned_file.clone(),
+            metadata_size_hint,
+            metric_set.clone(),
+        )?;
 
         // Calculate the output schema from the original projection (before literal replacement)
         // so we get correct field names from column references
@@ -614,9 +618,7 @@ impl ParquetMorselizer {
                 .transpose()?;
         }
 
-        let predicate_creation_errors = MetricBuilder::new(&self.metrics)
-            .with_category(MetricCategory::Rows)
-            .global_counter("num_predicate_creation_errors");
+        let predicate_creation_errors = metric_set.predicate_creation_errors.clone();
 
         // Apply literal replacements to projection and predicate
         let file_pruner = predicate
@@ -637,11 +639,9 @@ impl ParquetMorselizer {
             file_range,
             extensions,
             file_name,
-            file_metrics,
-            baseline_metrics,
+            metric_set,
             file_pruner,
             metadata_size_hint,
-            metrics: self.metrics.clone(),
             parquet_file_reader_factory: Arc::clone(&self.parquet_file_reader_factory),
             async_file_reader,
             batch_size: self.batch_size,
@@ -660,7 +660,6 @@ impl ParquetMorselizer {
             coerce_int96: self.coerce_int96,
             coerce_int96_tz: self.coerce_int96_tz.clone(),
             expr_adapter_factory: Arc::clone(&self.expr_adapter_factory),
-            predicate_creation_errors,
             max_predicate_cache_size: self.max_predicate_cache_size,
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
@@ -704,13 +703,11 @@ impl PreparedParquetOpen {
         if let Some(file_pruner) = &mut self.file_pruner
             && file_pruner.should_prune()?
         {
-            self.file_metrics
-                .files_ranges_pruned_statistics
-                .add_pruned(1);
+            self.metric_set.files_ranges_pruned_statistics.add_pruned(1);
             return Ok(None);
         }
 
-        self.file_metrics
+        self.metric_set
             .files_ranges_pruned_statistics
             .add_matched(1);
         Ok(Some(self))
@@ -732,7 +729,7 @@ impl PreparedParquetOpen {
             options = options.with_file_decryption_properties(Arc::clone(fd_val));
         }
 
-        let mut metadata_timer = self.file_metrics.metadata_load_time.timer();
+        let mut metadata_timer = self.metric_set.metadata_load_time.timer();
         // Begin by loading the metadata from the underlying reader (note
         // the returned metadata may actually include page indexes as some
         // readers may return page indexes even when not requested -- for
@@ -837,7 +834,7 @@ impl MetadataLoadedParquetOpen {
         let pruning_predicate = build_pruning_predicates(
             prepared.predicate.as_ref(),
             &physical_file_schema,
-            &prepared.predicate_creation_errors,
+            &prepared.metric_set.predicate_creation_errors,
         );
 
         // Only build page pruning predicate if page index is enabled
@@ -912,13 +909,13 @@ impl FiltersPreparedParquetOpen {
                     loaded.reader_metadata.parquet_schema(),
                     rg_metadata,
                     predicate,
-                    &prepared.file_metrics,
+                    &prepared.metric_set,
                 );
             } else {
                 // Update metrics: statistics unavailable, so all row groups are
                 // matched (not pruned)
                 prepared
-                    .file_metrics
+                    .metric_set
                     .row_groups_pruned_statistics
                     .add_matched(row_groups.remaining_row_group_count());
             }
@@ -927,7 +924,7 @@ impl FiltersPreparedParquetOpen {
                 // Update metrics: bloom filter unavailable, so all row groups are
                 // matched (not pruned)
                 prepared
-                    .file_metrics
+                    .metric_set
                     .row_groups_pruned_bloom_filter
                     .add_matched(row_groups.remaining_row_group_count());
             }
@@ -935,11 +932,11 @@ impl FiltersPreparedParquetOpen {
             // Update metrics: no predicate, so all row groups are matched (not pruned)
             let remaining = row_groups.remaining_row_group_count();
             prepared
-                .file_metrics
+                .metric_set
                 .row_groups_pruned_statistics
                 .add_matched(remaining);
             prepared
-                .file_metrics
+                .metric_set
                 .row_groups_pruned_bloom_filter
                 .add_matched(remaining);
         }
@@ -977,7 +974,7 @@ impl RowGroupsPrunedParquetOpen {
                     prepared.partition_index,
                     prepared.partitioned_file.clone(),
                     prepared.metadata_size_hint,
-                    &prepared.metrics,
+                    prepared.metric_set.clone(),
                 )?
             };
 
@@ -1016,7 +1013,7 @@ impl RowGroupsPrunedParquetOpen {
                         Ok(None) => continue,
                         Err(e) => {
                             debug!("Ignoring error reading bloom filter: {e}");
-                            prepared.file_metrics.predicate_evaluation_errors.add(1);
+                            prepared.metric_set.predicate_evaluation_errors.add(1);
                             continue;
                         }
                     };
@@ -1041,7 +1038,7 @@ impl BloomFiltersLoadedParquetOpen {
             .prepared
             .loaded
             .prepared
-            .file_metrics
+            .metric_set
             .bloom_filter_eval_time
             .clone();
         let _timer_guard = bloom_filter_eval_time.timer();
@@ -1056,7 +1053,7 @@ impl BloomFiltersLoadedParquetOpen {
         {
             self.prepared.row_groups.prune_by_bloom_filters(
                 predicate,
-                &self.prepared.prepared.loaded.prepared.file_metrics,
+                &self.prepared.prepared.loaded.prepared.metric_set,
                 &self.row_group_bloom_filters,
             );
         }
@@ -1088,7 +1085,7 @@ impl RowGroupsPrunedParquetOpen {
 
         // Prune by limit if limit is set and limit order is not sensitive
         if let (Some(limit), false) = (prepared.limit, prepared.preserve_order) {
-            row_groups.prune_by_limit(limit, rg_metadata, &prepared.file_metrics);
+            row_groups.prune_by_limit(limit, rg_metadata, &prepared.metric_set);
         }
 
         // Build the access plan. Fully matched row groups have all rows
@@ -1109,15 +1106,13 @@ impl RowGroupsPrunedParquetOpen {
                     &prepared.physical_file_schema,
                     reader_metadata.parquet_schema(),
                     file_metadata.as_ref(),
-                    &prepared.file_metrics,
+                    &prepared.metric_set,
                 );
             access_plan = page_pruning_result.access_plan;
-            ParquetFileMetrics::add_page_index_pages_skipped_by_fully_matched(
-                &prepared.metrics,
-                prepared.partition_index,
-                &prepared.file_name,
-                page_pruning_result.pages_skipped_by_fully_matched,
-            );
+            prepared
+                .metric_set
+                .page_index_pages_skipped_by_fully_matched
+                .add(page_pruning_result.pages_skipped_by_fully_matched);
         }
 
         // Prepare access plans, then apply row-group ordering tweaks per
@@ -1172,7 +1167,7 @@ impl RowGroupsPrunedParquetOpen {
                 &prepared.physical_file_schema,
                 file_metadata.as_ref(),
                 prepared.reorder_predicates,
-                &prepared.file_metrics,
+                &prepared.metric_set,
             );
 
             // Split into consecutive runs of row groups that share the same filter
@@ -1222,9 +1217,8 @@ impl RowGroupsPrunedParquetOpen {
         };
 
         let predicate_cache_inner_records =
-            prepared.file_metrics.predicate_cache_inner_records.clone();
-        let predicate_cache_records =
-            prepared.file_metrics.predicate_cache_records.clone();
+            prepared.metric_set.predicate_cache_inner_records.clone();
+        let predicate_cache_records = prepared.metric_set.predicate_cache_records.clone();
 
         // Check if we need to replace the schema to handle things like differing nullability or metadata.
         // See note below about file vs. output schema.
@@ -1240,7 +1234,7 @@ impl RowGroupsPrunedParquetOpen {
         let projector = projection.make_projector(&stream_schema)?;
         let output_schema = Arc::clone(&prepared.output_schema);
         let files_ranges_pruned_statistics =
-            prepared.file_metrics.files_ranges_pruned_statistics.clone();
+            prepared.metric_set.files_ranges_pruned_statistics.clone();
         let stream = PushDecoderStreamState {
             decoder,
             pending_decoders,
@@ -1252,7 +1246,9 @@ impl RowGroupsPrunedParquetOpen {
             arrow_reader_metrics,
             predicate_cache_inner_records,
             predicate_cache_records,
-            baseline_metrics: prepared.baseline_metrics,
+            previous_predicate_cache_inner_records: 0,
+            previous_predicate_cache_records: 0,
+            baseline_metrics: prepared.metric_set.baseline_metrics(),
         }
         .into_stream();
 
@@ -1425,8 +1421,8 @@ mod test {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use bytes::{BufMut, BytesMut};
     use datafusion_common::{
-        ColumnStatistics, ScalarValue, Statistics, internal_err, record_batch,
-        stats::Precision,
+        ColumnStatistics, ScalarValue, Statistics, config::MetricsCardinality,
+        internal_err, record_batch, stats::Precision,
     };
     use datafusion_datasource::morsel::{Morsel, Morselizer};
     use datafusion_datasource::{PartitionedFile, TableSchema};
@@ -1440,7 +1436,7 @@ mod test {
     use datafusion_physical_expr_adapter::{
         DefaultPhysicalExprAdapterFactory, replace_columns_with_literals,
     };
-    use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+    use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricValue};
     use futures::StreamExt;
     use futures::stream::BoxStream;
     use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
@@ -1451,6 +1447,26 @@ mod test {
 
     /// Builder for creating [`ParquetMorselizer`] instances with sensible defaults for tests.
     /// This helps reduce code duplication and makes it clear what differs between test cases.
+    #[derive(Debug)]
+    struct LegacyReaderFactory(DefaultParquetFileReaderFactory);
+
+    impl ParquetFileReaderFactory for LegacyReaderFactory {
+        fn create_reader(
+            &self,
+            partition_index: usize,
+            partitioned_file: PartitionedFile,
+            metadata_size_hint: Option<usize>,
+            metrics: ParquetMetricSet,
+        ) -> Result<Box<dyn AsyncFileReader + Send>> {
+            self.0.create_reader(
+                partition_index,
+                partitioned_file,
+                metadata_size_hint,
+                metrics,
+            )
+        }
+    }
+
     struct ParquetMorselizerBuilder {
         store: Option<Arc<dyn ObjectStore>>,
         table_schema: Option<TableSchema>,
@@ -1462,6 +1478,8 @@ mod test {
         predicate: Option<Arc<dyn PhysicalExpr>>,
         metadata_size_hint: Option<usize>,
         metrics: ExecutionPlanMetricsSet,
+        metrics_cardinality: MetricsCardinality,
+        parquet_file_reader_factory: Option<Arc<dyn ParquetFileReaderFactory>>,
         pushdown_filters: bool,
         reorder_filters: bool,
         force_filter_selections: bool,
@@ -1488,6 +1506,8 @@ mod test {
                 predicate: None,
                 metadata_size_hint: None,
                 metrics: ExecutionPlanMetricsSet::new(),
+                metrics_cardinality: MetricsCardinality::Compact,
+                parquet_file_reader_factory: None,
                 pushdown_filters: false,
                 reorder_filters: false,
                 force_filter_selections: false,
@@ -1555,6 +1575,27 @@ mod test {
             self
         }
 
+        fn with_metrics(mut self, metrics: ExecutionPlanMetricsSet) -> Self {
+            self.metrics = metrics;
+            self
+        }
+
+        fn with_metrics_cardinality(
+            mut self,
+            metrics_cardinality: MetricsCardinality,
+        ) -> Self {
+            self.metrics_cardinality = metrics_cardinality;
+            self
+        }
+
+        fn with_parquet_file_reader_factory(
+            mut self,
+            factory: Arc<dyn ParquetFileReaderFactory>,
+        ) -> Self {
+            self.parquet_file_reader_factory = Some(factory);
+            self
+        }
+
         /// Set a row limit.
         fn with_limit(mut self, limit: usize) -> Self {
             self.limit = Some(limit);
@@ -1591,6 +1632,11 @@ mod test {
                 ProjectionExprs::from_indices(&all_indices, &file_schema)
             };
 
+            let metrics = self.metrics;
+            let compact_metric_set = (self.metrics_cardinality
+                == MetricsCardinality::Compact)
+                .then(|| ParquetMetricSet::new_compact(self.partition_index, &metrics));
+
             ParquetMorselizer {
                 partition_index: self.partition_index,
                 projection,
@@ -1600,10 +1646,13 @@ mod test {
                 predicate: self.predicate,
                 table_schema,
                 metadata_size_hint: self.metadata_size_hint,
-                metrics: self.metrics,
-                parquet_file_reader_factory: Arc::new(
-                    DefaultParquetFileReaderFactory::new(store),
-                ),
+                metrics,
+                compact_metric_set,
+                parquet_file_reader_factory: self
+                    .parquet_file_reader_factory
+                    .unwrap_or_else(|| {
+                        Arc::new(DefaultParquetFileReaderFactory::new(store)) as _
+                    }),
                 pushdown_filters: self.pushdown_filters,
                 reorder_filters: self.reorder_filters,
                 force_filter_selections: self.force_filter_selections,
@@ -1663,6 +1712,111 @@ mod test {
                 }
             }
         }
+    }
+
+    #[test]
+    fn compact_mode_reuses_selected_metric_set() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let metrics = ExecutionPlanMetricsSet::new();
+        let factory = Arc::new(LegacyReaderFactory(
+            DefaultParquetFileReaderFactory::new(Arc::clone(&store)),
+        ));
+        let morselizer = ParquetMorselizerBuilder::new()
+            .with_store(store)
+            .with_schema(Arc::new(Schema::empty()))
+            .with_metrics(metrics.clone())
+            .with_parquet_file_reader_factory(factory)
+            .build();
+        let before = metrics.clone_inner().iter().count();
+
+        morselizer
+            .prepare_open_file(PartitionedFile::new("legacy.parquet", 100))
+            .unwrap();
+
+        let final_metrics = metrics.clone_inner();
+        assert_eq!(final_metrics.iter().count(), before);
+        assert!(
+            final_metrics
+                .iter()
+                .all(|metric| !metric.to_string().contains("filename="))
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_cardinality_controls_per_file_registration() {
+        async fn run(cardinality: MetricsCardinality) -> (usize, usize, usize, String) {
+            let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let batch =
+                record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+            let first_size =
+                write_parquet(Arc::clone(&store), "first.parquet", batch.clone()).await;
+            let second_size =
+                write_parquet(Arc::clone(&store), "second.parquet", batch.clone()).await;
+            let metrics = ExecutionPlanMetricsSet::new();
+            let morselizer = ParquetMorselizerBuilder::new()
+                .with_store(store)
+                .with_schema(batch.schema())
+                .with_metrics(metrics.clone())
+                .with_metrics_cardinality(cardinality)
+                .build();
+
+            let before = metrics.clone_inner().iter().count();
+            let mut first = open_file(
+                &morselizer,
+                PartitionedFile::new("first.parquet", first_size as u64),
+            )
+            .await
+            .unwrap();
+            while first.next().await.transpose().unwrap().is_some() {}
+            let after_first = metrics.clone_inner().iter().count();
+
+            let mut second = open_file(
+                &morselizer,
+                PartitionedFile::new("second.parquet", second_size as u64),
+            )
+            .await
+            .unwrap();
+            while second.next().await.transpose().unwrap().is_some() {}
+            let final_metrics = metrics.clone_inner();
+            let after_second = final_metrics.iter().count();
+            let bytes_scanned = match final_metrics
+                .sum_by_name("bytes_scanned")
+                .expect("bytes_scanned metric")
+            {
+                MetricValue::Count { count, .. } => count.value(),
+                value => panic!("unexpected bytes_scanned metric: {value:?}"),
+            };
+            let scan_efficiency = match final_metrics
+                .sum_by_name("scan_efficiency_ratio")
+                .expect("scan_efficiency_ratio metric")
+            {
+                MetricValue::Ratio { ratio_metrics, .. } => ratio_metrics,
+                value => panic!("unexpected scan_efficiency_ratio metric: {value:?}"),
+            };
+            assert_eq!(scan_efficiency.part(), bytes_scanned);
+            let display = final_metrics
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            (before, after_first, after_second, display)
+        }
+
+        let (before, after_first, after_second, compact) =
+            run(MetricsCardinality::Compact).await;
+        assert_eq!(before, 26);
+        assert_eq!(before, after_first);
+        assert_eq!(after_first, after_second);
+        assert!(!compact.contains("filename="), "{compact}");
+
+        let (before, after_first, after_second, verbose) =
+            run(MetricsCardinality::Verbose).await;
+        let per_file_registrations = after_first - before;
+        assert_eq!(before, 0);
+        assert_eq!(per_file_registrations, 26);
+        assert_eq!(after_second - after_first, per_file_registrations);
+        assert!(verbose.contains("filename=first.parquet"), "{verbose}");
+        assert!(verbose.contains("filename=second.parquet"), "{verbose}");
     }
 
     fn constant_int_stats() -> (Statistics, SchemaRef) {

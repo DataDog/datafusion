@@ -18,13 +18,13 @@
 //! [`ParquetFileReaderFactory`] and [`DefaultParquetFileReaderFactory`] for
 //! low level control of parquet file readers
 
-use crate::ParquetFileMetrics;
+use crate::ParquetMetricSet;
 use crate::metadata::DFParquetMetadata;
 use bytes::Bytes;
 use datafusion_datasource::PartitionedFile;
 use datafusion_execution::cache::cache_manager::FileMetadata;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
-use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use object_store::ObjectStore;
@@ -58,13 +58,13 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
     /// * partition_index - Index of the partition (for reporting metrics)
     /// * file - The file to be read
     /// * metadata_size_hint - If specified, the first IO reads this many bytes from the footer
-    /// * metrics - Execution metrics
+    /// * metrics - Parquet metric handles selected by the opener
     fn create_reader(
         &self,
         partition_index: usize,
         partitioned_file: PartitionedFile,
         metadata_size_hint: Option<usize>,
-        metrics: &ExecutionPlanMetricsSet,
+        metrics: ParquetMetricSet,
     ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>>;
 }
 
@@ -95,7 +95,7 @@ impl DefaultParquetFileReaderFactory {
 /// optimizations can be done either at the object store level or by providing a
 /// custom implementation of [`ParquetFileReaderFactory`].
 pub struct ParquetFileReader {
-    pub file_metrics: ParquetFileMetrics,
+    pub file_metrics: ParquetMetricSet,
     pub inner: ParquetObjectReader,
     pub partitioned_file: PartitionedFile,
 }
@@ -106,7 +106,7 @@ impl AsyncFileReader for ParquetFileReader {
         range: Range<u64>,
     ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
         let bytes_scanned = range.end - range.start;
-        self.file_metrics.bytes_scanned.add(bytes_scanned as usize);
+        self.file_metrics.add_bytes_scanned(bytes_scanned as usize);
         self.inner.get_bytes(range)
     }
 
@@ -118,7 +118,7 @@ impl AsyncFileReader for ParquetFileReader {
         Self: Send,
     {
         let total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
-        self.file_metrics.bytes_scanned.add(total as usize);
+        self.file_metrics.add_bytes_scanned(total as usize);
         self.inner.get_byte_ranges(ranges)
     }
 
@@ -132,9 +132,6 @@ impl AsyncFileReader for ParquetFileReader {
 
 impl Drop for ParquetFileReader {
     fn drop(&mut self) {
-        self.file_metrics
-            .scan_efficiency_ratio
-            .add_part(self.file_metrics.bytes_scanned.value());
         // Multiple ParquetFileReaders may run, so we set_total to avoid adding the total multiple times
         self.file_metrics
             .scan_efficiency_ratio
@@ -145,30 +142,23 @@ impl Drop for ParquetFileReader {
 impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
     fn create_reader(
         &self,
-        partition_index: usize,
+        _partition_index: usize,
         partitioned_file: PartitionedFile,
         metadata_size_hint: Option<usize>,
-        metrics: &ExecutionPlanMetricsSet,
+        metrics: ParquetMetricSet,
     ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>> {
-        let file_metrics = ParquetFileMetrics::new(
-            partition_index,
-            partitioned_file.object_meta.location.as_ref(),
-            metrics,
-        );
-        let store = Arc::clone(&self.store);
         let mut inner = ParquetObjectReader::new(
-            store,
+            Arc::clone(&self.store),
             partitioned_file.object_meta.location.clone(),
         )
         .with_file_size(partitioned_file.object_meta.size);
-
         if let Some(hint) = metadata_size_hint {
-            inner = inner.with_footer_size_hint(hint)
-        };
+            inner = inner.with_footer_size_hint(hint);
+        }
 
         Ok(Box::new(ParquetFileReader {
+            file_metrics: metrics,
             inner,
-            file_metrics,
             partitioned_file,
         }))
     }
@@ -195,25 +185,15 @@ impl CachedParquetFileReaderFactory {
             metadata_cache,
         }
     }
-}
 
-impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
-    fn create_reader(
+    fn create_reader_with_metrics(
         &self,
-        partition_index: usize,
         partitioned_file: PartitionedFile,
         metadata_size_hint: Option<usize>,
-        metrics: &ExecutionPlanMetricsSet,
+        metrics: ParquetMetricSet,
     ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>> {
-        let file_metrics = ParquetFileMetrics::new(
-            partition_index,
-            partitioned_file.object_meta.location.as_ref(),
-            metrics,
-        );
-        let store = Arc::clone(&self.store);
-
         let mut inner = ParquetObjectReader::new(
-            store,
+            Arc::clone(&self.store),
             partitioned_file.object_meta.location.clone(),
         )
         .with_file_size(partitioned_file.object_meta.size);
@@ -223,7 +203,7 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         };
 
         Ok(Box::new(CachedParquetFileReader::new(
-            file_metrics,
+            metrics,
             Arc::clone(&self.store),
             inner,
             partitioned_file,
@@ -233,11 +213,23 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
     }
 }
 
+impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
+    fn create_reader(
+        &self,
+        _partition_index: usize,
+        partitioned_file: PartitionedFile,
+        metadata_size_hint: Option<usize>,
+        metrics: ParquetMetricSet,
+    ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>> {
+        self.create_reader_with_metrics(partitioned_file, metadata_size_hint, metrics)
+    }
+}
+
 /// Implements [`AsyncFileReader`] for a Parquet file in object storage. Reads the file metadata
 /// from the [`FileMetadataCache`], if available, otherwise reads it directly from the file and then
 /// updates the cache.
 pub struct CachedParquetFileReader {
-    pub file_metrics: ParquetFileMetrics,
+    pub file_metrics: ParquetMetricSet,
     store: Arc<dyn ObjectStore>,
     pub inner: ParquetObjectReader,
     partitioned_file: PartitionedFile,
@@ -247,7 +239,7 @@ pub struct CachedParquetFileReader {
 
 impl CachedParquetFileReader {
     pub fn new(
-        file_metrics: ParquetFileMetrics,
+        file_metrics: ParquetMetricSet,
         store: Arc<dyn ObjectStore>,
         inner: ParquetObjectReader,
         partitioned_file: PartitionedFile,
@@ -271,7 +263,7 @@ impl AsyncFileReader for CachedParquetFileReader {
         range: Range<u64>,
     ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
         let bytes_scanned = range.end - range.start;
-        self.file_metrics.bytes_scanned.add(bytes_scanned as usize);
+        self.file_metrics.add_bytes_scanned(bytes_scanned as usize);
         self.inner.get_bytes(range)
     }
 
@@ -283,7 +275,7 @@ impl AsyncFileReader for CachedParquetFileReader {
         Self: Send,
     {
         let total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
-        self.file_metrics.bytes_scanned.add(total as usize);
+        self.file_metrics.add_bytes_scanned(total as usize);
         self.inner.get_byte_ranges(ranges)
     }
 
@@ -323,9 +315,6 @@ impl AsyncFileReader for CachedParquetFileReader {
 
 impl Drop for CachedParquetFileReader {
     fn drop(&mut self) {
-        self.file_metrics
-            .scan_efficiency_ratio
-            .add_part(self.file_metrics.bytes_scanned.value());
         // Multiple ParquetFileReaders may run, so we set_total to avoid adding the total multiple times
         self.file_metrics
             .scan_efficiency_ratio

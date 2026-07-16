@@ -32,7 +32,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
 use datafusion::datasource::physical_plan::{
-    FileScanConfigBuilder, ParquetFileReaderFactory, ParquetSource,
+    FileScanConfigBuilder, ParquetFileReaderFactory, ParquetMetricSet, ParquetSource,
 };
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::utils::conjunction;
@@ -49,7 +49,7 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::utils::{Guarantee, LiteralGuarantee};
 use datafusion::physical_optimizer::pruning::PruningPredicate;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+
 use datafusion::prelude::*;
 
 use arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
@@ -553,11 +553,8 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         _partition_index: usize,
         partitioned_file: PartitionedFile,
         metadata_size_hint: Option<usize>,
-        _metrics: &ExecutionPlanMetricsSet,
+        metrics: ParquetMetricSet,
     ) -> Result<Box<dyn AsyncFileReader + Send>> {
-        // for this example we ignore the partition index and metrics
-        // but in a real system you would likely use them to report details on
-        // the performance of the reader.
         let filename = partitioned_file
             .object_meta
             .location
@@ -583,6 +580,7 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         Ok(Box::new(ParquetReaderWithCache {
             filename,
             metadata: Arc::clone(metadata),
+            metrics,
             inner,
         }))
     }
@@ -592,6 +590,7 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
 struct ParquetReaderWithCache {
     filename: String,
     metadata: Arc<ParquetMetaData>,
+    metrics: ParquetMetricSet,
     inner: ParquetObjectReader,
 }
 
@@ -601,6 +600,8 @@ impl AsyncFileReader for ParquetReaderWithCache {
         range: Range<u64>,
     ) -> BoxFuture<'_, datafusion::parquet::errors::Result<Bytes>> {
         println!("get_bytes: {} Reading range {:?}", self.filename, range);
+        self.metrics
+            .add_bytes_scanned((range.end - range.start) as usize);
         self.inner.get_bytes(range)
     }
 
@@ -612,6 +613,11 @@ impl AsyncFileReader for ParquetReaderWithCache {
             "get_byte_ranges: {} Reading ranges {:?}",
             self.filename, ranges
         );
+        let bytes = ranges
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum::<u64>();
+        self.metrics.add_bytes_scanned(bytes as usize);
         self.inner.get_byte_ranges(ranges)
     }
 

@@ -24,7 +24,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
-use datafusion_datasource_parquet::{ParquetFileMetrics, build_row_filter};
+use datafusion_datasource_parquet::{ParquetMetricSet, build_row_filter};
 use datafusion_expr::{Expr, col};
 use datafusion_functions_nested::expr_fn::array_has;
 use datafusion_physical_expr::planner::logical2physical;
@@ -112,7 +112,7 @@ fn scan_with_predicate(
     let projection = ProjectionMask::all();
 
     let metrics = ExecutionPlanMetricsSet::new();
-    let file_metrics = ParquetFileMetrics::new(0, &path.display().to_string(), &metrics);
+    let file_metrics = ParquetMetricSet::new(0, &path.display().to_string(), &metrics);
 
     let builder = if pushdown {
         if let Some(row_filter) =
