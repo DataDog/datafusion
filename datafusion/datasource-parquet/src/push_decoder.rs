@@ -257,7 +257,12 @@ pub(crate) struct PushDecoderStreamState {
     pub(crate) arrow_reader_metrics: ArrowReaderMetrics,
     pub(crate) predicate_cache_inner_records: Gauge,
     pub(crate) predicate_cache_records: Gauge,
-    pub(crate) baseline_metrics: BaselineMetrics,
+    /// Last absolute Arrow reader values copied by this decoder. The registered
+    /// gauges may be shared by multiple files in compact cardinality mode, so
+    /// each decoder contributes only its own delta.
+    pub(crate) previous_predicate_cache_inner_records: usize,
+    pub(crate) previous_predicate_cache_records: usize,
+    pub(crate) baseline_metrics: Arc<BaselineMetrics>,
     /// Dynamic row-group pruner consulted at every row-group boundary.
     ///
     /// When the file scan was opened with a still-watching dynamic predicate
@@ -304,7 +309,8 @@ impl PushDecoderStreamState {
             if let Some(reader) = self.active_reader.as_mut() {
                 match reader.next() {
                     Some(Ok(batch)) => {
-                        let mut timer = self.baseline_metrics.elapsed_compute().timer();
+                        let baseline_metrics = Arc::clone(&self.baseline_metrics);
+                        let mut timer = baseline_metrics.elapsed_compute().timer();
                         self.copy_arrow_reader_metrics();
                         let result = self.project_batch(&batch);
                         timer.stop();
@@ -475,12 +481,20 @@ impl PushDecoderStreamState {
 
     /// Copies metrics from ArrowReaderMetrics (the metrics collected by the
     /// arrow-rs parquet reader) to the parquet file metrics for DataFusion
-    fn copy_arrow_reader_metrics(&self) {
+    fn copy_arrow_reader_metrics(&mut self) {
         if let Some(v) = self.arrow_reader_metrics.records_read_from_inner() {
-            self.predicate_cache_inner_records.set(v);
+            update_absolute_gauge(
+                &self.predicate_cache_inner_records,
+                &mut self.previous_predicate_cache_inner_records,
+                v,
+            );
         }
         if let Some(v) = self.arrow_reader_metrics.records_read_from_cache() {
-            self.predicate_cache_records.set(v);
+            update_absolute_gauge(
+                &self.predicate_cache_records,
+                &mut self.previous_predicate_cache_records,
+                v,
+            );
         }
     }
 
@@ -490,7 +504,7 @@ impl PushDecoderStreamState {
 }
 
 #[cfg(test)]
-mod tests {
+mod metric_tests {
     use super::*;
 
     use arrow::array::{Int64Array, RecordBatch};
@@ -693,5 +707,34 @@ mod tests {
             err.to_string().contains("diverged"),
             "expected a divergence internal error, got: {err}",
         );
+    }
+}
+
+fn update_absolute_gauge(gauge: &Gauge, previous: &mut usize, current: usize) {
+    if current >= *previous {
+        gauge.add(current - *previous);
+    } else {
+        gauge.sub(*previous - current);
+    }
+    *previous = current;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absolute_gauge_deltas_preserve_shared_total() {
+        let gauge = Gauge::new();
+        let mut first = 0;
+        let mut second = 0;
+
+        update_absolute_gauge(&gauge, &mut first, 10);
+        update_absolute_gauge(&gauge, &mut second, 7);
+        assert_eq!(gauge.value(), 17);
+
+        update_absolute_gauge(&gauge, &mut first, 15);
+        update_absolute_gauge(&gauge, &mut second, 4);
+        assert_eq!(gauge.value(), 19);
     }
 }

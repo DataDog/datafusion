@@ -240,7 +240,7 @@ mod tests {
 
     use crate::reader::ParquetFileReader;
     use crate::test_util::ExpectedPruning;
-    use crate::{ParquetAccessPlan, ParquetFileMetrics, RowGroupAccessPlanFilter};
+    use crate::{ParquetAccessPlan, ParquetMetricSet, RowGroupAccessPlanFilter};
 
     use arrow::array::Decimal128Array;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -648,7 +648,7 @@ mod tests {
 
         let metrics = ExecutionPlanMetricsSet::new();
         let file_metrics =
-            ParquetFileMetrics::new(0, object_meta.location.as_ref(), &metrics);
+            ParquetMetricSet::new(0, object_meta.location.as_ref(), &metrics);
         let store: Arc<dyn ObjectStore> = Arc::new(in_memory);
         let partitioned_file = PartitionedFile::new_from_meta(object_meta);
 

@@ -1041,9 +1041,10 @@ async fn parquet_explain_analyze_verbose() {
         .unwrap()
         .to_string();
 
-    // should contain the raw per file stats (with the label)
+    // should contain the raw per-file stats with filename labels
     assert_contains!(&formatted, "row_groups_pruned_bloom_filter{partition=0");
     assert_contains!(&formatted, "row_groups_pruned_statistics{partition=0");
+    assert_contains!(&formatted, "filename=");
 }
 
 #[tokio::test]

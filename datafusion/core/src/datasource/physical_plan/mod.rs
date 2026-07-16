@@ -33,7 +33,7 @@ pub use avro::AvroSource;
 #[cfg(feature = "parquet")]
 pub use datafusion_datasource_parquet::source::ParquetSource;
 #[cfg(feature = "parquet")]
-pub use datafusion_datasource_parquet::{ParquetFileMetrics, ParquetFileReaderFactory};
+pub use datafusion_datasource_parquet::{ParquetFileReaderFactory, ParquetMetricSet};
 
 pub use json::{JsonOpener, JsonSource};
 
