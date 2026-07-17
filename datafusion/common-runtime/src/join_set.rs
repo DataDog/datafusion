@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::trace_utils::{trace_block, trace_future};
+use crate::trace_utils::{SpawnTarget, spawn_future, trace_block};
 use std::future::Future;
 use std::task::{Context, Poll};
 use tokio::runtime::Handle;
@@ -63,7 +63,7 @@ impl<T: 'static> JoinSet<T> {
         F: Send + 'static,
         T: Send,
     {
-        self.inner.spawn(trace_future(task))
+        spawn_future(task, SpawnTarget::Current, |task| self.inner.spawn(task))
     }
 
     /// [JoinSet::spawn_on](tokio::task::JoinSet::spawn_on) - Spawn a task on a provided runtime.
@@ -73,7 +73,9 @@ impl<T: 'static> JoinSet<T> {
         F: Send + 'static,
         T: Send,
     {
-        self.inner.spawn_on(trace_future(task), handle)
+        spawn_future(task, SpawnTarget::Runtime(handle), |task| {
+            self.inner.spawn_on(task, handle)
+        })
     }
 
     /// [JoinSet::spawn_local](tokio::task::JoinSet::spawn_local) - Spawn a local task.
@@ -168,5 +170,29 @@ impl<T: 'static> JoinSet<T> {
     /// [JoinSet::join_all](tokio::task::JoinSet::join_all) - Await all tasks.
     pub async fn join_all(self) -> Vec<T> {
         self.inner.join_all().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_variants_use_selected_runtime() {
+        let runtime_a = tokio::runtime::Runtime::new().unwrap();
+        let runtime_b = tokio::runtime::Runtime::new().unwrap();
+        let runtime_a_id = runtime_a.handle().id();
+        let runtime_b_id = runtime_b.handle().id();
+
+        runtime_a.block_on(async {
+            let mut set = JoinSet::new();
+            set.spawn(async { Handle::current().id() });
+            set.spawn_on(async { Handle::current().id() }, runtime_b.handle());
+
+            let values = set.join_all().await;
+            assert_eq!(values.len(), 2);
+            assert!(values.contains(&runtime_a_id));
+            assert!(values.contains(&runtime_b_id));
+        });
     }
 }

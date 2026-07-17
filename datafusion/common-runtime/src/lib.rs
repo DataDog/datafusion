@@ -32,5 +32,6 @@ mod trace_utils;
 pub use common::SpawnedTask;
 pub use join_set::JoinSet;
 pub use trace_utils::{
-    JoinSetTracer, JoinSetTracerError, set_join_set_tracer, trace_block, trace_future,
+    ErasedFuture, ErasedValue, JoinSetTracer, JoinSetTracerError, SpawnCallback,
+    SpawnTarget, set_join_set_tracer, spawn_future, trace_block, trace_future,
 };
