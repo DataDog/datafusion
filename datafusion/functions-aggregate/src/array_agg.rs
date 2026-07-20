@@ -2300,4 +2300,250 @@ mod tests {
 
         Ok(())
     }
+
+    // ---- DistinctArrayAggAccumulator retract_batch tests ----
+
+    // Build a DISTINCT accumulator with ascending sort so evaluate output is
+    // deterministic regardless of HashMap iteration order.
+    fn distinct_acc(ignore_nulls: bool) -> Result<DistinctArrayAggAccumulator> {
+        DistinctArrayAggAccumulator::try_new(
+            &DataType::Utf8,
+            Some(SortOptions::default()),
+            ignore_nulls,
+        )
+    }
+
+    #[test]
+    fn distinct_retract_duplicate_remains() -> Result<()> {
+        // Canonical regression for the HashSet-can't-retract bug: a value
+        // that appears multiple times in-frame must survive retraction of
+        // a single occurrence.
+        let mut acc = distinct_acc(false)?;
+
+        // Feed [A, A, B] across two batches to exercise multi-batch state.
+        acc.update_batch(&[data(["A", "A"])])?;
+        acc.update_batch(&[data(["B"])])?;
+        assert_eq!(print_nulls(str_arr(acc.evaluate()?)?), vec!["A", "B"]);
+
+        // Retract a single A — the other A is still in the frame.
+        acc.retract_batch(&[data(["A"])])?;
+        assert_eq!(print_nulls(str_arr(acc.evaluate()?)?), vec!["A", "B"]);
+
+        // Retract the remaining A — only B left.
+        acc.retract_batch(&[data(["A"])])?;
+        assert_eq!(print_nulls(str_arr(acc.evaluate()?)?), vec!["B"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_retract_full_removal() -> Result<()> {
+        let mut acc = distinct_acc(false)?;
+
+        acc.update_batch(&[data(["A", "B"])])?;
+        acc.retract_batch(&[data(["A", "B"])])?;
+
+        let result = acc.evaluate()?;
+        assert!(
+            matches!(&result, ScalarValue::List(arr) if arr.is_null(0)),
+            "expected null list after full retract, got {result:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_retract_ignore_nulls_skips() -> Result<()> {
+        // ignore_nulls=true: NULL never enters state on update, so retract
+        // must also skip NULL — otherwise we'd error on the missing key.
+        let mut acc = distinct_acc(true)?;
+
+        acc.update_batch(&[data([Some("A"), None, Some("B")])])?;
+        assert_eq!(print_nulls(str_arr(acc.evaluate()?)?), vec!["A", "B"]);
+
+        // Retract [A, NULL] — the NULL is skipped, only A is removed.
+        acc.retract_batch(&[data([Some("A"), None])])?;
+        assert_eq!(print_nulls(str_arr(acc.evaluate()?)?), vec!["B"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_retract_null_tracked() -> Result<()> {
+        // ignore_nulls=false: NULL enters state with a refcount and must
+        // retract symmetrically; the NULL key must be removed at zero
+        // (else evaluate still emits a NULL element).
+        let mut acc = distinct_acc(false)?;
+
+        acc.update_batch(&[data([Some("A"), None, None])])?;
+        // With nulls_first=true (SortOptions default), NULL sorts before A.
+        assert_eq!(print_nulls(str_arr(acc.evaluate()?)?), vec!["NULL", "A"]);
+
+        // Retract one NULL — count drops to 1, key still present.
+        acc.retract_batch(&[data::<Option<&str>, 1>([None])])?;
+        assert_eq!(print_nulls(str_arr(acc.evaluate()?)?), vec!["NULL", "A"]);
+
+        // Retract the remaining NULL — key is removed.
+        acc.retract_batch(&[data::<Option<&str>, 1>([None])])?;
+        assert_eq!(print_nulls(str_arr(acc.evaluate()?)?), vec!["A"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_supports_retract_batch() -> Result<()> {
+        let acc = distinct_acc(false)?;
+        assert!(acc.supports_retract_batch());
+
+        let acc_ignore = distinct_acc(true)?;
+        assert!(acc_ignore.supports_retract_batch());
+
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_merge_then_evaluate_regression() -> Result<()> {
+        // Non-window path: state -> merge_batch -> evaluate must still
+        // produce the union of distinct values across partitions.
+        let mut acc1 = distinct_acc(false)?;
+        let mut acc2 = distinct_acc(false)?;
+
+        acc1.update_batch(&[data(["A", "A", "B"])])?;
+        acc2.update_batch(&[data(["A", "C"])])?;
+
+        let state = acc2.state()?;
+        let state_arrs: Vec<ArrayRef> = state
+            .into_iter()
+            .map(|sv| sv.to_array_of_size(1))
+            .collect::<Result<Vec<_>>>()?;
+        acc1.merge_batch(&state_arrs)?;
+
+        assert_eq!(print_nulls(str_arr(acc1.evaluate()?)?), vec!["A", "B", "C"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_array_agg_utf8_deduplicates() -> Result<()> {
+        use arrow::array::StringArray;
+
+        // 7 rows with 4 distinct values, each duplicate appearing twice.
+        let input: ArrayRef = Arc::new(StringArray::from(vec![
+            "postgres", "mysql", "postgres", "redis", "mysql", "duckdb", "redis",
+        ]));
+
+        let mut acc =
+            DistinctArrayAggAccumulator::try_new(&DataType::Utf8, None, false)?;
+        acc.update_batch(&[input])?;
+
+        let result = acc.evaluate()?;
+        let ScalarValue::List(arr) = &result else {
+            panic!("expected ScalarValue::List, got {result:?}");
+        };
+
+        let inner = arr.value(0);
+        let strings = inner
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("inner array should be StringArray");
+
+        // HashSet ordering is nondeterministic — sort before asserting.
+        let mut values: Vec<&str> =
+            (0..strings.len()).map(|i| strings.value(i)).collect();
+        values.sort_unstable();
+
+        assert_eq!(values, vec!["duckdb", "mysql", "postgres", "redis"]);
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_array_agg_int64_deduplicates() -> Result<()> {
+        use arrow::array::Int64Array;
+
+        // 7 rows with 4 distinct values, each duplicate appearing twice.
+        let input: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 1, 3, 2, 4, 3]));
+
+        let mut acc =
+            DistinctArrayAggAccumulator::try_new(&DataType::Int64, None, false)?;
+        acc.update_batch(&[input])?;
+
+        let result = acc.evaluate()?;
+        let ScalarValue::List(arr) = &result else {
+            panic!("expected ScalarValue::List, got {result:?}");
+        };
+
+        let inner = arr.value(0);
+        let ints = inner
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("inner array should be Int64Array");
+
+        let mut values: Vec<i64> = (0..ints.len()).map(|i| ints.value(i)).collect();
+        values.sort_unstable();
+
+        assert_eq!(values, vec![1i64, 2, 3, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_array_agg_float64_deduplicates() -> Result<()> {
+        use arrow::array::Float64Array;
+
+        // 7 rows with 4 distinct values, each duplicate appearing twice.
+        let input: ArrayRef = Arc::new(Float64Array::from(vec![
+            1.0f64, 2.5, 1.0, 3.75, 2.5, 4.0, 3.75,
+        ]));
+
+        let mut acc =
+            DistinctArrayAggAccumulator::try_new(&DataType::Float64, None, false)?;
+        acc.update_batch(&[input])?;
+
+        let result = acc.evaluate()?;
+        let ScalarValue::List(arr) = &result else {
+            panic!("expected ScalarValue::List, got {result:?}");
+        };
+
+        let inner = arr.value(0);
+        let floats = inner
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("inner array should be Float64Array");
+
+        // f64 has no Ord — use total_cmp for a stable sort.
+        let mut values: Vec<f64> = (0..floats.len()).map(|i| floats.value(i)).collect();
+        values.sort_unstable_by(|a, b| a.total_cmp(b));
+
+        assert_eq!(values, vec![1.0f64, 2.5, 3.75, 4.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_array_agg_date32_deduplicates() -> Result<()> {
+        use arrow::array::Date32Array;
+
+        // 7 rows with 4 distinct dates (days since epoch), each duplicate appearing twice.
+        let input: ArrayRef =
+            Arc::new(Date32Array::from(vec![100i32, 200, 100, 300, 200, 400, 300]));
+
+        let mut acc =
+            DistinctArrayAggAccumulator::try_new(&DataType::Date32, None, false)?;
+        acc.update_batch(&[input])?;
+
+        let result = acc.evaluate()?;
+        let ScalarValue::List(arr) = &result else {
+            panic!("expected ScalarValue::List, got {result:?}");
+        };
+
+        let inner = arr.value(0);
+        let dates = inner
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .expect("inner array should be Date32Array");
+
+        let mut values: Vec<i32> = (0..dates.len()).map(|i| dates.value(i)).collect();
+        values.sort_unstable();
+
+        assert_eq!(values, vec![100i32, 200, 300, 400]);
+        Ok(())
+    }
 }
