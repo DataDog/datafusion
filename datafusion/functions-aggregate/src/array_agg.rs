@@ -28,14 +28,16 @@ use arrow::array::{
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::compute::{SortOptions, filter};
-use arrow::row::{Row, RowConverter, Rows, SortField};
 use arrow::datatypes::{DataType, Field, FieldRef, Fields};
+use arrow::row::{Row, RowConverter, Rows, SortField};
 
 use datafusion_common::cast::as_list_array;
+use datafusion_common::hash_utils::{RandomState, create_hashes};
+use datafusion_common::utils::proxy::HashTableAllocExt;
 use datafusion_common::utils::{
     SingleRowListArrayBuilder, compare_rows, get_row_at_idx, take_function_args,
 };
-use datafusion_common::{Result, ScalarValue, assert_eq_or_internal_err, exec_err};
+use datafusion_common::{Result, ScalarValue, assert_eq_or_internal_err, exec_err, internal_err};
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
@@ -46,11 +48,9 @@ use datafusion_functions_aggregate_common::aggregate::groups_accumulator::nulls:
 use datafusion_functions_aggregate_common::merge_arrays::merge_ordered_arrays;
 use datafusion_functions_aggregate_common::order::AggregateOrderSensitivity;
 use datafusion_functions_aggregate_common::utils::ordering_fields;
-use datafusion_common::hash_utils::{RandomState, create_hashes};
-use datafusion_common::utils::proxy::HashTableAllocExt;
 use datafusion_macros::user_doc;
-use hashbrown::hash_table::HashTable;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
+use hashbrown::hash_table::HashTable;
 
 make_udaf_expr_and_func!(
     ArrayAgg,
@@ -1108,7 +1108,8 @@ impl Accumulator for DistinctArrayAggAccumulator {
             + self.map_size
             + self.counts.capacity() * size_of::<u64>()
             + self.hashes_buffer.capacity() * size_of::<u64>()
-            + self.datatype.size() - size_of_val(&self.datatype)
+            + self.datatype.size()
+            - size_of_val(&self.datatype)
     }
 }
 
@@ -2620,8 +2621,7 @@ mod tests {
             "postgres", "mysql", "postgres", "redis", "mysql", "duckdb", "redis",
         ]));
 
-        let mut acc =
-            DistinctArrayAggAccumulator::try_new(&DataType::Utf8, None, false)?;
+        let mut acc = DistinctArrayAggAccumulator::try_new(&DataType::Utf8, None, false)?;
         acc.update_batch(&[input])?;
 
         let result = acc.evaluate()?;
@@ -2710,8 +2710,9 @@ mod tests {
         use arrow::array::Date32Array;
 
         // 7 rows with 4 distinct dates (days since epoch), each duplicate appearing twice.
-        let input: ArrayRef =
-            Arc::new(Date32Array::from(vec![100i32, 200, 100, 300, 200, 400, 300]));
+        let input: ArrayRef = Arc::new(Date32Array::from(vec![
+            100i32, 200, 100, 300, 200, 400, 300,
+        ]));
 
         let mut acc =
             DistinctArrayAggAccumulator::try_new(&DataType::Date32, None, false)?;
