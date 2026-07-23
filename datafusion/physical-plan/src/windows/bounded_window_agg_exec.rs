@@ -343,7 +343,6 @@ impl ExecutionPlan for BoundedWindowAggExec {
             InputDistributionRequirements::new(vec![Distribution::KeyPartitioned(
                 self.partition_keys(),
             )])
-            .allow_range_satisfaction_for_key_partitioning()
         }
     }
 

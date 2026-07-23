@@ -442,7 +442,6 @@ impl ExecutionPlan for SymmetricHashJoinExec {
                     Distribution::KeyPartitioned(left_expr),
                     Distribution::KeyPartitioned(right_expr),
                 ])
-                .allow_range_satisfaction_for_key_partitioning()
             }
             StreamJoinPartitionMode::SinglePartition => {
                 InputDistributionRequirements::new(vec![
