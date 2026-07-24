@@ -1088,8 +1088,8 @@ fn range_right_mark_hash_join_reuses_range_partitioning() -> Result<()> {
         plan,
         @r"
     HashJoinExec: mode=Partitioned, join_type=RightMark, on=[(a@0, a@0)]
-      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
-      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+      PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4)
+      PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4)
     "
     );
 
@@ -1126,9 +1126,9 @@ fn range_right_semi_hash_join_rehashes_incompatible_sort_options() -> Result<()>
         @r"
     HashJoinExec: mode=Partitioned, join_type=RightSemi, on=[(a@0, a@0)]
       RepartitionExec: partitioning=Hash([a@0], 4), input_partitions=2
-        DataSourceExec: file_groups={2 groups: [[p0], [p1]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(20)], 2), file_type=parquet
+        PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(20)], 2)
       RepartitionExec: partitioning=Hash([a@0], 4), input_partitions=2
-        DataSourceExec: file_groups={2 groups: [[p0], [p1]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 DESC], [(20)], 2), file_type=parquet
+        PartitionedTestExec: output_partitioning=Range([a@0 DESC], [(20)], 2)
     "
     );
 
@@ -1159,7 +1159,7 @@ fn range_window_reuses_range_partitioning() -> Result<()> {
         @r#"
     BoundedWindowAggExec: wdw=[count: Field { "count": Int64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
       SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[true]
-        DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+        PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4)
     "#
     );
 
@@ -1191,7 +1191,7 @@ fn range_window_rehashes_incompatible_range_partitioning() -> Result<()> {
     BoundedWindowAggExec: wdw=[count: Field { "count": Int64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
       SortExec: expr=[b@1 ASC NULLS LAST], preserve_partitioning=[true]
         RepartitionExec: partitioning=Hash([b@1], 4), input_partitions=4
-          DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+          PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4)
     "#
     );
 
@@ -1230,9 +1230,9 @@ fn range_full_hash_join_reuses_compatible_range_partitioning() -> Result<()> {
         plan,
         @r"
     HashJoinExec: mode=Partitioned, join_type=Full, on=[(a@0, a1@0)]
-      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+      PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4)
       ProjectionExec: expr=[a@0 as a1, b@1 as b1]
-        DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+        PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4)
     "
     );
 
@@ -1272,10 +1272,10 @@ fn range_full_hash_join_rehashes_incompatible_range_partitioning() -> Result<()>
         @r"
     HashJoinExec: mode=Partitioned, join_type=Full, on=[(a@0, a1@0)]
       RepartitionExec: partitioning=Hash([a@0], 4), input_partitions=4
-        DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+        PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4)
       RepartitionExec: partitioning=Hash([a1@0], 4), input_partitions=4
         ProjectionExec: expr=[a@0 as a1, b@1 as b1]
-          DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (30), (40)], 4), file_type=parquet
+          PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (30), (40)], 4)
     "
     );
 
@@ -1308,8 +1308,8 @@ fn range_left_mark_hash_join_reuses_range_partitioning() -> Result<()> {
         plan,
         @r"
     HashJoinExec: mode=Partitioned, join_type=LeftMark, on=[(a@0, a@0)]
-      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
-      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+      PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4)
+      PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4)
     "
     );
 
@@ -1346,9 +1346,9 @@ fn range_left_anti_hash_join_rehashes_incompatible_null_options() -> Result<()> 
         @r"
     HashJoinExec: mode=Partitioned, join_type=LeftAnti, on=[(a@0, a@0)]
       RepartitionExec: partitioning=Hash([a@0], 4), input_partitions=4
-        DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+        PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4)
       RepartitionExec: partitioning=Hash([a@0], 4), input_partitions=4
-        DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC NULLS LAST], [(10), (20), (30)], 4), file_type=parquet
+        PartitionedTestExec: output_partitioning=Range([a@0 ASC NULLS LAST], [(10), (20), (30)], 4)
     "
     );
 

@@ -655,7 +655,7 @@ physical_plan
 01)ProjectionExec: expr=[c1@0 as c1, c2@1 as c2, row_number() PARTITION BY [t.c1] ORDER BY [t.c2 DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 as rn]
 02)--RepartitionExec: partitioning=RoundRobinBatch(5), input_partitions=1, maintains_sort_order=true
 03)----BoundedWindowAggExec: wdw=[row_number() PARTITION BY [t.c1] ORDER BY [t.c2 DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "row_number() PARTITION BY [t.c1] ORDER BY [t.c2 DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": UInt64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
-04)------PartitionedTopKExec: fn=row_number, fetch=1, partition=[c1@0], order=[c2@1 DESC]
+04)------PartitionedTopKExec: fetch=1, partition=[c1@0], order=[c2@1 DESC]
 05)--------DataSourceExec: partitions=1, partition_sizes=[1]
 
 statement ok
