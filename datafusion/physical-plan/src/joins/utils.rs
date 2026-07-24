@@ -144,6 +144,12 @@ pub fn adjust_right_output_partitioning(
                 .collect::<Result<_>>()?;
             Partitioning::Hash(new_exprs, *size)
         }
+        // Range partitioning can satisfy join input requirements, but range
+        // output propagation needs broader join semantics coverage.
+        // https://github.com/apache/datafusion/issues/22395
+        Partitioning::Range(range) => {
+            Partitioning::UnknownPartitioning(range.partition_count())
+        }
         result => result.clone(),
     };
     Ok(result)

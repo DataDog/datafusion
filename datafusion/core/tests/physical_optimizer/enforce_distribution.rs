@@ -59,9 +59,13 @@ use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
 };
 
-use datafusion_physical_expr::Distribution;
+use datafusion_physical_expr::{
+    Distribution, EquivalenceProperties, RangePartitioning, SplitPoint,
+};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion_physical_plan::execution_plan::ExecutionPlan;
+use datafusion_physical_plan::execution_plan::{
+    Boundedness, EmissionType, ExecutionPlan,
+};
 use datafusion_physical_plan::expressions::col;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::utils::JoinOn;
@@ -70,7 +74,8 @@ use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties, displayable,
+    DisplayAs, DisplayFormatType, ExecutionPlanProperties, Partitioning, PlanProperties,
+    displayable,
 };
 use insta::Settings;
 
@@ -323,6 +328,104 @@ fn parquet_exec_multiple_sorted(
     .build();
 
     DataSourceExec::from_data_source(config)
+}
+
+#[derive(Debug)]
+struct PartitionedTestExec {
+    cache: Arc<PlanProperties>,
+}
+
+impl PartitionedTestExec {
+    fn new(output_partitioning: Partitioning) -> Self {
+        Self {
+            cache: Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(schema()),
+                output_partitioning,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )),
+        }
+    }
+}
+
+impl DisplayAs for PartitionedTestExec {
+    fn fmt_as(
+        &self,
+        t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
+                f,
+                "PartitionedTestExec: output_partitioning={}",
+                self.cache.output_partitioning()
+            ),
+            DisplayFormatType::TreeRender => write!(f, ""),
+        }
+    }
+}
+
+impl ExecutionPlan for PartitionedTestExec {
+    fn name(&self) -> &'static str {
+        "PartitionedTestExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.cache
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        assert!(children.is_empty());
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> Result<datafusion_physical_plan::SendableRecordBatchStream> {
+        unreachable!()
+    }
+}
+
+fn parquet_exec_with_output_partitioning(
+    output_partitioning: Partitioning,
+) -> Arc<dyn ExecutionPlan> {
+    Arc::new(PartitionedTestExec::new(output_partitioning))
+}
+
+fn range_partitioning(
+    key: &str,
+    split_points: impl IntoIterator<Item = i64>,
+    options: SortOptions,
+) -> Result<Partitioning> {
+    let ordering = [PhysicalSortExpr {
+        expr: col(key, &schema())?,
+        options,
+    }]
+    .into();
+    let split_points = split_points
+        .into_iter()
+        .map(|value| SplitPoint::new(vec![ScalarValue::Int64(Some(value))]))
+        .collect();
+    Ok(Partitioning::Range(RangePartitioning::try_new(
+        ordering,
+        split_points,
+    )?))
+}
+
+fn hash_partitioning(key: &str, partition_count: usize) -> Result<Partitioning> {
+    Ok(Partitioning::Hash(
+        vec![col(key, &schema())?],
+        partition_count,
+    ))
 }
 
 fn csv_exec() -> Arc<DataSourceExec> {
@@ -699,6 +802,135 @@ impl TestConfig {
     ) -> Arc<dyn ExecutionPlan> {
         self.try_to_plan(plan, optimizers_to_run).unwrap()
     }
+}
+
+fn partitioned_join_plan(
+    left_partitioning: Partitioning,
+    right_partitioning: Partitioning,
+    join_type: JoinType,
+) -> Arc<dyn ExecutionPlan> {
+    let left = parquet_exec_with_output_partitioning(left_partitioning);
+    let right = parquet_exec_with_output_partitioning(right_partitioning);
+    let join_on = vec![(
+        Arc::new(Column::new_with_schema("a", &left.schema()).unwrap()) as _,
+        Arc::new(Column::new_with_schema("b", &right.schema()).unwrap()) as _,
+    )];
+    hash_join_exec(left, right, &join_on, &join_type)
+}
+
+#[test]
+fn inner_range_join_keeps_range_partitioning() -> Result<()> {
+    let join = partitioned_join_plan(
+        range_partitioning("a", [10, 20], SortOptions::default())?,
+        range_partitioning("b", [10, 20], SortOptions::default())?,
+        JoinType::Inner,
+    );
+
+    let plan = TestConfig::default().to_plan(join, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, b@1)]
+      PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (20)], 3)
+      PartitionedTestExec: output_partitioning=Range([b@1 ASC], [(10), (20)], 3)
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn inner_range_join_rehashes_different_bounds() -> Result<()> {
+    let join = partitioned_join_plan(
+        range_partitioning("a", [10, 20], SortOptions::default())?,
+        range_partitioning("b", [15, 20], SortOptions::default())?,
+        JoinType::Inner,
+    );
+
+    let plan = TestConfig::default().to_plan(join, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, b@1)]
+      RepartitionExec: partitioning=Hash([a@0], 10), input_partitions=3
+        PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (20)], 3)
+      RepartitionExec: partitioning=Hash([b@1], 10), input_partitions=3
+        PartitionedTestExec: output_partitioning=Range([b@1 ASC], [(15), (20)], 3)
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn inner_hash_join_rehashes_mismatched_counts() -> Result<()> {
+    let join = partitioned_join_plan(
+        hash_partitioning("a", 11)?,
+        hash_partitioning("b", 12)?,
+        JoinType::Inner,
+    );
+
+    let plan = TestConfig::default().to_plan(join, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, b@1)]
+      RepartitionExec: partitioning=Hash([a@0], 10), input_partitions=11
+        PartitionedTestExec: output_partitioning=Hash([a@0], 11)
+      RepartitionExec: partitioning=Hash([b@1], 10), input_partitions=12
+        PartitionedTestExec: output_partitioning=Hash([b@1], 12)
+    "
+    );
+    Ok(())
+}
+
+#[test]
+fn inner_hash_join_rehashes_to_target_count() -> Result<()> {
+    let join = partitioned_join_plan(
+        hash_partitioning("a", 3)?,
+        hash_partitioning("b", 3)?,
+        JoinType::Inner,
+    );
+
+    let plan = TestConfig::default().to_plan(join, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, b@1)]
+      RepartitionExec: partitioning=Hash([a@0], 10), input_partitions=3
+        PartitionedTestExec: output_partitioning=Hash([a@0], 3)
+      RepartitionExec: partitioning=Hash([b@1], 10), input_partitions=3
+        PartitionedTestExec: output_partitioning=Hash([b@1], 3)
+    "
+    );
+    Ok(())
+}
+
+#[test]
+fn non_inner_range_join_rehashes() -> Result<()> {
+    let join = partitioned_join_plan(
+        range_partitioning("a", [10, 20], SortOptions::default())?,
+        range_partitioning("b", [10, 20], SortOptions::default())?,
+        JoinType::Left,
+    );
+
+    let plan = TestConfig::default().to_plan(join, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    HashJoinExec: mode=Partitioned, join_type=Left, on=[(a@0, b@1)]
+      RepartitionExec: partitioning=Hash([a@0], 10), input_partitions=3
+        PartitionedTestExec: output_partitioning=Range([a@0 ASC], [(10), (20)], 3)
+      RepartitionExec: partitioning=Hash([b@1], 10), input_partitions=3
+        PartitionedTestExec: output_partitioning=Range([b@1 ASC], [(10), (20)], 3)
+    "
+    );
+    Ok(())
 }
 
 #[test]
