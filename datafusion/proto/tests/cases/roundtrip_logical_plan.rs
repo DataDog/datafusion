@@ -1563,13 +1563,15 @@ impl LogicalExtensionCodec for UDFExtensionCodec {
         &self,
         name: &str,
         buf: &[u8],
-    ) -> Result<Arc<dyn HigherOrderUDF>> {
+    ) -> Result<Arc<HigherOrderUDF>> {
         if name == "higher_order_udf" {
             let proto = MyHigherOrderUdfNode::decode(buf).map_err(|err| {
                 internal_datafusion_err!("failed to decode higher_order_udf: {err}")
             })?;
 
-            Ok(Arc::new(MyHigherOrderUDF::new(proto.payload)))
+            Ok(Arc::new(HigherOrderUDF::new_from_impl(
+                MyHigherOrderUDF::new(proto.payload),
+            )))
         } else {
             not_impl_err!("unrecognized higher order UDF implementation, cannot decode")
         }
@@ -1577,10 +1579,12 @@ impl LogicalExtensionCodec for UDFExtensionCodec {
 
     fn try_encode_higher_order_function(
         &self,
-        node: &dyn HigherOrderUDF,
+        node: &HigherOrderUDF,
         buf: &mut Vec<u8>,
     ) -> Result<()> {
-        let hof = (node as &dyn Any).downcast_ref::<MyHigherOrderUDF>().unwrap();
+        let hof = (node.inner().as_ref() as &dyn Any)
+            .downcast_ref::<MyHigherOrderUDF>()
+            .unwrap();
         let proto = MyHigherOrderUdfNode {
             payload: hof.payload.clone(),
         };
@@ -2667,7 +2671,9 @@ fn dummy_higher_order_function_args() -> Vec<Expr> {
 
 #[test]
 fn roundtrip_higher_order_function() {
-    let hof = Arc::new(MyHigherOrderUDF::new("payload".to_string())) as _;
+    let hof = Arc::new(HigherOrderUDF::new_from_impl(MyHigherOrderUDF::new(
+        "payload".to_string(),
+    )));
 
     let test_expr = Expr::HigherOrderFunction(expr::HigherOrderFunction::new(
         Arc::clone(&hof),
@@ -2721,9 +2727,11 @@ fn roundtrip_higher_order_function() {
             &self,
             name: &str,
             _buf: &[u8],
-        ) -> Result<Arc<dyn HigherOrderUDF>> {
+        ) -> Result<Arc<HigherOrderUDF>> {
             if name == "higher_order_udf" {
-                Ok(Arc::new(MyHigherOrderUDF::new("payload".to_string())))
+                Ok(Arc::new(HigherOrderUDF::new_from_impl(
+                    MyHigherOrderUDF::new("payload".to_string()),
+                )))
             } else {
                 Err(internal_datafusion_err!("HOF {name} not found"))
             }
@@ -2736,8 +2744,9 @@ fn roundtrip_higher_order_function() {
 
 #[test]
 fn roundtrip_higher_order_udf_extension_codec() {
-    let hof: Arc<dyn HigherOrderUDF> =
-        Arc::new(MyHigherOrderUDF::new("payload".to_string()));
+    let hof = Arc::new(HigherOrderUDF::new_from_impl(MyHigherOrderUDF::new(
+        "payload".to_string(),
+    )));
 
     let test_expr = Expr::HigherOrderFunction(expr::HigherOrderFunction::new(
         hof,

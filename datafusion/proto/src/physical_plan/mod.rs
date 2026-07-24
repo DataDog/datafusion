@@ -3868,7 +3868,7 @@ pub trait PhysicalExtensionCodec: Debug + Send + Sync + Any {
         &self,
         name: &str,
         _buf: &[u8],
-    ) -> Result<Arc<dyn HigherOrderUDF>> {
+    ) -> Result<Arc<HigherOrderUDF>> {
         not_impl_err!(
             "PhysicalExtensionCodec is not provided for higher order function {name}"
         )
@@ -3876,7 +3876,7 @@ pub trait PhysicalExtensionCodec: Debug + Send + Sync + Any {
 
     fn try_encode_higher_order_function(
         &self,
-        _node: &dyn HigherOrderUDF,
+        _node: &HigherOrderUDF,
         _buf: &mut Vec<u8>,
     ) -> Result<()> {
         Ok(())
