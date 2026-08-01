@@ -557,8 +557,8 @@ pub enum Distribution {
     ///
     /// For multi-input operators, satisfaction alone is not enough: each input
     /// may satisfy its own key requirement while using incompatible partition
-    /// boundaries. Use [`Partitioning::co_partitioned_with`] before pairing
-    /// partitions by index.
+    /// boundaries. Such operators must separately require compatible
+    /// co-partitioning before pairing partitions by index.
     KeyPartitioned(Vec<Arc<dyn PhysicalExpr>>),
 }
 
