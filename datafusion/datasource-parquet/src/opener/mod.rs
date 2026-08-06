@@ -30,7 +30,7 @@ use crate::row_filter::{RowFilterGenerator, build_projection_read_plan};
 use crate::row_group_filter::{BloomFilterStatistics, RowGroupAccessPlanFilter};
 use crate::{
     Int96Coercer, ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
-    apply_file_schema_type_coercions,
+    apply_file_schema_type_coercions, strip_virtual_columns,
 };
 use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
@@ -44,7 +44,7 @@ use std::future::Future;
 use std::mem;
 use std::sync::Arc;
 
-use arrow::datatypes::{SchemaRef, TimeUnit};
+use arrow::datatypes::{FieldRef, Schema, SchemaRef, TimeUnit};
 #[cfg(feature = "parquet_encryption")]
 use datafusion_common::encryption::FileDecryptionProperties;
 use datafusion_common::stats::Precision;
@@ -141,6 +141,9 @@ pub(super) struct ParquetMorselizer {
     pub reverse_row_groups: bool,
     /// Optional sort order used to reorder row groups by their min/max statistics.
     pub sort_order_for_reorder: Option<LexOrdering>,
+    /// Reader-produced columns appended to the physical file schema (see
+    /// [`ParquetSource::with_virtual_columns`](crate::ParquetSource::with_virtual_columns)).
+    pub virtual_columns: Vec<FieldRef>,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -294,6 +297,7 @@ struct PreparedParquetOpen {
     reverse_row_groups: bool,
     sort_order_for_reorder: Option<LexOrdering>,
     preserve_order: bool,
+    virtual_columns: Vec<FieldRef>,
     #[cfg(feature = "parquet_encryption")]
     file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
 }
@@ -665,6 +669,7 @@ impl ParquetMorselizer {
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             preserve_order: self.preserve_order,
+            virtual_columns: self.virtual_columns.clone(),
             #[cfg(feature = "parquet_encryption")]
             file_decryption_properties: None,
         })
@@ -723,10 +728,11 @@ impl PreparedParquetOpen {
         // unnecessary I/O. We decide later if it is needed to evaluate the
         // pruning predicates. Thus default to not requesting it from the
         // underlying reader.
-        let options =
+        let mut options =
             ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
-        #[cfg(feature = "parquet_encryption")]
-        let mut options = options;
+        if !self.virtual_columns.is_empty() {
+            options = options.with_virtual_columns(self.virtual_columns.clone())?;
+        }
         #[cfg(feature = "parquet_encryption")]
         if let Some(fd_val) = &self.file_decryption_properties {
             options = options.with_file_decryption_properties(Arc::clone(fd_val));
@@ -770,6 +776,38 @@ impl MetadataLoadedParquetOpen {
         //   parquet reader will actually produce.
         let mut physical_file_schema = Arc::clone(reader_metadata.schema());
 
+        // Re-derive the reader metadata after a coercion produced a new physical schema.
+        //
+        // Kept as one closure, and returning the schema rather than letting the caller read it
+        // back, because the two are not interchangeable once virtual columns are in play:
+        //
+        // - `merged` descends from `reader_metadata.schema()`, so it already carries the virtual
+        //   fields. arrow-rs's supplied-schema path appends `options.virtual_columns` itself, so
+        //   they must be stripped from what is handed to `with_schema` or they land twice and
+        //   `try_new` fails with "incompatible arrow schema".
+        // - After that call, `reader_metadata.schema()` is the *stripped* schema verbatim, while
+        //   its `fields` still describe the virtual columns. Reading the schema back would
+        //   silently drop them — no error, just a `PhysicalExprAdapter` that null-fills every
+        //   virtual column and a query that quietly returns wrong rows.
+        //
+        // So `merged` (virtuals intact) is the physical file schema, and the stripped copy exists
+        // only for the duration of the call.
+        let rederive = |merged: Schema,
+                        options: &mut ArrowReaderOptions,
+                        reader_metadata: &ArrowReaderMetadata|
+         -> Result<(SchemaRef, ArrowReaderMetadata)> {
+            let physical_file_schema = Arc::new(merged);
+            *options = options.clone().with_schema(Arc::new(strip_virtual_columns(
+                &physical_file_schema,
+                &prepared.virtual_columns,
+            )));
+            let rederived = ArrowReaderMetadata::try_new(
+                Arc::clone(reader_metadata.metadata()),
+                options.clone(),
+            )?;
+            Ok((physical_file_schema, rederived))
+        };
+
         // The schema loaded from the file may not be the same as the
         // desired schema (for example if we want to instruct the parquet
         // reader to read strings using Utf8View instead). Update if necessary
@@ -777,12 +815,8 @@ impl MetadataLoadedParquetOpen {
             &prepared.logical_file_schema,
             &physical_file_schema,
         ) {
-            physical_file_schema = Arc::new(merged);
-            options = options.with_schema(Arc::clone(&physical_file_schema));
-            reader_metadata = ArrowReaderMetadata::try_new(
-                Arc::clone(reader_metadata.metadata()),
-                options.clone(),
-            )?;
+            (physical_file_schema, reader_metadata) =
+                rederive(merged, &mut options, &reader_metadata)?;
         }
 
         if let Some(ref coerce) = prepared.coerce_int96
@@ -794,12 +828,8 @@ impl MetadataLoadedParquetOpen {
             .with_timezone(prepared.coerce_int96_tz.clone())
             .coerce()
         {
-            physical_file_schema = Arc::new(merged);
-            options = options.with_schema(Arc::clone(&physical_file_schema));
-            reader_metadata = ArrowReaderMetadata::try_new(
-                Arc::clone(reader_metadata.metadata()),
-                options.clone(),
-            )?;
+            (physical_file_schema, reader_metadata) =
+                rederive(merged, &mut options, &reader_metadata)?;
         }
 
         // Adapt the projection & filter predicate to the physical file schema.
@@ -1472,6 +1502,7 @@ mod test {
         max_predicate_cache_size: Option<usize>,
         reverse_row_groups: bool,
         preserve_order: bool,
+        virtual_columns: Vec<FieldRef>,
     }
 
     impl ParquetMorselizerBuilder {
@@ -1498,6 +1529,7 @@ mod test {
                 max_predicate_cache_size: None,
                 reverse_row_groups: false,
                 preserve_order: false,
+                virtual_columns: Vec::new(),
             }
         }
 
@@ -1516,6 +1548,12 @@ mod test {
         /// Set a custom table schema (for files with partition columns).
         fn with_table_schema(mut self, table_schema: TableSchema) -> Self {
             self.table_schema = Some(table_schema);
+            self
+        }
+
+        /// Set the projection directly.
+        fn with_projection(mut self, projection: ProjectionExprs) -> Self {
+            self.projection = Some(projection);
             self
         }
 
@@ -1558,6 +1596,12 @@ mod test {
         /// Set a row limit.
         fn with_limit(mut self, limit: usize) -> Self {
             self.limit = Some(limit);
+            self
+        }
+
+        /// Request reader-produced virtual columns.
+        fn with_virtual_columns(mut self, virtual_columns: Vec<FieldRef>) -> Self {
+            self.virtual_columns = virtual_columns;
             self
         }
 
@@ -1610,6 +1654,7 @@ mod test {
                 enable_page_index: self.enable_page_index,
                 enable_bloom_filter: self.enable_bloom_filter,
                 enable_row_group_stats_pruning: self.enable_row_group_stats_pruning,
+                virtual_columns: self.virtual_columns,
                 coerce_int96: self.coerce_int96,
                 // End-to-end coercion behavior (including timezone) is
                 // covered by parquet.slt. No opener-level test currently
@@ -1663,6 +1708,207 @@ mod test {
                 }
             }
         }
+    }
+
+    /// The mechanism `_residual`-avoidance needs: a reader-produced column that stays aligned with
+    /// the data columns even though rows are dropped by a decode-time `RowFilter`
+    /// (`pushdown_filters`) and by page-index selection. An index-derived answer materialized this
+    /// way needs no assumption about how many rows survive — unlike a positionally reconstructed
+    /// array, which desynchronizes the moment anything below the projection drops a row.
+    #[tokio::test]
+    async fn virtual_row_number_stays_aligned_under_pushdown() {
+        use arrow::array::Int64Array;
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::BinaryExpr;
+        use datafusion_physical_expr::projection::ProjectionExpr;
+        use parquet::arrow::RowNumber;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema) as SchemaRef,
+            vec![Arc::new(Int64Array::from((0..16i64).collect::<Vec<_>>()))],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(8))
+            .build();
+        let file_size = write_parquet_batches(
+            Arc::clone(&store),
+            "rn.parquet",
+            vec![batch],
+            Some(props),
+        )
+        .await;
+
+        let mut row_number = Field::new("__row_number", DataType::Int64, false);
+        row_number.try_with_extension_type(RowNumber).unwrap();
+        let row_number: FieldRef = Arc::new(row_number);
+
+        // `id > 9` is pushed into the decoder, so rows 0..=9 never reach the projection.
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 0)),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(9)))),
+        ));
+
+        // The scan advertises the virtual column as an ordinary field: everything above the
+        // reader treats it as a real column of the file.
+        let advertised_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            row_number.as_ref().clone(),
+        ]));
+
+        let morselizer = ParquetMorselizerBuilder::new()
+            .with_store(store)
+            .with_schema(advertised_schema)
+            .with_projection(ProjectionExprs::new(vec![ProjectionExpr::new(
+                Arc::new(Column::new("__row_number", 1)) as Arc<dyn PhysicalExpr>,
+                "rn".to_string(),
+            )]))
+            .with_virtual_columns(vec![Arc::clone(&row_number)])
+            .with_predicate(predicate)
+            .with_pushdown_filters(true)
+            .with_enable_page_index(true)
+            .build();
+
+        let stream = open_file(
+            &morselizer,
+            PartitionedFile::new("rn.parquet".to_string(), file_size as u64),
+        )
+        .await
+        .unwrap();
+
+        let mut got = Vec::new();
+        let mut stream = stream;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            got.extend(column.iter().flatten());
+        }
+
+        assert_eq!(
+            got,
+            vec![10, 11, 12, 13, 14, 15],
+            "the virtual column must carry the surviving rows' absolute row numbers"
+        );
+    }
+
+    /// Bug: when virtual columns (e.g. `__row_number`) are requested and the file/table schema
+    /// also needs a type coercion pass (here, a `Utf8` column that `apply_file_schema_type_coercions`
+    /// rewrites), `prepare_filters` re-derives `ArrowReaderMetadata` by calling
+    /// `options.with_schema(merged)` where `merged` still carries the virtual fields (they were
+    /// copied in from `physical_file_schema`, which already includes them from the first
+    /// `ArrowReaderMetadata::try_new`/`load_async` call). `with_schema` takes the
+    /// `with_supplied_schema` code path, which assumes the supplied schema describes the file only
+    /// and appends the virtual columns a second time, so the reader ends up looking for one more
+    /// struct field than the parquet file actually has.
+    ///
+    /// Expected: the reader metadata re-derivation succeeds and the query returns the surviving
+    /// rows' absolute row numbers, exactly as `virtual_row_number_stays_aligned_under_pushdown`
+    /// does without the `Utf8` column.
+    ///
+    /// Actual: `ArrowReaderMetadata::try_new` fails with something like `ArrowError("incompatible
+    /// arrow schema, expected 2 struct fields got 3")` because the virtual column was appended
+    /// twice to the schema handed to the parquet reader.
+    #[tokio::test]
+    async fn virtual_row_number_stays_aligned_with_utf8_coercion() {
+        use arrow::array::{Int64Array, StringArray};
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::BinaryExpr;
+        use datafusion_physical_expr::projection::ProjectionExpr;
+        use parquet::arrow::RowNumber;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        // A `Utf8` column in the file/table schema is enough to make
+        // `apply_file_schema_type_coercions` return `Some(..)`, which triggers the re-derivation
+        // path in `prepare_filters`.
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema) as SchemaRef,
+            vec![
+                Arc::new(Int64Array::from((0..16i64).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    (0..16i64).map(|i| format!("v{i}")).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(8))
+            .build();
+        let file_size = write_parquet_batches(
+            Arc::clone(&store),
+            "rn_utf8.parquet",
+            vec![batch],
+            Some(props),
+        )
+        .await;
+
+        let mut row_number = Field::new("__row_number", DataType::Int64, false);
+        row_number.try_with_extension_type(RowNumber).unwrap();
+        let row_number: FieldRef = Arc::new(row_number);
+
+        // `id > 9` is pushed into the decoder, so rows 0..=9 never reach the projection.
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 0)),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(9)))),
+        ));
+
+        // The scan advertises the virtual column as an ordinary field: everything above the
+        // reader treats it as a real column of the file.
+        let advertised_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+            row_number.as_ref().clone(),
+        ]));
+
+        let morselizer = ParquetMorselizerBuilder::new()
+            .with_store(store)
+            .with_schema(advertised_schema)
+            .with_projection(ProjectionExprs::new(vec![ProjectionExpr::new(
+                Arc::new(Column::new("__row_number", 2)) as Arc<dyn PhysicalExpr>,
+                "rn".to_string(),
+            )]))
+            .with_virtual_columns(vec![Arc::clone(&row_number)])
+            .with_predicate(predicate)
+            .with_pushdown_filters(true)
+            .with_enable_page_index(true)
+            .build();
+
+        let stream = open_file(
+            &morselizer,
+            PartitionedFile::new("rn_utf8.parquet".to_string(), file_size as u64),
+        )
+        .await
+        .unwrap();
+
+        let mut got = Vec::new();
+        let mut stream = stream;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            got.extend(column.iter().flatten());
+        }
+
+        assert_eq!(
+            got,
+            vec![10, 11, 12, 13, 14, 15],
+            "the virtual column must carry the surviving rows' absolute row numbers"
+        );
     }
 
     fn constant_int_stats() -> (Statistics, SchemaRef) {

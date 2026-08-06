@@ -55,7 +55,7 @@ pub use row_group_filter::RowGroupAccessPlanFilter;
 #[expect(deprecated)]
 pub use schema_coercion::{
     Int96Coercer, apply_file_schema_type_coercions, coerce_file_schema_to_string_type,
-    coerce_file_schema_to_view_type, coerce_int96_to_resolution,
+    coerce_file_schema_to_view_type, coerce_int96_to_resolution, strip_virtual_columns,
     transform_binary_to_string, transform_schema_to_view,
 };
 pub use sink::ParquetSink;

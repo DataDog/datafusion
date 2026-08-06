@@ -600,6 +600,22 @@ pub(crate) fn build_parquet_read_plan(
 /// that *can* be resolved in the file and produces a leaf-level projection
 /// mask. Columns missing from the file are silently skipped since the projection
 /// layer handles those by inserting nulls.
+/// Drops indices pointing at virtual (reader-produced) fields: they have no Parquet leaf, so
+/// feeding them to [`ProjectionMask`] would index past the end of the file's schema descriptor.
+/// The reader appends their values itself, from `ArrowReaderOptions::with_virtual_columns`.
+fn without_virtual_columns(indices: &[usize], file_schema: &Schema) -> Vec<usize> {
+    indices
+        .iter()
+        .copied()
+        .filter(|index| {
+            file_schema
+                .fields()
+                .get(*index)
+                .is_none_or(|field| !parquet::arrow::is_virtual_column(field))
+        })
+        .collect()
+}
+
 pub(crate) fn build_projection_read_plan(
     exprs: impl IntoIterator<Item = Arc<dyn PhysicalExpr>>,
     file_schema: &Schema,
@@ -618,8 +634,10 @@ pub(crate) fn build_projection_read_plan(
         root_indices.sort_unstable();
         root_indices.dedup();
 
-        let projection_mask =
-            ProjectionMask::roots(schema_descr, root_indices.iter().copied());
+        let projection_mask = ProjectionMask::roots(
+            schema_descr,
+            without_virtual_columns(&root_indices, file_schema),
+        );
         let projected_schema = Arc::new(
             file_schema
                 .project(&root_indices)
@@ -681,8 +699,10 @@ pub(crate) fn build_projection_read_plan(
     // when no struct field accesses were found, fall back to root-level projection
     // to match the performance of the simple path
     if all_struct_accesses.is_empty() {
-        let projection_mask =
-            ProjectionMask::roots(schema_descr, all_root_indices.iter().copied());
+        let projection_mask = ProjectionMask::roots(
+            schema_descr,
+            without_virtual_columns(&all_root_indices, file_schema),
+        );
         let projected_schema = Arc::new(
             file_schema
                 .project(&all_root_indices)

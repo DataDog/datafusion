@@ -33,7 +33,7 @@ use datafusion_datasource::file_stream::FileOpener;
 use datafusion_datasource::morsel::Morselizer;
 
 use arrow::array::timezone::Tz;
-use arrow::datatypes::TimeUnit;
+use arrow::datatypes::{FieldRef, TimeUnit};
 use datafusion_common::DataFusionError;
 use datafusion_common::config::TableParquetOptions;
 use datafusion_datasource::TableSchema;
@@ -297,6 +297,11 @@ pub struct ParquetSource {
     /// Sort order driving `PreparedAccessPlan::reorder_by_statistics`
     /// in the opener.
     sort_order_for_reorder: Option<LexOrdering>,
+    /// Reader-produced columns that do not exist in the file, appended to the physical file
+    /// schema and materialized by arrow-rs alongside the real ones (e.g. `RowNumber`). Because
+    /// they are produced inside the decode path they stay aligned with the data columns through
+    /// row-group selection, page-index selection and decode-time row filtering.
+    virtual_columns: Vec<FieldRef>,
 }
 
 impl ParquetSource {
@@ -323,6 +328,7 @@ impl ParquetSource {
             encryption_factory: None,
             reverse_row_groups: false,
             sort_order_for_reorder: None,
+            virtual_columns: Vec::new(),
         }
     }
 
@@ -333,6 +339,20 @@ impl ParquetSource {
     ) -> Self {
         self.table_parquet_options = table_parquet_options;
         self
+    }
+
+    /// Request reader-produced virtual columns, appended to the physical file schema.
+    ///
+    /// Each field must carry a virtual-column extension type (e.g.
+    /// [`RowNumber`](parquet::arrow::RowNumber)); arrow-rs rejects anything else.
+    pub fn with_virtual_columns(mut self, virtual_columns: Vec<FieldRef>) -> Self {
+        self.virtual_columns = virtual_columns;
+        self
+    }
+
+    /// The reader-produced virtual columns requested for this scan.
+    pub fn virtual_columns(&self) -> &[FieldRef] {
+        &self.virtual_columns
     }
 
     /// Set the metadata size hint
@@ -613,6 +633,7 @@ impl FileSource for ParquetSource {
             max_predicate_cache_size: self.max_predicate_cache_size(),
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
+            virtual_columns: self.virtual_columns.clone(),
         }))
     }
 

@@ -135,6 +135,31 @@ pub fn apply_file_schema_type_coercions(
     ))
 }
 
+/// Removes the fields listed in `virtual_columns` (e.g. `__row_number`) from `schema`, by name.
+///
+/// `ArrowReaderOptions::with_schema` takes arrow-rs's "supplied schema" path, which appends
+/// `virtual_columns` to whatever schema it is given. If a schema derived from a physical file
+/// schema that *already* contains the virtual fields (as `ArrowReaderMetadata::schema()` does
+/// once virtual columns are requested) is passed back into `with_schema` unmodified, the virtual
+/// fields get appended a second time and `ArrowReaderMetadata::try_new` fails matching supplied
+/// fields against parquet leaves. Call this to recover a file-only schema before re-supplying it,
+/// e.g. after running the schema through [`apply_file_schema_type_coercions`] or
+/// [`Int96Coercer`](crate::Int96Coercer).
+pub fn strip_virtual_columns(schema: &Schema, virtual_columns: &[FieldRef]) -> Schema {
+    if virtual_columns.is_empty() {
+        return schema.clone();
+    }
+    let virtual_names: HashSet<&str> =
+        virtual_columns.iter().map(|f| f.name().as_str()).collect();
+    let fields: Vec<FieldRef> = schema
+        .fields()
+        .iter()
+        .filter(|f| !virtual_names.contains(f.name().as_str()))
+        .cloned()
+        .collect();
+    Schema::new_with_metadata(fields, schema.metadata.clone())
+}
+
 /// Coerces the file schema's Timestamps to the provided TimeUnit if the
 /// Parquet schema contains INT96.
 ///
