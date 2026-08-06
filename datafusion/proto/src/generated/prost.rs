@@ -1688,6 +1688,10 @@ pub struct ParquetScanExecNode {
     pub parquet_options: ::core::option::Option<
         super::datafusion_common::TableParquetOptions,
     >,
+    /// Reader-produced virtual columns requested via
+    /// `ParquetSource::with_virtual_columns` (e.g. row number, row group index).
+    #[prost(message, repeated, tag = "5")]
+    pub virtual_columns: ::prost::alloc::vec::Vec<super::datafusion_common::Field>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CsvScanExecNode {

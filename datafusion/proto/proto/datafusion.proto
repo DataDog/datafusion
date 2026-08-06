@@ -1131,6 +1131,10 @@ message ParquetScanExecNode {
   PhysicalExprNode predicate = 3;
 
   datafusion_common.TableParquetOptions parquet_options = 4;
+
+  // Reader-produced virtual columns requested via
+  // `ParquetSource::with_virtual_columns` (e.g. row number, row group index).
+  repeated datafusion_common.Field virtual_columns = 5;
 }
 
 message CsvScanExecNode {

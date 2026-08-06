@@ -22,7 +22,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow::compute::SortOptions;
-use arrow::datatypes::{IntervalMonthDayNanoType, Schema, SchemaRef};
+use arrow::datatypes::{Field, IntervalMonthDayNanoType, Schema, SchemaRef};
 use datafusion_catalog::memory::MemorySourceConfig;
 use datafusion_common::config::CsvOptions;
 use datafusion_common::{
@@ -951,9 +951,16 @@ impl protobuf::PhysicalPlanNode {
             let reader_factory =
                 Arc::new(CachedParquetFileReaderFactory::new(store, metadata_cache));
 
+            let virtual_columns = scan
+                .virtual_columns
+                .iter()
+                .map(|f| Ok(Arc::new(Field::try_from(f)?)))
+                .collect::<Result<Vec<_>>>()?;
+
             let mut source = ParquetSource::new(table_schema)
                 .with_parquet_file_reader_factory(reader_factory)
-                .with_table_parquet_options(options);
+                .with_table_parquet_options(options)
+                .with_virtual_columns(virtual_columns);
 
             if let Some(predicate) = predicate {
                 source = source.with_predicate(predicate);
@@ -3087,6 +3094,11 @@ impl protobuf::PhysicalPlanNode {
                 .filter()
                 .map(|pred| proto_converter.physical_expr_to_proto(&pred, codec))
                 .transpose()?;
+            let virtual_columns = conf
+                .virtual_columns()
+                .iter()
+                .map(|f| f.as_ref().try_into())
+                .collect::<Result<Vec<_>, _>>()?;
             return Ok(Some(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::ParquetScan(
                     protobuf::ParquetScanExecNode {
@@ -3097,6 +3109,7 @@ impl protobuf::PhysicalPlanNode {
                         )?),
                         predicate,
                         parquet_options: Some(conf.table_parquet_options().try_into()?),
+                        virtual_columns,
                     },
                 )),
             }));
