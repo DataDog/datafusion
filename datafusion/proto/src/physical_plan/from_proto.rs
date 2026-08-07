@@ -24,7 +24,9 @@ use arrow::compute::SortOptions;
 use arrow::datatypes::{Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use chrono::{TimeZone, Utc};
-use datafusion_common::{DataFusionError, Result, internal_datafusion_err, not_impl_err};
+use datafusion_common::{
+    DataFusionError, Result, ScalarValue, internal_datafusion_err, not_impl_err,
+};
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
@@ -51,7 +53,9 @@ use datafusion_physical_plan::expressions::{
 };
 use datafusion_physical_plan::joins::{HashExpr, SeededRandomState};
 use datafusion_physical_plan::windows::{create_window_expr, schema_add_window_field};
-use datafusion_physical_plan::{Partitioning, PhysicalExpr, WindowExpr};
+use datafusion_physical_plan::{
+    Partitioning, PhysicalExpr, RangePartitioning, SplitPoint, WindowExpr,
+};
 use datafusion_proto_common::common::proto_error;
 use object_store::ObjectMeta;
 use object_store::path::Path;
@@ -674,6 +678,14 @@ pub fn parse_protobuf_partitioning(
                     proto_converter,
                 )
             }
+            Some(protobuf::partitioning::PartitionMethod::Range(range_partitioning)) => {
+                Ok(Some(parse_protobuf_range_partitioning(
+                    range_partitioning,
+                    ctx,
+                    input_schema,
+                    proto_converter,
+                )?))
+            }
             Some(protobuf::partitioning::PartitionMethod::Unknown(partition_count)) => {
                 Ok(Some(Partitioning::UnknownPartitioning(
                     *partition_count as usize,
@@ -683,6 +695,49 @@ pub fn parse_protobuf_partitioning(
         },
         None => Ok(None),
     }
+}
+
+fn parse_protobuf_range_partitioning(
+    range_partitioning: &protobuf::PhysicalRangePartitioning,
+    ctx: &PhysicalPlanDecodeContext<'_>,
+    input_schema: &Schema,
+    proto_converter: &dyn PhysicalProtoConverterExtension,
+) -> Result<Partitioning> {
+    let sort_exprs = parse_physical_sort_exprs(
+        &range_partitioning.sort_expr,
+        ctx,
+        input_schema,
+        proto_converter,
+    )?;
+    let sort_expr_count = sort_exprs.len();
+    let ordering = LexOrdering::new(sort_exprs).ok_or_else(|| {
+        internal_datafusion_err!("Range partitioning requires non-empty ordering")
+    })?;
+    if ordering.len() != sort_expr_count {
+        return Err(internal_datafusion_err!(
+            "Range partitioning ordering must not contain duplicate expressions"
+        ));
+    }
+    let split_points = range_partitioning
+        .split_point
+        .iter()
+        .map(parse_protobuf_range_split_point)
+        .collect::<Result<_>>()?;
+    Ok(Partitioning::Range(RangePartitioning::try_new(
+        ordering,
+        split_points,
+    )?))
+}
+
+fn parse_protobuf_range_split_point(
+    split_point: &protobuf::PhysicalRangeSplitPoint,
+) -> Result<SplitPoint> {
+    let values = split_point
+        .value
+        .iter()
+        .map(|value| ScalarValue::try_from(value).map_err(Into::into))
+        .collect::<Result<_>>()?;
+    Ok(SplitPoint::new(values))
 }
 
 pub fn parse_protobuf_file_scan_schema(
@@ -754,6 +809,12 @@ pub fn parse_protobuf_file_scan_config(
         )?;
         output_ordering.extend(LexOrdering::new(sort_exprs));
     }
+    let output_partitioning = parse_protobuf_partitioning(
+        proto.output_partitioning.as_ref(),
+        ctx,
+        &schema,
+        proto_converter,
+    )?;
 
     // Parse projection expressions if present and apply to file source
     let file_source = if let Some(proto_projection_exprs) = &proto.projection_exprs {
@@ -782,14 +843,18 @@ pub fn parse_protobuf_file_scan_config(
         file_source
     };
 
-    let config = FileScanConfigBuilder::new(object_store_url, file_source)
+    let mut config_builder = FileScanConfigBuilder::new(object_store_url, file_source)
         .with_file_groups(file_groups)
         .with_constraints(constraints)
         .with_statistics(statistics)
         .with_limit(proto.limit.as_ref().map(|sl| sl.limit as usize))
         .with_output_ordering(output_ordering)
-        .with_batch_size(proto.batch_size.map(|s| s as usize))
-        .build();
+        .with_output_partitioning(output_partitioning)
+        .with_batch_size(proto.batch_size.map(|s| s as usize));
+    if proto.partitioned_by_file_group.unwrap_or(false) {
+        config_builder = config_builder.with_partitioned_by_file_group(true);
+    }
+    let config = config_builder.build();
     Ok(config)
 }
 

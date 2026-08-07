@@ -44,7 +44,9 @@ use datafusion_physical_plan::expressions::{
 use datafusion_physical_plan::joins::{HashExpr, HashTableLookupExpr};
 use datafusion_physical_plan::udaf::AggregateFunctionExpr;
 use datafusion_physical_plan::windows::{PlainAggregateWindowExpr, WindowUDFExpr};
-use datafusion_physical_plan::{Partitioning, PhysicalExpr, WindowExpr};
+use datafusion_physical_plan::{
+    Partitioning, PhysicalExpr, RangePartitioning, SplitPoint, WindowExpr,
+};
 
 use super::{
     DefaultPhysicalProtoConverter, PhysicalExtensionCodec,
@@ -658,6 +660,11 @@ pub fn serialize_partitioning(
                 )),
             }
         }
+        Partitioning::Range(range) => protobuf::Partitioning {
+            partition_method: Some(protobuf::partitioning::PartitionMethod::Range(
+                serialize_range_partitioning(range, codec, proto_converter)?,
+            )),
+        },
         Partitioning::UnknownPartitioning(partition_count) => protobuf::Partitioning {
             partition_method: Some(protobuf::partitioning::PartitionMethod::Unknown(
                 *partition_count as u64,
@@ -665,6 +672,40 @@ pub fn serialize_partitioning(
         },
     };
     Ok(serialized_partitioning)
+}
+
+fn serialize_range_partitioning(
+    range: &RangePartitioning,
+    codec: &dyn PhysicalExtensionCodec,
+    proto_converter: &dyn PhysicalProtoConverterExtension,
+) -> Result<protobuf::PhysicalRangePartitioning> {
+    Ok(protobuf::PhysicalRangePartitioning {
+        sort_expr: serialize_physical_sort_exprs(
+            range.ordering().iter().cloned(),
+            codec,
+            proto_converter,
+        )?,
+        split_point: range
+            .split_points()
+            .iter()
+            .map(serialize_range_split_point)
+            .collect::<Result<_>>()?,
+    })
+}
+
+fn serialize_range_split_point(
+    split_point: &SplitPoint,
+) -> Result<protobuf::PhysicalRangeSplitPoint> {
+    Ok(protobuf::PhysicalRangeSplitPoint {
+        value: split_point
+            .values()
+            .iter()
+            .map(|value| {
+                TryInto::<datafusion_proto_common::ScalarValue>::try_into(value)
+                    .map_err(Into::into)
+            })
+            .collect::<Result<_>>()?,
+    })
 }
 
 fn serialize_when_then_expr(
@@ -745,6 +786,11 @@ pub fn serialize_file_scan_config(
             serialize_physical_sort_exprs(order.to_vec(), codec, proto_converter)?;
         output_orderings.push(ordering)
     }
+    let output_partitioning = conf
+        .output_partitioning
+        .as_ref()
+        .map(|partitioning| serialize_partitioning(partitioning, codec, proto_converter))
+        .transpose()?;
 
     // Fields must be added to the schema so that they can persist in the protobuf,
     // and then they are to be removed from the schema in `parse_protobuf_file_scan_config`
@@ -804,6 +850,8 @@ pub fn serialize_file_scan_config(
         constraints: Some(conf.constraints.clone().into()),
         batch_size: conf.batch_size.map(|s| s as u64),
         projection_exprs,
+        partitioned_by_file_group: Some(conf.partitioned_by_file_group),
+        output_partitioning,
     })
 }
 
