@@ -521,7 +521,6 @@ mod tests {
     use datafusion_common::Result;
     use datafusion_common::assert_contains;
     use datafusion_expr::execution_props::ExecutionProps;
-    use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
     use datafusion_expr::{
         HigherOrderFunctionArgs, HigherOrderSignature, HigherOrderUDF, HigherOrderUDFImpl,
     };
@@ -763,7 +762,6 @@ mod tests {
             &Expr::HigherOrderFunction(HigherOrderFunction::new(fun, vec![lambda_expr])),
             &schema,
             &ExecutionProps::new(),
-            &PhysicalPlanningContext::default(),
         )
         .unwrap();
 
