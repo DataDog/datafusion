@@ -268,15 +268,11 @@ impl ExecutionPlan for PartialSortExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        self.input_distribution_requirements().into_per_child()
-    }
-
-    fn input_distribution_requirements(&self) -> crate::InputDistributionRequirements {
-        crate::InputDistributionRequirements::new(if self.preserve_partitioning {
+        if self.preserve_partitioning {
             vec![Distribution::UnspecifiedDistribution]
         } else {
             vec![Distribution::SinglePartition]
-        })
+        }
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {

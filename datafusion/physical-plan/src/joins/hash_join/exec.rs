@@ -54,9 +54,8 @@ use crate::projection::{
 use crate::repartition::REPARTITION_RANDOM_STATE;
 use crate::spill::get_record_batch_memory_size;
 use crate::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
-    InputDistributionRequirements, Partitioning, PlanProperties,
-    SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
+    PlanProperties, SendableRecordBatchStream, Statistics,
     common::can_project,
     joins::utils::{
         BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinHashMapType,
@@ -846,63 +845,19 @@ impl HashJoinExec {
             return false;
         }
 
-        // Bounds and membership filters derived from the build side do not
-        // account for null-equal matching: a probe-side NULL key evaluates
-        // such predicates to NULL and would be pruned, even though it can
-        // match a build-side NULL when nulls compare equal.
-        if self.null_equality == NullEquality::NullEqualsNull {
-            return false;
-        }
-
-        if self.mode == PartitionMode::Partitioned {
-            // `preserve_file_partitions` can report Hash partitioning for
-            // Hive-style file groups, but those partitions are not actually
-            // hash-distributed. Partitioned dynamic filters rely on hash
-            // routing, so disable them in this mode to avoid incorrect
-            // results. Follow-up work: enable dynamic filtering for
-            // preserve_file_partitioned scans (issue #20195).
-            // https://github.com/apache/datafusion/issues/20195
-            if config.optimizer.preserve_file_partitions > 0 {
-                return false;
-            }
-
-            // Partitioned dynamic filters route probe rows with
-            // `hash(join_key) % partition_count`. That is only valid when
-            // partition ids are hash buckets with the same bucket count, or
-            // when there is only one partition and no routing choice exists.
-            // This also rejects non-hash partitioning such as
-            // `Partitioning::Range`.
-            if !self.has_partitioned_dynamic_filter_routing() {
-                return false;
-            }
-        }
-
-        if self.mode == PartitionMode::Partitioned
-            && !self.has_partitioned_dynamic_filter_routing()
+        // `preserve_file_partitions` can report Hash partitioning for Hive-style
+        // file groups, but those partitions are not actually hash-distributed.
+        // Partitioned dynamic filters rely on hash routing, so disable them in
+        // this mode to avoid incorrect results. Follow-up work: enable dynamic
+        // filtering for preserve_file_partitioned scans (issue #20195).
+        // https://github.com/apache/datafusion/issues/20195
+        if config.optimizer.preserve_file_partitions > 0
+            && self.mode == PartitionMode::Partitioned
         {
-            // TODO: support partition-routed dynamic filters for compatible
-            // range co-partitioned joins.
-            // <https://github.com/apache/datafusion/issues/23376>.
             return false;
         }
 
         true
-    }
-
-    fn has_partitioned_dynamic_filter_routing(&self) -> bool {
-        match (
-            self.left.output_partitioning(),
-            self.right.output_partitioning(),
-        ) {
-            (
-                Partitioning::Hash(_, left_partition_count),
-                Partitioning::Hash(_, right_partition_count),
-            ) => left_partition_count == right_partition_count,
-            (left_partitioning, right_partitioning) => {
-                left_partitioning.partition_count() == 1
-                    && right_partitioning.partition_count() == 1
-            }
-        }
     }
 
     /// left (build) side which gets hashed
@@ -1248,30 +1203,26 @@ impl ExecutionPlan for HashJoinExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        self.input_distribution_requirements().into_per_child()
-    }
-
-    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
         match self.mode {
+            PartitionMode::CollectLeft => vec![
+                Distribution::SinglePartition,
+                Distribution::UnspecifiedDistribution,
+            ],
             PartitionMode::Partitioned => {
                 let (left_expr, right_expr) = self
                     .on
                     .iter()
                     .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
                     .unzip();
-                InputDistributionRequirements::co_partitioned(vec![
-                    Distribution::KeyPartitioned(left_expr),
-                    Distribution::KeyPartitioned(right_expr),
-                ])
+                vec![
+                    Distribution::HashPartitioned(left_expr),
+                    Distribution::HashPartitioned(right_expr),
+                ]
             }
-            PartitionMode::CollectLeft => InputDistributionRequirements::new(vec![
-                Distribution::SinglePartition,
-                Distribution::UnspecifiedDistribution,
-            ]),
-            PartitionMode::Auto => InputDistributionRequirements::new(vec![
+            PartitionMode::Auto => vec![
                 Distribution::UnspecifiedDistribution,
                 Distribution::UnspecifiedDistribution,
-            ]),
+            ],
         }
     }
 
@@ -2168,90 +2119,7 @@ mod tests {
         Ok((left_schema, right_schema, on))
     }
 
-    #[derive(Debug)]
-    struct PartitionedTestInput {
-        input: Arc<dyn ExecutionPlan>,
-        cache: Arc<PlanProperties>,
-    }
-
-    impl PartitionedTestInput {
-        fn new(input: Arc<dyn ExecutionPlan>, partitioning: Partitioning) -> Self {
-            let cache = Arc::new(PlanProperties::new(
-                input.equivalence_properties().clone(),
-                partitioning,
-                input.pipeline_behavior(),
-                input.boundedness(),
-            ));
-            Self { input, cache }
-        }
-    }
-
-    impl DisplayAs for PartitionedTestInput {
-        fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-            match t {
-                DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                    write!(f, "PartitionedTestInput")
-                }
-                DisplayFormatType::TreeRender => write!(f, ""),
-            }
-        }
-    }
-
-    impl ExecutionPlan for PartitionedTestInput {
-        fn name(&self) -> &'static str {
-            "PartitionedTestInput"
-        }
-
-        fn properties(&self) -> &Arc<PlanProperties> {
-            &self.cache
-        }
-
-        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-            vec![&self.input]
-        }
-
-        fn with_new_children(
-            self: Arc<Self>,
-            children: Vec<Arc<dyn ExecutionPlan>>,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            if children.len() != 1 {
-                return internal_err!(
-                    "PartitionedTestInput expected one child, got {}",
-                    children.len()
-                );
-            }
-            Ok(Arc::new(Self::new(
-                Arc::clone(&children[0]),
-                self.cache.output_partitioning().clone(),
-            )))
-        }
-
-        fn execute(
-            &self,
-            partition: usize,
-            context: Arc<TaskContext>,
-        ) -> Result<SendableRecordBatchStream> {
-            self.input.execute(partition, context)
-        }
-    }
-
-    fn declared_hash_test_input(
-        input: Arc<dyn ExecutionPlan>,
-        key: &str,
-        key_index: usize,
-        partition_count: usize,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(PartitionedTestInput::new(
-            input,
-            Partitioning::Hash(
-                vec![Arc::new(Column::new(key, key_index))],
-                partition_count,
-            ),
-        )))
-    }
-
     use crate::coalesce_partitions::CoalescePartitionsExec;
-    use crate::execution_plan::Boundedness;
     use crate::joins::hash_join::stream::lookup_join_hashmap;
     use crate::test::{TestMemoryExec, assert_join_metrics};
     use crate::{
@@ -2274,66 +2142,10 @@ mod tests {
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{BinaryExpr, Literal};
-    use datafusion_physical_expr::{
-        EquivalenceProperties, PhysicalSortExpr, RangePartitioning, SplitPoint,
-    };
     use hashbrown::HashTable;
     use insta::{allow_duplicates, assert_snapshot};
     use rstest::*;
     use rstest_reuse::*;
-
-    #[derive(Debug)]
-    struct PartitionedTestExec {
-        cache: Arc<PlanProperties>,
-    }
-
-    impl PartitionedTestExec {
-        fn try_new(schema: SchemaRef, partitioning: Partitioning) -> Result<Self> {
-            Ok(Self {
-                cache: Arc::new(PlanProperties::new(
-                    EquivalenceProperties::new(Arc::clone(&schema)),
-                    partitioning,
-                    EmissionType::Incremental,
-                    Boundedness::Bounded,
-                )),
-            })
-        }
-    }
-
-    impl DisplayAs for PartitionedTestExec {
-        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-            write!(f, "PartitionedTestExec")
-        }
-    }
-
-    impl ExecutionPlan for PartitionedTestExec {
-        fn name(&self) -> &'static str {
-            "PartitionedTestExec"
-        }
-
-        fn properties(&self) -> &Arc<PlanProperties> {
-            &self.cache
-        }
-
-        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-            vec![]
-        }
-
-        fn with_new_children(
-            self: Arc<Self>,
-            _: Vec<Arc<dyn ExecutionPlan>>,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            Ok(self)
-        }
-
-        fn execute(
-            &self,
-            _partition: usize,
-            _context: Arc<TaskContext>,
-        ) -> Result<SendableRecordBatchStream> {
-            unreachable!()
-        }
-    }
 
     fn div_ceil(a: usize, b: usize) -> usize {
         a.div_ceil(b)
@@ -5563,7 +5375,6 @@ mod tests {
             None,
         )
         .unwrap();
-        let left = declared_hash_test_input(left, "b1", 1, 2)?;
         let right_batch = build_table_i32(
             ("a2", &vec![10, 11]),
             ("b2", &vec![12, 13]),
@@ -5575,7 +5386,6 @@ mod tests {
             None,
         )
         .unwrap();
-        let right = declared_hash_test_input(right, "b2", 1, 2)?;
         let on = vec![(
             Arc::new(Column::new_with_schema("b1", &left_batch.schema())?) as _,
             Arc::new(Column::new_with_schema("b2", &right_batch.schema())?) as _,
@@ -5603,8 +5413,8 @@ mod tests {
             let task_ctx = Arc::new(task_ctx);
 
             let join = HashJoinExec::try_new(
-                Arc::clone(&left),
-                Arc::clone(&right),
+                Arc::clone(&left) as Arc<dyn ExecutionPlan>,
+                Arc::clone(&right) as Arc<dyn ExecutionPlan>,
                 on.clone(),
                 None,
                 &join_type,
@@ -5907,8 +5717,6 @@ mod tests {
             Arc::clone(&child_right_schema),
             None,
         )?;
-        let child_left = declared_hash_test_input(child_left, "child_key", 1, 4)?;
-        let child_right = declared_hash_test_input(child_right, "child_right_key", 1, 4)?;
         let parent_left: Arc<dyn ExecutionPlan> = TestMemoryExec::try_new_exec(
             &[
                 vec![build_table_i32(
@@ -5927,7 +5735,6 @@ mod tests {
             Arc::clone(&parent_left_schema),
             None,
         )?;
-        let parent_left = declared_hash_test_input(parent_left, "parent_key", 1, 4)?;
 
         let child_on = vec![(
             Arc::new(Column::new_with_schema("child_key", &child_left_schema)?) as _,
@@ -6531,193 +6338,6 @@ mod tests {
             df.expression_id()
                 .expect("DynamicFilterPhysicalExpr always has an expression_id"),
         );
-        Ok(())
-    }
-
-    #[test]
-    fn test_dynamic_filter_pushdown_rejects_null_equal_join() -> Result<()> {
-        let (_, _, on) = build_schema_and_on()?;
-        let left = build_table(("a1", &vec![1]), ("b1", &vec![1]), ("c1", &vec![1]));
-        let right = build_table(("a2", &vec![1]), ("b1", &vec![1]), ("c2", &vec![1]));
-
-        let session_config = join_dynamic_filter_session_config(0);
-        let join = HashJoinExec::try_new(
-            left,
-            right,
-            on,
-            None,
-            &JoinType::RightSemi,
-            None,
-            PartitionMode::CollectLeft,
-            NullEquality::NullEqualsNull,
-            false,
-        )?;
-
-        assert!(!join.allow_join_dynamic_filter_pushdown(session_config.options()));
-
-        Ok(())
-    }
-
-    fn range_partitioned_test_input(
-        schema: SchemaRef,
-        range_key: &str,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let input = TestMemoryExec::try_new_exec(&[vec![]], Arc::clone(&schema), None)?;
-        let range_expr = Arc::new(Column::new_with_schema(range_key, &schema)?);
-        let range_partitioning = Partitioning::Range(RangePartitioning::new(
-            [PhysicalSortExpr::new_default(range_expr)].into(),
-            vec![SplitPoint::new(vec![ScalarValue::Int32(Some(10))])],
-        ));
-        RepartitionExec::try_new(input, range_partitioning)
-            .map(|exec| Arc::new(exec) as _)
-    }
-
-    fn hash_partitioned_test_input(
-        schema: SchemaRef,
-        hash_key: &str,
-        partition_count: usize,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let input = TestMemoryExec::try_new_exec(&[vec![]], Arc::clone(&schema), None)?;
-        let hash_expr = Arc::new(Column::new_with_schema(hash_key, &schema)?);
-        RepartitionExec::try_new(
-            input,
-            Partitioning::Hash(vec![hash_expr], partition_count),
-        )
-        .map(|exec| Arc::new(exec) as _)
-    }
-
-    fn join_dynamic_filter_session_config(
-        preserve_file_partitions: usize,
-    ) -> SessionConfig {
-        let mut session_config = SessionConfig::default();
-        session_config
-            .options_mut()
-            .optimizer
-            .enable_join_dynamic_filter_pushdown = true;
-        session_config
-            .options_mut()
-            .optimizer
-            .preserve_file_partitions = preserve_file_partitions;
-        session_config
-    }
-
-    fn partitioned_inner_hash_join(
-        left: Arc<dyn ExecutionPlan>,
-        right: Arc<dyn ExecutionPlan>,
-        on: JoinOn,
-    ) -> Result<HashJoinExec> {
-        HashJoinExec::try_new(
-            left,
-            right,
-            on,
-            None,
-            &JoinType::Inner,
-            None,
-            PartitionMode::Partitioned,
-            NullEquality::NullEqualsNothing,
-            false,
-        )
-    }
-
-    #[test]
-    fn dynamic_filter_rejects_range_partitioning() -> Result<()> {
-        let (left_schema, right_schema, on) = build_schema_and_on()?;
-        let left = range_partitioned_test_input(left_schema, "b1")?;
-        let right = range_partitioned_test_input(right_schema, "b1")?;
-
-        let session_config = join_dynamic_filter_session_config(0);
-        let join = partitioned_inner_hash_join(left, right, on)?;
-
-        let requirements = join.input_distribution_requirements().into_per_child();
-        assert!(matches!(
-            requirements.as_slice(),
-            [
-                Distribution::KeyPartitioned(_),
-                Distribution::KeyPartitioned(_)
-            ]
-        ));
-        assert!(!join.allow_join_dynamic_filter_pushdown(session_config.options()));
-
-        Ok(())
-    }
-
-    #[test]
-    fn dynamic_filter_rejects_preserve_file_partitions() -> Result<()> {
-        let (left_schema, right_schema, on) = build_schema_and_on()?;
-        let left = hash_partitioned_test_input(left_schema, "b1", 2)?;
-        let right = hash_partitioned_test_input(right_schema, "b1", 2)?;
-
-        let session_config = join_dynamic_filter_session_config(1);
-        let join = partitioned_inner_hash_join(left, right, on)?;
-
-        assert!(!join.allow_join_dynamic_filter_pushdown(session_config.options()));
-
-        Ok(())
-    }
-
-    #[test]
-    fn dynamic_filter_rejects_mismatched_hash_counts() -> Result<()> {
-        let (left_schema, right_schema, on) = build_schema_and_on()?;
-        let left = hash_partitioned_test_input(left_schema, "b1", 2)?;
-        let right = hash_partitioned_test_input(right_schema, "b1", 3)?;
-
-        let session_config = join_dynamic_filter_session_config(0);
-        let join = partitioned_inner_hash_join(left, right, on)?;
-
-        assert!(!join.allow_join_dynamic_filter_pushdown(session_config.options()));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_partitioned_dynamic_filter_pushdown_rejects_range_partitioning() -> Result<()>
-    {
-        let (left_schema, right_schema, on) = build_schema_and_on()?;
-        let left_partitioning = Partitioning::Range(RangePartitioning::try_new(
-            [PhysicalSortExpr {
-                expr: Arc::clone(&on[0].0),
-                options: Default::default(),
-            }]
-            .into(),
-            vec![SplitPoint::new(vec![ScalarValue::Int32(Some(10))])],
-        )?);
-        let right_partitioning = Partitioning::Range(RangePartitioning::try_new(
-            [PhysicalSortExpr {
-                expr: Arc::clone(&on[0].1),
-                options: Default::default(),
-            }]
-            .into(),
-            vec![SplitPoint::new(vec![ScalarValue::Int32(Some(10))])],
-        )?);
-        let left = Arc::new(PartitionedTestExec::try_new(
-            left_schema,
-            left_partitioning,
-        )?);
-        let right = Arc::new(PartitionedTestExec::try_new(
-            right_schema,
-            right_partitioning,
-        )?);
-
-        let mut session_config = SessionConfig::default();
-        session_config
-            .options_mut()
-            .optimizer
-            .enable_join_dynamic_filter_pushdown = true;
-
-        let join = HashJoinExec::try_new(
-            left,
-            right,
-            on,
-            None,
-            &JoinType::Inner,
-            None,
-            PartitionMode::Partitioned,
-            NullEquality::NullEqualsNothing,
-            false,
-        )?;
-
-        assert!(!join.allow_join_dynamic_filter_pushdown(session_config.options()));
-
         Ok(())
     }
 
