@@ -266,13 +266,7 @@ impl ExecutionPlan for SortPreservingMergeExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        self.input_distribution_requirements().into_per_child()
-    }
-
-    fn input_distribution_requirements(&self) -> crate::InputDistributionRequirements {
-        crate::InputDistributionRequirements::new(vec![
-            Distribution::UnspecifiedDistribution,
-        ])
+        vec![Distribution::UnspecifiedDistribution]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -1492,7 +1486,11 @@ mod tests {
         let task_ctx = Arc::new(TaskContext::default());
         let schema = Schema::new(vec![Field::new("c1", DataType::UInt64, false)]);
         let properties = CongestedExec::compute_properties(Arc::new(schema.clone()));
-        let partition_count = properties.output_partitioning().partition_count();
+        let &partition_count = match properties.output_partitioning() {
+            Partitioning::RoundRobinBatch(partitions) => partitions,
+            Partitioning::Hash(_, partitions) => partitions,
+            Partitioning::UnknownPartitioning(partitions) => partitions,
+        };
         let source = CongestedExec {
             schema: schema.clone(),
             cache: Arc::new(properties),

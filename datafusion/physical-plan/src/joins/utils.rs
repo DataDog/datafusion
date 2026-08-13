@@ -33,8 +33,7 @@ use crate::metrics::{
 };
 use crate::projection::{ProjectionExec, ProjectionExpr};
 use crate::{
-    ColumnStatistics, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    RangePartitioning, Statistics,
+    ColumnStatistics, ExecutionPlan, ExecutionPlanProperties, Partitioning, Statistics,
 };
 // compatibility
 pub use super::join_filter::JoinFilter;
@@ -68,7 +67,7 @@ use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::stats::Precision;
 use datafusion_common::{
     DataFusionError, JoinSide, JoinType, NullEquality, Result, SharedResult,
-    internal_datafusion_err, not_impl_err, plan_err,
+    not_impl_err, plan_err,
 };
 use datafusion_expr::Operator;
 use datafusion_expr::interval_arithmetic::Interval;
@@ -144,21 +143,6 @@ pub fn adjust_right_output_partitioning(
                 .map(|expr| add_offset_to_expr(Arc::clone(expr), left_columns_len as _))
                 .collect::<Result<_>>()?;
             Partitioning::Hash(new_exprs, *size)
-        }
-        Partitioning::Range(range) => {
-            let ordering = add_offset_to_physical_sort_exprs(
-                range.ordering().iter().cloned(),
-                left_columns_len as _,
-            )?;
-            let ordering = LexOrdering::new(ordering).ok_or_else(|| {
-                internal_datafusion_err!(
-                    "Offsetting range partitioning produced an empty ordering"
-                )
-            })?;
-            Partitioning::Range(RangePartitioning::new(
-                ordering,
-                range.split_points().to_vec(),
-            ))
         }
         result => result.clone(),
     };
@@ -2160,7 +2144,7 @@ mod tests {
     use arrow::datatypes::{DataType, Fields};
     use arrow::error::{ArrowError, Result as ArrowResult};
     use datafusion_common::stats::Precision::{Absent, Exact, Inexact};
-    use datafusion_common::{ScalarValue, SplitPoint, arrow_datafusion_err, arrow_err};
+    use datafusion_common::{ScalarValue, arrow_datafusion_err, arrow_err};
     use datafusion_physical_expr::PhysicalSortExpr;
 
     use rstest::rstest;
@@ -3252,53 +3236,6 @@ mod tests {
             "multi-column semi join with nulls on one column"
         );
 
-        Ok(())
-    }
-
-    #[test]
-    fn test_adjust_right_output_partitioning_preserves_range() -> Result<()> {
-        let split_points = vec![
-            SplitPoint::new(vec![
-                ScalarValue::Int32(Some(10)),
-                ScalarValue::Int32(Some(100)),
-            ]),
-            SplitPoint::new(vec![
-                ScalarValue::Int32(Some(20)),
-                ScalarValue::Int32(Some(50)),
-            ]),
-        ];
-        let range = RangePartitioning::try_new(
-            LexOrdering::new([
-                PhysicalSortExpr::new(
-                    Arc::new(Column::new("a", 0)),
-                    SortOptions::new(false, true),
-                ),
-                PhysicalSortExpr::new(
-                    Arc::new(Column::new("b", 2)),
-                    SortOptions::new(true, false),
-                ),
-            ])
-            .unwrap(),
-            split_points.clone(),
-        )?;
-
-        let adjusted = adjust_right_output_partitioning(&Partitioning::Range(range), 3)?;
-        let expected = Partitioning::Range(RangePartitioning::new(
-            LexOrdering::new([
-                PhysicalSortExpr::new(
-                    Arc::new(Column::new("a", 3)),
-                    SortOptions::new(false, true),
-                ),
-                PhysicalSortExpr::new(
-                    Arc::new(Column::new("b", 5)),
-                    SortOptions::new(true, false),
-                ),
-            ])
-            .unwrap(),
-            split_points,
-        ));
-
-        assert_eq!(adjusted, expected);
         Ok(())
     }
 

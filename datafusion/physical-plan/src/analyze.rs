@@ -144,13 +144,7 @@ impl ExecutionPlan for AnalyzeExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        self.input_distribution_requirements().into_per_child()
-    }
-
-    fn input_distribution_requirements(&self) -> crate::InputDistributionRequirements {
-        crate::InputDistributionRequirements::new(vec![
-            Distribution::UnspecifiedDistribution,
-        ])
+        vec![Distribution::UnspecifiedDistribution]
     }
 
     fn with_new_children(

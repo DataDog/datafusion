@@ -28,7 +28,7 @@ use crate::PhysicalOptimizerRule;
 
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{Result, Statistics, internal_err};
+use datafusion_common::{Result, Statistics};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::Distribution;
 use datafusion_physical_expr_common::sort_expr::OrderingRequirements;
@@ -205,15 +205,7 @@ impl ExecutionPlan for OutputRequirementExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        self.input_distribution_requirements().into_per_child()
-    }
-
-    fn input_distribution_requirements(
-        &self,
-    ) -> datafusion_physical_plan::InputDistributionRequirements {
-        datafusion_physical_plan::InputDistributionRequirements::new(vec![
-            self.dist_requirement.clone(),
-        ])
+        vec![self.dist_requirement.clone()]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -252,10 +244,6 @@ impl ExecutionPlan for OutputRequirementExec {
         self.input.partition_statistics(partition)
     }
 
-    #[expect(
-        deprecated,
-        reason = "HashPartitioned is accepted during the KeyPartitioned migration"
-    )]
     fn try_swapping_with_projection(
         &self,
         projection: &ProjectionExec,
@@ -280,12 +268,8 @@ impl ExecutionPlan for OutputRequirementExec {
             requirements = OrderingRequirements::new_alternatives(updated_reqs, soft);
         }
 
-        let input_distributions = self.input_distribution_requirements();
-        let dist_req = match input_distributions.child_distribution(0) {
-            Some(
-                Distribution::HashPartitioned(exprs)
-                | Distribution::KeyPartitioned(exprs),
-            ) => {
+        let dist_req = match &self.required_input_distribution()[0] {
+            Distribution::HashPartitioned(exprs) => {
                 let mut updated_exprs = vec![];
                 for expr in exprs {
                     let Some(new_expr) = update_expr(expr, projection.expr(), false)?
@@ -294,14 +278,9 @@ impl ExecutionPlan for OutputRequirementExec {
                     };
                     updated_exprs.push(new_expr);
                 }
-                Distribution::KeyPartitioned(updated_exprs)
+                Distribution::HashPartitioned(updated_exprs)
             }
-            Some(dist) => dist.clone(),
-            None => {
-                return internal_err!(
-                    "OutputRequirementExec missing input distribution requirement"
-                );
-            }
+            dist => dist.clone(),
         };
 
         make_with_child(projection, &self.input()).map(|input| {
@@ -376,10 +355,7 @@ fn require_top_ordering_helper(
         // In case of constant columns, output ordering of the `SortExec` would
         // be an empty set. Therefore; we check the sort expression field to
         // assign the requirements.
-        let req_dist = sort_exec
-            .input_distribution_requirements()
-            .into_per_child()
-            .swap_remove(0);
+        let req_dist = sort_exec.required_input_distribution().swap_remove(0);
         let req_ordering = sort_exec.expr();
         let reqs = OrderingRequirements::from(req_ordering.clone());
         let fetch = sort_exec.fetch();

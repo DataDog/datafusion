@@ -306,14 +306,10 @@ impl ExecutionPlan for CrossJoinExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        self.input_distribution_requirements().into_per_child()
-    }
-
-    fn input_distribution_requirements(&self) -> crate::InputDistributionRequirements {
-        crate::InputDistributionRequirements::new(vec![
+        vec![
             Distribution::SinglePartition,
             Distribution::UnspecifiedDistribution,
-        ])
+        ]
     }
 
     fn execute(

@@ -264,22 +264,6 @@ pub fn bounded_window_exec_with_partition(
     partition_by: &[Arc<dyn PhysicalExpr>],
     input: Arc<dyn ExecutionPlan>,
 ) -> Arc<dyn ExecutionPlan> {
-    bounded_window_exec_with_can_repartition(
-        col_name,
-        sort_exprs,
-        partition_by,
-        input,
-        false,
-    )
-}
-
-pub fn bounded_window_exec_with_can_repartition(
-    col_name: &str,
-    sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>,
-    partition_by: &[Arc<dyn PhysicalExpr>],
-    input: Arc<dyn ExecutionPlan>,
-    can_repartition: bool,
-) -> Arc<dyn ExecutionPlan> {
     let sort_exprs = sort_exprs.into_iter().collect::<Vec<_>>();
     let schema = input.schema();
     let window_expr = create_window_expr(
@@ -301,7 +285,7 @@ pub fn bounded_window_exec_with_can_repartition(
             vec![window_expr],
             Arc::clone(&input),
             InputOrderMode::Sorted,
-            can_repartition,
+            false,
         )
         .unwrap(),
     )
