@@ -2850,3 +2850,120 @@ async fn test_sort_with_streaming_table() -> Result<()> {
 
     Ok(())
 }
+
+/// Builds the plan shape that `parallelize_sorts` sees for a `CollectLeft` `HashJoinExec`
+/// whose build side is required to be `SinglePartition`, i.e. the output of the
+/// distribution + sorting phases, not a freshly planned tree:
+///
+/// ```text
+/// CoalescePartitionsExec                 <- the node `parallelize_sorts` rewrites
+///   HashJoinExec: mode=CollectLeft
+///     CoalescePartitionsExec             <- satisfies `SinglePartition` on the build side
+///       <build>
+///     RepartitionExec: RoundRobinBatch
+///       CoalescePartitionsExec           <- links the join into the coalesce cascade
+///         <probe multi-partition source>
+/// ```
+///
+/// Both coalesces below the join matter. The probe-side one is what makes
+/// `update_coalesce_ctx_children` mark the join as connected — it only skips children that
+/// require `SinglePartition`, and the probe side does not — so the walk descends into the
+/// join. The build-side one is the one that must survive.
+fn collect_left_plan_before_parallelize_sorts(
+    build: Arc<dyn ExecutionPlan>,
+    join_type: JoinType,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    use datafusion_common::NullEquality;
+    use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
+
+    let schema = create_test_schema2()?;
+    let build = coalesce_partitions_exec(build);
+    let probe = repartition_exec(coalesce_partitions_exec(parquet_exec(schema)));
+
+    let on = vec![(
+        Arc::new(Column::new("col_a", 0)) as _,
+        Arc::new(Column::new("col_a", 0)) as _,
+    )];
+    let join: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+        build,
+        probe,
+        on,
+        None,
+        &join_type,
+        None,
+        PartitionMode::CollectLeft,
+        NullEquality::NullEqualsNothing,
+        false,
+    )?);
+
+    Ok(coalesce_partitions_exec(join))
+}
+
+/// A `CollectLeft` `HashJoinExec` requires `Distribution::SinglePartition` on its build
+/// (left) child, so the distribution phase puts a `CoalescePartitionsExec` on top of a
+/// multi-partition build side. The sort-parallelization phase (`parallelize_sorts`) must
+/// not take that coalesce back out again.
+///
+/// It used to, because `remove_bottleneck_in_subplan` removed a coalesce found at
+/// `children[0]` positionally, without consulting the parent's distribution requirement for
+/// that child. The result was a build side left multi-partition with nothing to re-enforce
+/// distribution afterwards, which `SanityCheckPlan` rejected with "does not satisfy
+/// distribution requirements: SinglePartition".
+///
+/// Cherry-picked from apache/datafusion#23948.
+#[test]
+fn test_collect_left_join_keeps_build_side_coalesce() -> Result<()> {
+    let schema = create_test_schema2()?;
+    let build = repartition_exec(parquet_exec(schema));
+    let plan = collect_left_plan_before_parallelize_sorts(build, JoinType::Left)?;
+
+    let ctx = PlanWithCorrespondingCoalescePartitions::new_default(plan);
+    let rewritten = ctx.transform_up(parallelize_sorts).data()?.plan;
+
+    // The build-side coalesce is retained; the probe-side one is still removed, which is
+    // the parallelization this phase exists for.
+    assert_snapshot!(displayable(rewritten.as_ref()).indent(true).to_string(), @r"
+    CoalescePartitionsExec
+      HashJoinExec: mode=CollectLeft, join_type=Left, on=[(col_a@0, col_a@0)]
+        CoalescePartitionsExec
+          RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+            DataSourceExec: file_groups={1 group: [[x]]}, projection=[col_a, col_b], file_type=parquet
+        RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+          DataSourceExec: file_groups={1 group: [[x]]}, projection=[col_a, col_b], file_type=parquet
+    ");
+
+    Ok(())
+}
+
+/// The same removal, with a build side that is already hash-partitioned on the join key
+/// rather than round-robin partitioned. This is the shape a `JoinSelection` input swap
+/// leaves behind (a `CollectLeft` join reported as `join_type=Right`) when the build
+/// subtree is the output of an aggregate or a partitioned join: the build side satisfies
+/// the join's *hash* requirement but still not `SinglePartition`, so the coalesce is just
+/// as load-bearing.
+///
+/// Cherry-picked from apache/datafusion#23948.
+#[test]
+fn test_collect_left_join_keeps_hash_partitioned_build_side_coalesce() -> Result<()> {
+    let schema = create_test_schema2()?;
+    let build: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
+        parquet_exec(schema),
+        Partitioning::Hash(vec![Arc::new(Column::new("col_a", 0))], 10),
+    )?);
+    let plan = collect_left_plan_before_parallelize_sorts(build, JoinType::Right)?;
+
+    let ctx = PlanWithCorrespondingCoalescePartitions::new_default(plan);
+    let rewritten = ctx.transform_up(parallelize_sorts).data()?.plan;
+
+    assert_snapshot!(displayable(rewritten.as_ref()).indent(true).to_string(), @r"
+    CoalescePartitionsExec
+      HashJoinExec: mode=CollectLeft, join_type=Right, on=[(col_a@0, col_a@0)]
+        CoalescePartitionsExec
+          RepartitionExec: partitioning=Hash([col_a@0], 10), input_partitions=1
+            DataSourceExec: file_groups={1 group: [[x]]}, projection=[col_a, col_b], file_type=parquet
+        RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+          DataSourceExec: file_groups={1 group: [[x]]}, projection=[col_a, col_b], file_type=parquet
+    ");
+
+    Ok(())
+}
