@@ -28,7 +28,7 @@
 //!
 //! [`GroupValuesColumn`] can only be used when *every* column of the group-by
 //! key has a [`GroupColumn`] implementation; otherwise the whole aggregation
-//! falls back to the row-wise [`GroupValuesRows`], which is materially slower
+//! falls back to the row-wise `GroupValuesRows`, which is materially slower
 //! and heavier for the columns that *would* have qualified for the column-wise
 //! fast path. By providing a generic fallback `GroupColumn`, a schema like
 //! `GROUP BY int_col, struct_col` keeps `int_col` on its fast native builder
@@ -41,10 +41,9 @@
 //! raw input columns via `create_hashes`, which already supports nested types.
 //! Equality is decided here by comparing arrow-row bytes. For the two to agree
 //! on group identity, values that this column considers equal must hash equal —
-//! see the float `-0.0` / `NaN` note on [`RowsGroupColumn`].
+//! see the float `-0.0` / `NaN` note on [`RowsGroupColumn`] below.
 //!
 //! [`GroupValuesColumn`]: crate::aggregates::group_values::multi_group_by::GroupValuesColumn
-//! [`GroupValuesRows`]: crate::aggregates::group_values::GroupValuesRows
 
 use crate::aggregates::group_values::multi_group_by::GroupColumn;
 use crate::aggregates::group_values::row::encode_array_if_necessary;
@@ -70,11 +69,9 @@ use datafusion_common::{DataFusionError, Result};
 /// encoding, which treats `-0.0` and `+0.0` as distinct and canonicalizes
 /// `NaN`. Because hashing is performed separately (on the raw input array), a
 /// caller must ensure the two agree — e.g. by normalizing `-0.0 → +0.0` on the
-/// input columns before hashing when a float leaf is present (as
-/// [`GroupValuesRows`] does). See the module docs.
+/// input columns before hashing when a float leaf is present. See the module docs.
 ///
 /// [row format]: arrow::row
-/// [`GroupValuesRows`]: crate::aggregates::group_values::GroupValuesRows
 pub struct RowsGroupColumn {
     /// Single-field row converter for this column's data type.
     row_converter: RowConverter,

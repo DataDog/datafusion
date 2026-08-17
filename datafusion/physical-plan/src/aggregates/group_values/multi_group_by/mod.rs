@@ -36,10 +36,13 @@ use crate::aggregates::group_values::multi_group_by::{
 };
 use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
 use arrow::datatypes::{
-    BinaryViewType, DataType, Date32Type, Date64Type, Decimal128Type, Field, Float32Type,
-    Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, Schema, SchemaRef,
-    StringViewType, Time32MillisecondType, Time32SecondType, Time64MicrosecondType,
-    Time64NanosecondType, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
+    BinaryViewType, DataType, Date32Type, Date64Type, Decimal128Type, Decimal256Type,
+    DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType,
+    DurationSecondType, Field, Float16Type, Float32Type, Float64Type, Int8Type,
+    Int16Type, Int32Type, Int64Type, IntervalDayTimeType, IntervalMonthDayNanoType,
+    IntervalUnit, IntervalYearMonthType, Schema, SchemaRef, StringViewType,
+    Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
+    TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
     TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type, UInt32Type,
     UInt64Type,
 };
@@ -959,9 +962,11 @@ fn group_column_supported_type(data_type: &DataType) -> bool {
             | DataType::UInt16
             | DataType::UInt32
             | DataType::UInt64
+            | DataType::Float16
             | DataType::Float32
             | DataType::Float64
             | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
             | DataType::Utf8
             | DataType::LargeUtf8
             | DataType::Binary
@@ -983,6 +988,8 @@ fn group_column_supported_type(data_type: &DataType) -> bool {
             | DataType::Time64(TimeUnit::Microsecond)
             | DataType::Time64(TimeUnit::Nanosecond)
             | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+            | DataType::Interval(_)
             | DataType::Utf8View
             | DataType::BinaryView
             | DataType::Boolean
@@ -1017,6 +1024,9 @@ fn make_group_column(field: &Field) -> Result<Box<dyn GroupColumn>> {
         DataType::UInt16 => instantiate_primitive!(v, nullable, UInt16Type, data_type),
         DataType::UInt32 => instantiate_primitive!(v, nullable, UInt32Type, data_type),
         DataType::UInt64 => instantiate_primitive!(v, nullable, UInt64Type, data_type),
+        DataType::Float16 => {
+            instantiate_primitive!(v, nullable, Float16Type, data_type)
+        }
         DataType::Float32 => {
             instantiate_primitive!(v, nullable, Float32Type, data_type)
         }
@@ -1065,6 +1075,34 @@ fn make_group_column(field: &Field) -> Result<Box<dyn GroupColumn>> {
         DataType::Decimal128(_, _) => {
             instantiate_primitive!(v, nullable, Decimal128Type, data_type)
         }
+        DataType::Decimal256(_, _) => {
+            instantiate_primitive!(v, nullable, Decimal256Type, data_type)
+        }
+        DataType::Duration(t) => match t {
+            TimeUnit::Second => {
+                instantiate_primitive!(v, nullable, DurationSecondType, data_type)
+            }
+            TimeUnit::Millisecond => {
+                instantiate_primitive!(v, nullable, DurationMillisecondType, data_type)
+            }
+            TimeUnit::Microsecond => {
+                instantiate_primitive!(v, nullable, DurationMicrosecondType, data_type)
+            }
+            TimeUnit::Nanosecond => {
+                instantiate_primitive!(v, nullable, DurationNanosecondType, data_type)
+            }
+        },
+        DataType::Interval(u) => match u {
+            IntervalUnit::YearMonth => {
+                instantiate_primitive!(v, nullable, IntervalYearMonthType, data_type)
+            }
+            IntervalUnit::DayTime => {
+                instantiate_primitive!(v, nullable, IntervalDayTimeType, data_type)
+            }
+            IntervalUnit::MonthDayNano => {
+                instantiate_primitive!(v, nullable, IntervalMonthDayNanoType, data_type)
+            }
+        },
         DataType::Utf8 => {
             v.push(Box::new(ByteGroupValueBuilder::<i32>::new(
                 OutputType::Utf8,
@@ -2090,8 +2128,10 @@ mod tests {
         //   6. Only decrease group indices in non-inlined group index view
         //   7. Erase all things
 
-        let field = Field::new_list_field(DataType::Int32, true);
-        let schema = Arc::new(Schema::new_with_metadata(vec![field], HashMap::new()));
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![] as Vec<Field>,
+            HashMap::new(),
+        ));
         let mut group_values = GroupValuesColumn::<false>::try_new(schema).unwrap();
 
         // Insert group index views and check if success to insert
