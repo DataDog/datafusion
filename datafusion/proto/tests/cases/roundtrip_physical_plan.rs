@@ -880,6 +880,43 @@ fn roundtrip_sort_preserve_partitioning() -> Result<()> {
 }
 
 #[test]
+fn roundtrip_partitioned_file_metadata_size_hint() -> Result<()> {
+    let file = PartitionedFile::new("/path/to/file.parquet".to_string(), 1024)
+        .with_metadata_size_hint(123);
+    let file_schema =
+        Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));
+    let file_source = Arc::new(ParquetSource::new(Arc::clone(&file_schema)));
+    let scan_config =
+        FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), file_source)
+            .with_file_group(FileGroup::new(vec![file]))
+            .build();
+
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let proto_converter = DefaultPhysicalProtoConverter {};
+    let roundtripped = roundtrip_test_and_return(
+        DataSourceExec::from_data_source(scan_config),
+        &ctx,
+        &codec,
+        &proto_converter,
+    )?;
+    let data_source = roundtripped
+        .downcast_ref::<DataSourceExec>()
+        .ok_or_else(|| {
+            internal_datafusion_err!("Expected DataSourceExec after roundtrip")
+        })?;
+    let file_scan = data_source
+        .data_source()
+        .downcast_ref::<FileScanConfig>()
+        .ok_or_else(|| {
+            internal_datafusion_err!("Expected FileScanConfig after roundtrip")
+        })?;
+
+    assert_eq!(file_scan.file_groups[0][0].metadata_size_hint, Some(123));
+    Ok(())
+}
+
+#[test]
 fn roundtrip_coalesce_batches_with_fetch() -> Result<()> {
     let field_a = Field::new("a", DataType::Boolean, false);
     let field_b = Field::new("b", DataType::Int64, false);

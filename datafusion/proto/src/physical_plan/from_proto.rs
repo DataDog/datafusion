@@ -788,6 +788,14 @@ impl TryFrom<&protobuf::PartitionedFile> for PartitionedFile {
         if let Some(proto_stats) = val.statistics.as_ref() {
             pf = pf.with_statistics(Arc::new(proto_stats.try_into()?));
         }
+        if let Some(metadata_size_hint) = val.metadata_size_hint {
+            let metadata_size_hint = usize::try_from(metadata_size_hint).map_err(|_| {
+                proto_error(format!(
+                    "Parquet metadata size hint {metadata_size_hint} cannot be represented as usize"
+                ))
+            })?;
+            pf = pf.with_metadata_size_hint(metadata_size_hint);
+        }
         Ok(pf)
     }
 }
@@ -939,6 +947,7 @@ mod tests {
             partition_values: vec![],
             range: None,
             statistics: None,
+            metadata_size_hint: None,
         };
 
         let err = PartitionedFile::try_from(&proto).unwrap_err();

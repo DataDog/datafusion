@@ -663,6 +663,7 @@ impl TryFrom<&PartitionedFile> for protobuf::PartitionedFile {
                 .collect::<Result<Vec<_>, _>>()?,
             range: pf.range.as_ref().map(|r| r.try_into()).transpose()?,
             statistics: pf.statistics.as_ref().map(|s| s.as_ref().into()),
+            metadata_size_hint: pf.metadata_size_hint.map(|v| v as u64),
         })
     }
 }

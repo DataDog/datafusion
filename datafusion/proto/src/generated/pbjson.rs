@@ -15545,6 +15545,9 @@ impl serde::Serialize for PartitionedFile {
         if self.statistics.is_some() {
             len += 1;
         }
+        if self.metadata_size_hint.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.PartitionedFile", len)?;
         if !self.path.is_empty() {
             struct_ser.serialize_field("path", &self.path)?;
@@ -15568,6 +15571,11 @@ impl serde::Serialize for PartitionedFile {
         if let Some(v) = self.statistics.as_ref() {
             struct_ser.serialize_field("statistics", v)?;
         }
+        if let Some(v) = self.metadata_size_hint.as_ref() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("metadataSizeHint", ToString::to_string(&v).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -15586,6 +15594,8 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
             "partitionValues",
             "range",
             "statistics",
+            "metadata_size_hint",
+            "metadataSizeHint",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -15596,6 +15606,7 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
             PartitionValues,
             Range,
             Statistics,
+            MetadataSizeHint,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -15623,6 +15634,7 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
                             "partitionValues" | "partition_values" => Ok(GeneratedField::PartitionValues),
                             "range" => Ok(GeneratedField::Range),
                             "statistics" => Ok(GeneratedField::Statistics),
+                            "metadataSizeHint" | "metadata_size_hint" => Ok(GeneratedField::MetadataSizeHint),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -15648,6 +15660,7 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
                 let mut partition_values__ = None;
                 let mut range__ = None;
                 let mut statistics__ = None;
+                let mut metadata_size_hint__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Path => {
@@ -15690,6 +15703,14 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
                             }
                             statistics__ = map_.next_value()?;
                         }
+                        GeneratedField::MetadataSizeHint => {
+                            if metadata_size_hint__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("metadataSizeHint"));
+                            }
+                            metadata_size_hint__ = 
+                                map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| x.0)
+                            ;
+                        }
                     }
                 }
                 Ok(PartitionedFile {
@@ -15699,6 +15720,7 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
                     partition_values: partition_values__.unwrap_or_default(),
                     range: range__,
                     statistics: statistics__,
+                    metadata_size_hint: metadata_size_hint__,
                 })
             }
         }
