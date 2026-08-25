@@ -69,18 +69,31 @@ pub trait ExprSchemable {
     -> Result<(DataType, bool)>;
 }
 
-/// Derives the output field for a cast expression from the source field.
+/// Derives the output field for a cast expression from the source and target
+/// fields. Type-only casts preserve source metadata, while an explicit target
+/// field supplies its own metadata.
+///
 /// For `TryCast`, `force_nullable` is `true` since a failed cast returns NULL.
 fn cast_output_field(
     source_field: &FieldRef,
-    target_type: &DataType,
+    target_field: &FieldRef,
     force_nullable: bool,
 ) -> Arc<Field> {
+    // `Cast::new` and `TryCast::new` use this field when only a target
+    // type is known. In that case, retain the source field's metadata.
+    let type_only_target = target_field.name().is_empty()
+        && target_field.is_nullable()
+        && target_field.metadata().is_empty();
+    let metadata = if type_only_target {
+        source_field.metadata().clone()
+    } else {
+        target_field.metadata().clone()
+    };
     let mut f = source_field
         .as_ref()
         .clone()
-        .with_data_type(target_type.clone())
-        .with_metadata(source_field.metadata().clone());
+        .with_data_type(target_field.data_type().clone())
+        .with_metadata(metadata);
     if force_nullable {
         f = f.with_nullable(true);
     }
@@ -602,20 +615,16 @@ impl ExprSchemable for Expr {
                 func.return_field_from_args(args)
             }
             // _ => Ok((self.get_type(schema)?, self.nullable(schema)?)),
-            Expr::Cast(Cast { expr, field }) => {
-                expr.to_field(schema).map(|(_table_ref, src)| {
-                    cast_output_field(&src, field.data_type(), false)
-                })
-            }
+            Expr::Cast(Cast { expr, field }) => expr
+                .to_field(schema)
+                .map(|(_table_ref, src)| cast_output_field(&src, field, false)),
             Expr::Placeholder(Placeholder {
                 id: _,
                 field: Some(field),
             }) => Ok(Arc::clone(field).renamed(&schema_name)),
-            Expr::TryCast(TryCast { expr, field }) => {
-                expr.to_field(schema).map(|(_table_ref, src)| {
-                    cast_output_field(&src, field.data_type(), true)
-                })
-            }
+            Expr::TryCast(TryCast { expr, field }) => expr
+                .to_field(schema)
+                .map(|(_table_ref, src)| cast_output_field(&src, field, true)),
             Expr::LambdaVariable(LambdaVariable {
                 field: Some(field), ..
             }) => Ok(Arc::clone(field).renamed(&schema_name)),
@@ -1046,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_metadata() {
+    fn test_expr_metadata() -> Result<()> {
         let mut meta = HashMap::new();
         meta.insert("bar".to_string(), "buzz".to_string());
         let meta = FieldMetadata::from(meta);
@@ -1076,6 +1085,30 @@ mod tests {
         // verify to_field method populates metadata
         assert_eq!(meta, expr.metadata(&schema).unwrap());
 
+        // An explicit cast target replaces source metadata. A type-only cast
+        // continues to preserve it.
+        let target_metadata = HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "arrow.uuid".to_string(),
+        )]);
+        let target_field = Arc::new(
+            Field::new("", DataType::FixedSizeBinary(16), true)
+                .with_metadata(target_metadata.clone()),
+        );
+        let cast = Expr::Cast(Cast::new_from_field(
+            Box::new(expr.clone()),
+            Arc::clone(&target_field),
+        ));
+        assert_eq!(cast.to_field(&schema)?.1.metadata(), &target_metadata);
+
+        let try_cast = Expr::TryCast(TryCast::new_from_field(
+            Box::new(expr.clone()),
+            target_field,
+        ));
+        let try_cast_field = try_cast.to_field(&schema)?.1;
+        assert_eq!(try_cast_field.metadata(), &target_metadata);
+        assert!(try_cast_field.is_nullable());
+
         // outer ref constructed by `out_ref_col_with_metadata` should be metadata-preserving
         let outer_ref = out_ref_col_with_metadata(
             DataType::Int32,
@@ -1083,6 +1116,7 @@ mod tests {
             Column::from_name("foo"),
         );
         assert_eq!(meta, outer_ref.metadata(&schema).unwrap());
+        Ok(())
     }
 
     #[test]
