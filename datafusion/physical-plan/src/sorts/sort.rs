@@ -1490,8 +1490,8 @@ mod tests {
         GreedyMemoryPool, MemoryConsumer, MemoryPool,
     };
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion_physical_expr::EquivalenceProperties;
     use datafusion_physical_expr::expressions::{Column, Literal};
-    use datafusion_physical_expr::{DynamicFilterTracking, EquivalenceProperties};
 
     use futures::{FutureExt, Stream, TryStreamExt};
     use insta::assert_snapshot;
@@ -2815,13 +2815,8 @@ mod tests {
     }
 
     fn assert_filter_still_waiting(filter: &Arc<DynamicFilterPhysicalExpr>) {
-        let dynamic_filter_expr: Arc<dyn PhysicalExpr> =
-            Arc::<DynamicFilterPhysicalExpr>::clone(filter);
         assert!(
-            matches!(
-                DynamicFilterTracking::classify(&dynamic_filter_expr),
-                DynamicFilterTracking::Watching(_)
-            ),
+            filter.wait_complete().now_or_never().is_none(),
             "the shared filter should remain watchable until every partition emits"
         );
     }

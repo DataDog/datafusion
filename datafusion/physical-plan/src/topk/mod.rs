@@ -1173,8 +1173,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_schema::SortOptions;
     use datafusion_common::assert_batches_eq;
-    use datafusion_physical_expr::{DynamicFilterTracking, expressions::col};
-    use futures::TryStreamExt;
+    use datafusion_physical_expr::expressions::col;
+    use futures::{FutureExt, TryStreamExt};
 
     /// This test ensures the size calculation is correct for RecordBatches with multiple columns.
     #[test]
@@ -1608,13 +1608,11 @@ mod tests {
         topk_0.insert_batch(batch)?;
         let _results: Vec<_> = topk_0.emit()?.try_collect().await?;
 
-        let dynamic_filter_expr: Arc<dyn PhysicalExpr> =
-            Arc::<DynamicFilterPhysicalExpr>::clone(&dynamic_filter_clone);
         assert!(
-            matches!(
-                DynamicFilterTracking::classify(&dynamic_filter_expr),
-                DynamicFilterTracking::Watching(_)
-            ),
+            dynamic_filter_clone
+                .wait_complete()
+                .now_or_never()
+                .is_none(),
             "the shared filter should remain watchable until every TopK emits"
         );
 
