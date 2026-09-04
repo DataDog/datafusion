@@ -1908,6 +1908,7 @@ SELECT g, approx_distinct(arrow_cast(i, 'Dictionary(Int32, Float64)')) FROM appr
 
 statement ok
 DROP TABLE approx_distinct_group_test;
+
 ## This test executes the APPROX_PERCENTILE_CONT aggregation against the test
 ## data, asserting the estimated quantiles are ±5% their actual values.
 ##
