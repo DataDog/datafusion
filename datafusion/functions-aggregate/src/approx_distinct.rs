@@ -395,6 +395,21 @@ impl AggregateUDFImpl for ApproxDistinct {
             DataType::UInt8 | DataType::Int8 | DataType::UInt16 | DataType::Int16 => {
                 get_small_int_state_field(args.name, data_type)
             }
+            DataType::Dictionary(_, _) if is_supported_type(data_type) => {
+                let value_type = dictionary_value_type(data_type);
+                if is_fixed_domain_type(value_type) {
+                    get_small_int_state_field(args.name, value_type)
+                } else {
+                    Ok(vec![
+                        Field::new(
+                            format_state_name(args.name, "hll_registers"),
+                            DataType::Binary,
+                            false,
+                        )
+                        .into(),
+                    ])
+                }
+            }
             _ => Ok(vec![
                 Field::new(
                     format_state_name(args.name, "hll_registers"),
@@ -448,6 +463,11 @@ impl AggregateUDFImpl for ApproxDistinct {
             DataType::Utf8View => Box::new(StringViewHLLAccumulator::new()),
             DataType::Binary => Box::new(BinaryHLLAccumulator::<i32>::new()),
             DataType::LargeBinary => Box::new(BinaryHLLAccumulator::<i64>::new()),
+            DataType::Dictionary(_, _) if is_supported_type(data_type) => {
+                let value_type = dictionary_value_type(data_type).clone();
+                let inner = make_approx_distinct_accumulator(&value_type)?;
+                Box::new(DictionaryAccumulator { inner, value_type })
+            }
             DataType::Null => {
                 Box::new(NoopAccumulator::new(ScalarValue::UInt64(Some(0))))
             }
@@ -462,5 +482,186 @@ impl AggregateUDFImpl for ApproxDistinct {
 
     fn documentation(&self) -> Option<&Documentation> {
         self.doc()
+    }
+}
+
+#[derive(Debug)]
+struct DictionaryAccumulator {
+    inner: Box<dyn Accumulator>,
+    value_type: DataType,
+}
+
+impl Accumulator for DictionaryAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        let plain = arrow::compute::cast(&values[0], &self.value_type)?;
+        self.inner.update_batch(&[plain])
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        self.inner.evaluate()
+    }
+
+    fn size(&self) -> usize {
+        self.inner.size()
+    }
+
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        self.inner.state()
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        self.inner.merge_batch(states)
+    }
+}
+
+fn make_approx_distinct_accumulator(
+    data_type: &DataType,
+) -> Result<Box<dyn Accumulator>> {
+    match data_type {
+        DataType::UInt8 | DataType::Int8 | DataType::UInt16 | DataType::Int16 => {
+            get_small_int_approx_accumulator(data_type)
+        }
+        DataType::UInt32 => Ok(Box::new(NumericHLLAccumulator::<UInt32Type>::new())),
+        DataType::UInt64 => Ok(Box::new(NumericHLLAccumulator::<UInt64Type>::new())),
+        DataType::Int32 => Ok(Box::new(NumericHLLAccumulator::<Int32Type>::new())),
+        DataType::Int64 => Ok(Box::new(NumericHLLAccumulator::<Int64Type>::new())),
+        DataType::Date32 => Ok(Box::new(NumericHLLAccumulator::<Date32Type>::new())),
+        DataType::Date64 => Ok(Box::new(NumericHLLAccumulator::<Date64Type>::new())),
+        DataType::Time32(TimeUnit::Second) => {
+            Ok(Box::new(NumericHLLAccumulator::<Time32SecondType>::new()))
+        }
+        DataType::Time32(TimeUnit::Millisecond) => Ok(Box::new(NumericHLLAccumulator::<
+            Time32MillisecondType,
+        >::new())),
+        DataType::Time64(TimeUnit::Microsecond) => Ok(Box::new(NumericHLLAccumulator::<
+            Time64MicrosecondType,
+        >::new())),
+        DataType::Time64(TimeUnit::Nanosecond) => Ok(Box::new(NumericHLLAccumulator::<
+            Time64NanosecondType,
+        >::new())),
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            Ok(Box::new(NumericHLLAccumulator::<TimestampSecondType>::new()))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Ok(Box::new(
+            NumericHLLAccumulator::<TimestampMillisecondType>::new(),
+        )),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(Box::new(
+            NumericHLLAccumulator::<TimestampMicrosecondType>::new(),
+        )),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(Box::new(
+            NumericHLLAccumulator::<TimestampNanosecondType>::new(),
+        )),
+        DataType::Utf8 => Ok(Box::new(StringHLLAccumulator::<i32>::new())),
+        DataType::LargeUtf8 => Ok(Box::new(StringHLLAccumulator::<i64>::new())),
+        DataType::Utf8View => Ok(Box::new(StringViewHLLAccumulator::new())),
+        DataType::Binary => Ok(Box::new(BinaryHLLAccumulator::<i32>::new())),
+        DataType::LargeBinary => Ok(Box::new(BinaryHLLAccumulator::<i64>::new())),
+        DataType::Null => {
+            Ok(Box::new(NoopAccumulator::new(ScalarValue::UInt64(Some(0)))))
+        }
+        other => not_impl_err!(
+            "Support for 'approx_distinct' for data type {other} is not implemented"
+        ),
+    }
+}
+
+fn is_fixed_domain_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::UInt8 | DataType::Int8 | DataType::UInt16 | DataType::Int16
+    )
+}
+
+fn is_supported_type(data_type: &DataType) -> bool {
+    let value_type = dictionary_value_type(data_type);
+    matches!(value_type, DataType::Null)
+        || is_fixed_domain_type(value_type)
+        || is_hll_groups_type(value_type)
+}
+
+fn dictionary_value_type(data_type: &DataType) -> &DataType {
+    let mut value_type = data_type;
+    while let DataType::Dictionary(_, inner) = value_type {
+        value_type = inner;
+    }
+    value_type
+}
+
+fn is_hll_groups_type(data_type: &DataType) -> bool {
+    if matches!(data_type, DataType::Dictionary(_, _)) {
+        return is_supported_type(data_type);
+    }
+
+    matches!(
+        data_type,
+        DataType::UInt32
+            | DataType::UInt64
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(TimeUnit::Second)
+            | DataType::Time32(TimeUnit::Millisecond)
+            | DataType::Time64(TimeUnit::Microsecond)
+            | DataType::Time64(TimeUnit::Nanosecond)
+            | DataType::Timestamp(TimeUnit::Second, _)
+            | DataType::Timestamp(TimeUnit::Millisecond, _)
+            | DataType::Timestamp(TimeUnit::Microsecond, _)
+            | DataType::Timestamp(TimeUnit::Nanosecond, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dictionary_support() {
+        for value_type in [
+            DataType::UInt8,
+            DataType::Int8,
+            DataType::UInt16,
+            DataType::Int16,
+            DataType::Int64,
+            DataType::Null,
+            DataType::Utf8,
+            DataType::Binary,
+        ] {
+            let dict_type = DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(value_type.clone()),
+            );
+            assert!(is_hll_groups_type(&dict_type));
+        }
+
+        // Nested dictionaries resolve to the innermost value
+        assert!(is_hll_groups_type(&DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Utf8)
+            ))
+        )));
+
+        // Unsupported value types are rejected
+        for value_type in [DataType::Float16, DataType::Float32, DataType::Float64] {
+            let dict_type = DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(value_type.clone()),
+            );
+            let nested_dict_type = DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(dict_type.clone()),
+            );
+            assert!(!is_hll_groups_type(&value_type));
+            assert!(!is_supported_type(&dict_type));
+            assert!(!is_hll_groups_type(&dict_type));
+            assert!(!is_hll_groups_type(&nested_dict_type));
+        }
     }
 }
