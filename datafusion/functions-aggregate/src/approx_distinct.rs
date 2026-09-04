@@ -400,12 +400,14 @@ impl AggregateUDFImpl for ApproxDistinct {
                 if is_fixed_domain_type(value_type) {
                     get_small_int_state_field(args.name, value_type)
                 } else {
-                    Ok(vec![Field::new(
-                        format_state_name(args.name, "hll_registers"),
-                        DataType::Binary,
-                        false,
-                    )
-                    .into()])
+                    Ok(vec![
+                        Field::new(
+                            format_state_name(args.name, "hll_registers"),
+                            DataType::Binary,
+                            false,
+                        )
+                        .into(),
+                    ])
                 }
             }
             _ => Ok(vec![
@@ -512,7 +514,9 @@ impl Accumulator for DictionaryAccumulator {
     }
 }
 
-fn make_approx_distinct_accumulator(data_type: &DataType) -> Result<Box<dyn Accumulator>> {
+fn make_approx_distinct_accumulator(
+    data_type: &DataType,
+) -> Result<Box<dyn Accumulator>> {
     match data_type {
         DataType::UInt8 | DataType::Int8 | DataType::UInt16 | DataType::Int16 => {
             get_small_int_approx_accumulator(data_type)
@@ -526,27 +530,27 @@ fn make_approx_distinct_accumulator(data_type: &DataType) -> Result<Box<dyn Accu
         DataType::Time32(TimeUnit::Second) => {
             Ok(Box::new(NumericHLLAccumulator::<Time32SecondType>::new()))
         }
-        DataType::Time32(TimeUnit::Millisecond) => {
-            Ok(Box::new(NumericHLLAccumulator::<Time32MillisecondType>::new()))
-        }
-        DataType::Time64(TimeUnit::Microsecond) => {
-            Ok(Box::new(NumericHLLAccumulator::<Time64MicrosecondType>::new()))
-        }
-        DataType::Time64(TimeUnit::Nanosecond) => {
-            Ok(Box::new(NumericHLLAccumulator::<Time64NanosecondType>::new()))
-        }
+        DataType::Time32(TimeUnit::Millisecond) => Ok(Box::new(NumericHLLAccumulator::<
+            Time32MillisecondType,
+        >::new())),
+        DataType::Time64(TimeUnit::Microsecond) => Ok(Box::new(NumericHLLAccumulator::<
+            Time64MicrosecondType,
+        >::new())),
+        DataType::Time64(TimeUnit::Nanosecond) => Ok(Box::new(NumericHLLAccumulator::<
+            Time64NanosecondType,
+        >::new())),
         DataType::Timestamp(TimeUnit::Second, _) => {
             Ok(Box::new(NumericHLLAccumulator::<TimestampSecondType>::new()))
         }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            Ok(Box::new(NumericHLLAccumulator::<TimestampMillisecondType>::new()))
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            Ok(Box::new(NumericHLLAccumulator::<TimestampMicrosecondType>::new()))
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            Ok(Box::new(NumericHLLAccumulator::<TimestampNanosecondType>::new()))
-        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Ok(Box::new(
+            NumericHLLAccumulator::<TimestampMillisecondType>::new(),
+        )),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(Box::new(
+            NumericHLLAccumulator::<TimestampMicrosecondType>::new(),
+        )),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(Box::new(
+            NumericHLLAccumulator::<TimestampNanosecondType>::new(),
+        )),
         DataType::Utf8 => Ok(Box::new(StringHLLAccumulator::<i32>::new())),
         DataType::LargeUtf8 => Ok(Box::new(StringHLLAccumulator::<i64>::new())),
         DataType::Utf8View => Ok(Box::new(StringViewHLLAccumulator::new())),
