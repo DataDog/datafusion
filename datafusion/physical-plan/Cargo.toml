@@ -155,3 +155,7 @@ name = "bounded_window"
 [[bench]]
 harness = false
 name = "ordered_group_values"
+
+[[bench]]
+harness = false
+name = "range_repartition"
