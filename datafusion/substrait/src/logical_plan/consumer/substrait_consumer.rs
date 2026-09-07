@@ -23,17 +23,20 @@ use super::{
     from_substrait_rex, from_window_function,
 };
 use crate::extensions::Extensions;
-use crate::logical_plan::consumer::{from_lambda, from_substrait_type_without_names};
+use crate::logical_plan::consumer::{
+    field_from_substrait_type_without_names, from_lambda,
+};
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion::arrow::datatypes::{DataType, FieldRef};
 use datafusion::catalog::TableProvider;
+use datafusion::common::datatype::FieldExt;
 use datafusion::common::{
     DFSchema, ScalarValue, TableReference, not_impl_err, substrait_err,
 };
 use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::logical_expr::expr::LambdaVariable;
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use substrait::proto::expression as substrait_expression;
 use substrait::proto::expression::{
@@ -403,8 +406,9 @@ pub trait SubstraitConsumer: Send + Sync + Sized {
             .r#type
             .as_ref()
             .map(|t| {
-                from_substrait_type_without_names(self, t)
-                    .map(|dt| Arc::new(Field::new(&id, dt, true)))
+                super::from_substrait_type_without_names(self, t).map(|dt| {
+                    Arc::new(datafusion::arrow::datatypes::Field::new(&id, dt, true))
+                })
             })
             .transpose()?;
         Ok(Expr::Placeholder(
@@ -494,6 +498,28 @@ pub trait SubstraitConsumer: Send + Sync + Sized {
             "Missing handler for user-defined type: {}",
             user_defined_type.type_reference
         )
+    }
+
+    /// Optional Arrow field metadata for a Substrait type.
+    ///
+    /// Arrow cannot represent some Substrait types natively. A user-defined
+    /// "json" type, for example, becomes a plain `DataType::Utf8`, which loses
+    /// the fact that the values are JSON. A consumer can return metadata here
+    /// to keep the original type recoverable from the Arrow schema.
+    ///
+    /// The consumer sees the whole [`Type`], so it can key the metadata off a
+    /// user-defined type, a type variation, or anything else it recognizes.
+    /// The metadata is attached to the Arrow [`Field`] built for this type,
+    /// including a type nested inside a list, map, or struct.
+    ///
+    /// The default attaches nothing.
+    ///
+    /// [`Field`]: datafusion::arrow::datatypes::Field
+    fn consume_type_metadata(
+        &self,
+        _typ: &Type,
+    ) -> datafusion::common::Result<Option<HashMap<String, String>>> {
+        Ok(None)
     }
 
     fn consume_user_defined_literal(
@@ -724,7 +750,7 @@ impl DefaultSubstraitLambdaConsumer {
     ) -> datafusion::common::Result<Vec<String>> {
         let mut inner = self.inner.write().unwrap();
 
-        let lambda_parameters: Vec<FieldRef> = lambda_parameters
+        let lambda_parameters = lambda_parameters
             .iter()
             .map(|ty| {
                 let (assigned_number, default_name) =
@@ -732,8 +758,8 @@ impl DefaultSubstraitLambdaConsumer {
 
                 inner.next_lambda_parameter = assigned_number + 1;
 
-                let data_type = from_substrait_type_without_names(consumer, ty)?;
-                Ok(Arc::new(Field::new(default_name, data_type, true)))
+                Ok(field_from_substrait_type_without_names(consumer, ty)?
+                    .renamed(&default_name))
             })
             .collect::<datafusion::common::Result<Vec<_>>>()?;
 
