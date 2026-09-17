@@ -666,8 +666,10 @@ pub(crate) fn build_projection_read_plan(
         root_indices.sort_unstable();
         root_indices.dedup();
 
-        let projection_mask =
-            ProjectionMask::roots(schema_descr, root_indices.iter().copied());
+        let projection_mask = ProjectionMask::roots(
+            schema_descr,
+            without_virtual_columns(&root_indices, file_schema),
+        );
 
         let projected_schema = Arc::new(
             file_schema
@@ -716,8 +718,10 @@ pub(crate) fn build_projection_read_plan(
     }
 
     let leaf_indices = {
-        let mut out =
-            leaf_indices_for_roots(all_root_indices.iter().copied(), schema_descr);
+        let mut out = leaf_indices_for_roots(
+            without_virtual_columns(&all_root_indices, file_schema),
+            schema_descr,
+        );
         let struct_leaf_indices =
             resolve_struct_field_leaves(&all_struct_accesses, file_schema, schema_descr);
 

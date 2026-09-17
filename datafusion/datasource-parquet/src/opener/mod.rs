@@ -74,7 +74,7 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::parquet_column;
 use parquet::basic::Type;
 use parquet::bloom_filter::Sbbf;
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 
 /// Stateless Parquet morselizer implementation.
 ///
@@ -712,6 +712,9 @@ impl PreparedParquetOpen {
             self.file_metrics
                 .files_ranges_pruned_statistics
                 .add_pruned(1);
+            MetricBuilder::new(&self.metrics)
+                .counter("files_prepared", self.partition_index)
+                .add(1);
             return Ok(None);
         }
 
@@ -1150,6 +1153,8 @@ impl RowGroupsPrunedParquetOpen {
             );
         }
 
+        prepared.record_scan_footprint(&access_plan, &file_metadata)?;
+
         // Prepare access plans, then apply row-group ordering tweaks per
         // run. Two composable steps:
         //
@@ -1297,6 +1302,58 @@ impl RowGroupsPrunedParquetOpen {
         } else {
             Ok(stream)
         }
+    }
+}
+
+impl PreparedParquetOpen {
+    /// Records the column-chunk footprint after metadata pruning, before data reads.
+    /// Chunk sizes include pages that row selections or decoding can subsequently avoid.
+    fn record_scan_footprint(
+        &self,
+        access_plan: &ParquetAccessPlan,
+        metadata: &ParquetMetaData,
+    ) -> Result<()> {
+        let read_plan = build_projection_read_plan(
+            self.projection
+                .expr_iter()
+                .chain(self.predicate.iter().cloned()),
+            &self.physical_file_schema,
+            metadata.file_metadata().schema_descr(),
+        );
+        let mut row_groups = 0;
+        let mut column_bytes = 0usize;
+        for index in access_plan.row_group_index_iter() {
+            row_groups += 1;
+            for (column_index, column) in
+                metadata.row_group(index).columns().iter().enumerate()
+            {
+                if read_plan.projection_mask.leaf_included(column_index) {
+                    let bytes =
+                        usize::try_from(column.compressed_size()).map_err(|_| {
+                            datafusion_common::DataFusionError::Execution(
+                                "invalid compressed column-chunk size".to_owned(),
+                            )
+                        })?;
+                    column_bytes = column_bytes.checked_add(bytes).ok_or_else(|| {
+                        datafusion_common::DataFusionError::Execution(
+                            "retained column-chunk size overflow".to_owned(),
+                        )
+                    })?;
+                }
+            }
+        }
+        for (name, value) in [
+            ("files_prepared", 1),
+            ("files_retained", usize::from(row_groups != 0)),
+            ("row_groups_retained", row_groups),
+            ("column_chunk_bytes_retained", column_bytes),
+        ] {
+            MetricBuilder::new(&self.metrics)
+                .with_new_label("filename", self.file_name.clone())
+                .counter(name, self.partition_index)
+                .add(value);
+        }
+        Ok(())
     }
 }
 
@@ -1708,6 +1765,73 @@ mod test {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn scan_footprint_is_available_before_reading_data() -> Result<()> {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch = record_batch!(
+            ("value", Int64, vec![1, 2, 3, 4]),
+            ("filter", Int64, vec![0, 0, 10, 10]),
+            ("unused", Int64, vec![100, 200, 300, 400])
+        )?;
+        let schema = batch.schema();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let size = write_parquet_batches(
+            Arc::clone(&store),
+            "footprint.parquet",
+            vec![batch],
+            Some(props),
+        )
+        .await;
+        let bytes = store
+            .get(&Path::from("footprint.parquet"))
+            .await?
+            .bytes()
+            .await?;
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                bytes,
+            )?;
+        let expected_bytes: usize = reader.metadata().row_group(1).columns()[..2]
+            .iter()
+            .map(|column| column.compressed_size() as usize)
+            .sum();
+        let predicate = logical2physical(&col("filter").gt(lit(5_i64)), &schema);
+        let morselizer = ParquetMorselizerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(schema)
+            .with_projection_indices(&[0])
+            .with_predicate(predicate)
+            .with_row_group_stats_pruning(true)
+            .build();
+        let stream = open_file(
+            &morselizer,
+            PartitionedFile::new("footprint.parquet".to_owned(), size as u64),
+        )
+        .await?;
+        let metrics = morselizer.metrics.clone_inner();
+        assert_eq!(metrics.sum_by_name("files_prepared").unwrap().as_usize(), 1);
+        assert_eq!(metrics.sum_by_name("files_retained").unwrap().as_usize(), 1);
+        assert_eq!(
+            metrics
+                .sum_by_name("row_groups_retained")
+                .unwrap()
+                .as_usize(),
+            1
+        );
+        assert_eq!(metrics.sum_by_name("bytes_scanned").unwrap().as_usize(), 0);
+        assert_eq!(
+            metrics
+                .sum_by_name("column_chunk_bytes_retained")
+                .unwrap()
+                .as_usize(),
+            expected_bytes
+        );
+        drop(stream);
+        Ok(())
     }
 
     /// The mechanism `_residual`-avoidance needs: a reader-produced column that stays aligned with
