@@ -332,6 +332,13 @@ impl ParquetSource {
         }
     }
 
+    /// Set the metrics for this source. Cloned task variants can use separate sets
+    /// when their scans are prepared independently in the same process.
+    pub fn with_metrics(mut self, metrics: ExecutionPlanMetricsSet) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Set the `TableParquetOptions` for this ParquetSource.
     pub fn with_table_parquet_options(
         mut self,
