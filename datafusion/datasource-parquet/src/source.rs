@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::DefaultParquetFileReaderFactory;
 use crate::ParquetFileReaderFactory;
+use crate::ParquetMetricSet;
 use crate::opener::ParquetMorselizer;
 use crate::opener::build_pruning_predicates;
 use crate::opener::build_virtual_columns_state;
@@ -312,6 +313,162 @@ pub struct ParquetSource {
     /// Sort order driving `PreparedAccessPlan::reorder_by_statistics`
     /// in the opener.
     sort_order_for_reorder: Option<LexOrdering>,
+    /// Runtime identity shared by configured clones of this source.
+    pub(crate) runtime_identity: Arc<()>,
+}
+
+/// Partition-scoped state for deriving configured Parquet morselizers.
+///
+/// Compact mode allocates one native metric bundle when the context is created.
+/// Verbose mode allocates one filename-labelled bundle in [`Self::prepare_file`].
+/// Each resulting file context shares its bundle across preflight work and all
+/// morselizers derived for pieces of that file preparation.
+#[derive(Debug)]
+pub struct ParquetMorselizerContext {
+    args: FileSourceArgs,
+    partition: usize,
+    runtime_identity: Arc<()>,
+    compact_metric_set: Option<ParquetMetricSet>,
+}
+
+impl ParquetMorselizerContext {
+    fn validate_source(&self, source: &ParquetSource) -> datafusion_common::Result<()> {
+        if !Arc::ptr_eq(&self.runtime_identity, &source.runtime_identity) {
+            return datafusion_common::internal_err!(
+                "Parquet morselizer context belongs to a different source"
+            );
+        }
+        Ok(())
+    }
+
+    /// Prepare native state for one original file.
+    ///
+    /// Reuse the returned [`ParquetFileContext`] for preflight metadata and
+    /// every piece of this one file preparation. In verbose mode each call
+    /// allocates a separate filename-labelled metric bundle, even for the same
+    /// filename, so re-preparing per piece or per preflight inflates verbose
+    /// cardinality. Compact mode shares one partition bundle regardless of
+    /// how many times a file is prepared.
+    pub fn prepare_file(
+        &self,
+        source: &ParquetSource,
+        file: &datafusion_datasource::PartitionedFile,
+    ) -> datafusion_common::Result<ParquetFileContext> {
+        self.validate_source(source)?;
+        let metric_set = self.compact_metric_set.clone().unwrap_or_else(|| {
+            ParquetMetricSet::new(
+                self.partition,
+                file.object_meta.location.as_ref(),
+                &source.metrics,
+            )
+        });
+        Ok(ParquetFileContext {
+            args: self.args.clone(),
+            partition: self.partition,
+            runtime_identity: Arc::clone(&self.runtime_identity),
+            metric_set,
+            object_meta: file.object_meta.clone(),
+            arrow_schema: file.arrow_schema.clone(),
+            metadata_size_hint: file.metadata_size_hint.or(source.metadata_size_hint),
+        })
+    }
+}
+
+/// Parquet-native state owned by one original file preparation.
+///
+/// Compatible pieces may differ in range and extensions, but must retain the
+/// original object version and Arrow schema. Contexts and preloaded metadata are
+/// runtime-only and are not part of serialized scan configuration.
+#[derive(Debug)]
+pub struct ParquetFileContext {
+    args: FileSourceArgs,
+    partition: usize,
+    runtime_identity: Arc<()>,
+    metric_set: ParquetMetricSet,
+    object_meta: object_store::ObjectMeta,
+    arrow_schema: Option<arrow_schema::SchemaRef>,
+    metadata_size_hint: Option<usize>,
+}
+
+impl ParquetFileContext {
+    fn validate_source(&self, source: &ParquetSource) -> datafusion_common::Result<()> {
+        if !Arc::ptr_eq(&self.runtime_identity, &source.runtime_identity) {
+            return datafusion_common::internal_err!(
+                "Parquet file context belongs to a different source"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_file(
+        &self,
+        file: &datafusion_datasource::PartitionedFile,
+    ) -> datafusion_common::Result<()> {
+        if self.object_meta != file.object_meta || self.arrow_schema != file.arrow_schema
+        {
+            return datafusion_common::internal_err!(
+                "Parquet file context does not match the file object version and Arrow schema"
+            );
+        }
+        Ok(())
+    }
+
+    /// Derive a fully configured morselizer sharing this file's native metrics.
+    pub fn create_morselizer(
+        &self,
+        source: &ParquetSource,
+    ) -> datafusion_common::Result<Box<dyn Morselizer>> {
+        self.validate_source(source)?;
+        source.create_morselizer_with_metric_set(
+            &self.args,
+            self.partition,
+            Some(self.metric_set.clone()),
+        )
+    }
+
+    /// Return native metric handles for metadata work performed before opening.
+    pub fn file_metrics(
+        &self,
+        source: &ParquetSource,
+    ) -> datafusion_common::Result<ParquetMetricSet> {
+        self.validate_source(source)?;
+        Ok(self.metric_set.clone())
+    }
+
+    /// Return the effective metadata-size hint selected when this file was
+    /// prepared. The per-file hint takes precedence over the source-level
+    /// fallback (`file.metadata_size_hint.or(source.metadata_size_hint)`).
+    pub fn metadata_size_hint(&self) -> Option<usize> {
+        self.metadata_size_hint
+    }
+
+    /// Attach metadata loaded for this object version to a compatible file piece.
+    ///
+    /// Callers must time the completed metadata fetch with [`Self::file_metrics`].
+    /// The opener reconstructs its reader metadata with the piece's configured
+    /// options and does not charge that same fetch again.
+    pub fn with_file_metadata(
+        &self,
+        source: &ParquetSource,
+        file: datafusion_datasource::PartitionedFile,
+        metadata: Arc<parquet::file::metadata::ParquetMetaData>,
+    ) -> datafusion_common::Result<datafusion_datasource::PartitionedFile> {
+        self.validate_source(source)?;
+        self.validate_file(&file)?;
+        Ok(file.with_extension(PreloadedParquetMetadata {
+            runtime_identity: Arc::clone(&self.runtime_identity),
+            object_meta: self.object_meta.clone(),
+            arrow_schema: self.arrow_schema.clone(),
+            metadata,
+        }))
+    }
+}
+
+pub(crate) struct PreloadedParquetMetadata {
+    pub(crate) runtime_identity: Arc<()>,
+    pub(crate) object_meta: object_store::ObjectMeta,
+    pub(crate) arrow_schema: Option<arrow_schema::SchemaRef>,
+    pub(crate) metadata: Arc<parquet::file::metadata::ParquetMetaData>,
 }
 
 impl ParquetSource {
@@ -338,6 +495,7 @@ impl ParquetSource {
             encryption_factory: None,
             reverse_row_groups: false,
             sort_order_for_reorder: None,
+            runtime_identity: Arc::new(()),
         }
     }
 
@@ -514,6 +672,116 @@ impl ParquetSource {
     pub(crate) fn reverse_row_groups(&self) -> bool {
         self.reverse_row_groups
     }
+
+    /// Create partition-scoped runtime state for deriving Parquet morselizers.
+    ///
+    /// Ordinary scans should continue to use [`FileSource::create_morselizer`].
+    pub fn create_morselizer_context(
+        &self,
+        args: &FileSourceArgs,
+        partition: usize,
+    ) -> datafusion_common::Result<ParquetMorselizerContext> {
+        let compact_metric_set = (args.metrics_cardinality
+            == MetricsCardinality::Compact)
+            .then(|| ParquetMetricSet::new_compact(partition, &self.metrics));
+        Ok(ParquetMorselizerContext {
+            args: args.clone(),
+            partition,
+            runtime_identity: Arc::clone(&self.runtime_identity),
+            compact_metric_set,
+        })
+    }
+
+    fn create_morselizer_with_metric_set(
+        &self,
+        args: &FileSourceArgs,
+        partition: usize,
+        prepared_metric_set: Option<ParquetMetricSet>,
+    ) -> datafusion_common::Result<Box<dyn Morselizer>> {
+        let expr_adapter_factory = args
+            .expr_adapter_factory
+            .clone()
+            .unwrap_or_else(|| Arc::new(DefaultPhysicalExprAdapterFactory) as _);
+
+        let parquet_file_reader_factory =
+            self.parquet_file_reader_factory.clone().unwrap_or_else(|| {
+                Arc::new(DefaultParquetFileReaderFactory::new(Arc::clone(
+                    &args.object_store,
+                ))) as _
+            });
+
+        #[cfg(feature = "parquet_encryption")]
+        let file_decryption_properties = self
+            .table_parquet_options()
+            .crypto
+            .file_decryption
+            .clone()
+            .map(FileDecryptionProperties::try_from)
+            .transpose()?
+            .map(Arc::new);
+
+        let coerce_int96 = self
+            .table_parquet_options
+            .global
+            .coerce_int96
+            .as_ref()
+            .map(|time_unit| parse_coerce_int96_string(time_unit.as_str()).unwrap());
+        let coerce_int96_tz = self
+            .table_parquet_options
+            .global
+            .coerce_int96_tz
+            .as_ref()
+            .map(|tz| parse_coerce_int96_tz_string(tz))
+            .transpose()?;
+        if coerce_int96_tz.is_some() && coerce_int96.is_none() {
+            warn!(
+                "coerce_int96_tz is set but coerce_int96 is not; the timezone will be ignored"
+            );
+        }
+
+        // Validate morselizer-level virtual-column state once per derived
+        // configuration. Predicates reference virtual columns only when row
+        // filtering remains above the scan.
+        let virtual_state = build_virtual_columns_state(
+            self.table_schema.virtual_columns(),
+            self.table_schema.file_schema(),
+            self.predicate.as_ref(),
+            self.pushdown_filters(),
+        )?;
+
+        Ok(Box::new(ParquetMorselizer {
+            partition_index: partition,
+            projection: self.projection.clone(),
+            batch_size: args.batch_size,
+            limit: args.limit,
+            preserve_order: args.preserve_order,
+            predicate: self.predicate.clone(),
+            table_schema: self.table_schema.clone(),
+            metadata_size_hint: self.metadata_size_hint,
+            metrics: self.metrics().clone(),
+            prepared_metric_set,
+            parquet_file_reader_factory,
+            pushdown_filters: self.pushdown_filters(),
+            reorder_filters: self.reorder_filters(),
+            force_filter_selections: self.force_filter_selections(),
+            enable_page_index: self.enable_page_index(),
+            enable_bloom_filter: self.bloom_filter_on_read(),
+            enable_row_group_stats_pruning: self.table_parquet_options.global.pruning,
+            coerce_int96,
+            coerce_int96_tz,
+            #[cfg(feature = "parquet_encryption")]
+            file_decryption_properties,
+            expr_adapter_factory,
+            #[cfg(feature = "parquet_encryption")]
+            encryption_factory: self.get_encryption_factory_with_config(),
+            max_predicate_cache_size: self.max_predicate_cache_size(),
+            max_in_list_size: self.max_in_list_size(),
+            reverse_row_groups: self.reverse_row_groups,
+            sort_order_for_reorder: self.sort_order_for_reorder.clone(),
+            runtime_identity: Arc::clone(&self.runtime_identity),
+            virtual_state,
+        }))
+    }
 }
 
 /// Parses datafusion.common.config.ParquetOptions.coerce_int96 String to a arrow_schema.datatype.TimeUnit
@@ -570,98 +838,10 @@ impl FileSource for ParquetSource {
         args: &FileSourceArgs,
         partition: usize,
     ) -> datafusion_common::Result<Box<dyn Morselizer>> {
-        let expr_adapter_factory = args
-            .expr_adapter_factory
-            .clone()
-            .unwrap_or_else(|| Arc::new(DefaultPhysicalExprAdapterFactory) as _);
-
-        let parquet_file_reader_factory =
-            self.parquet_file_reader_factory.clone().unwrap_or_else(|| {
-                Arc::new(DefaultParquetFileReaderFactory::new(Arc::clone(
-                    &args.object_store,
-                ))) as _
-            });
-
-        #[cfg(feature = "parquet_encryption")]
-        let file_decryption_properties = self
-            .table_parquet_options()
-            .crypto
-            .file_decryption
-            .clone()
-            .map(FileDecryptionProperties::try_from)
-            .transpose()?
-            .map(Arc::new);
-
-        let coerce_int96 = self
-            .table_parquet_options
-            .global
-            .coerce_int96
-            .as_ref()
-            .map(|time_unit| parse_coerce_int96_string(time_unit.as_str()).unwrap());
-        let coerce_int96_tz = self
-            .table_parquet_options
-            .global
-            .coerce_int96_tz
-            .as_ref()
-            .map(|tz| parse_coerce_int96_tz_string(tz))
-            .transpose()?;
-        if coerce_int96_tz.is_some() && coerce_int96.is_none() {
-            warn!(
-                "coerce_int96_tz is set but coerce_int96 is not; the timezone will be ignored"
-            );
-        }
-
-        // Validate virtual columns (extension-type allowlist) and, when
-        // pushdown is enabled, reject predicates that reference them. Both
-        // checks depend only on morselizer-level state, so we pay their cost
-        // once per scan partition rather than per file.
-        //
-        // Gating predicate validation on `pushdown_filters` is deliberate:
-        // when pushdown is off the predicate stays above the scan as a
-        // `FilterExec` and resolves virtual columns there; the row-filter
-        // ban only applies to the pushdown path.
-        let virtual_state = build_virtual_columns_state(
-            self.table_schema.virtual_columns(),
-            self.table_schema.file_schema(),
-            self.predicate.as_ref(),
-            self.pushdown_filters(),
-        )?;
-
-        let metrics = self.metrics().clone();
-        let compact_metric_set = (args.metrics_cardinality
+        let prepared_metric_set = (args.metrics_cardinality
             == MetricsCardinality::Compact)
-            .then(|| crate::ParquetMetricSet::new_compact(partition, &metrics));
-        Ok(Box::new(ParquetMorselizer {
-            partition_index: partition,
-            projection: self.projection.clone(),
-            batch_size: args.batch_size,
-            limit: args.limit,
-            preserve_order: args.preserve_order,
-            predicate: self.predicate.clone(),
-            table_schema: self.table_schema.clone(),
-            metadata_size_hint: self.metadata_size_hint,
-            metrics,
-            compact_metric_set,
-            parquet_file_reader_factory,
-            pushdown_filters: self.pushdown_filters(),
-            reorder_filters: self.reorder_filters(),
-            force_filter_selections: self.force_filter_selections(),
-            enable_page_index: self.enable_page_index(),
-            enable_bloom_filter: self.bloom_filter_on_read(),
-            enable_row_group_stats_pruning: self.table_parquet_options.global.pruning,
-            coerce_int96,
-            coerce_int96_tz,
-            #[cfg(feature = "parquet_encryption")]
-            file_decryption_properties,
-            expr_adapter_factory,
-            #[cfg(feature = "parquet_encryption")]
-            encryption_factory: self.get_encryption_factory_with_config(),
-            max_predicate_cache_size: self.max_predicate_cache_size(),
-            max_in_list_size: self.max_in_list_size(),
-            reverse_row_groups: self.reverse_row_groups,
-            sort_order_for_reorder: self.sort_order_for_reorder.clone(),
-            virtual_state,
-        }))
+            .then(|| ParquetMetricSet::new_compact(partition, &self.metrics));
+        self.create_morselizer_with_metric_set(args, partition, prepared_metric_set)
     }
 
     fn reorder_files(
@@ -1276,6 +1456,164 @@ mod tests {
             ParquetSource::new(Arc::new(Schema::empty())).with_predicate(predicate);
         // same value. but filter() call Arc::clone internally
         assert_eq!(parquet_source.predicate(), parquet_source.filter().as_ref());
+    }
+
+    #[test]
+    fn morselizer_context_isolates_compact_partitions() {
+        use datafusion_common::config::MetricsCardinality;
+        use datafusion_datasource::PartitionedFile;
+        use object_store::memory::InMemory;
+
+        let source = ParquetSource::new(Arc::new(Schema::empty()));
+        let args = FileSourceArgs::new(Arc::new(InMemory::new()), 1024)
+            .with_metrics_cardinality(MetricsCardinality::Compact);
+        let file = PartitionedFile::new("compact.parquet", 100);
+        let partition_zero = source.create_morselizer_context(&args, 0).unwrap();
+        let first = partition_zero.prepare_file(&source, &file).unwrap();
+        let registrations = source.metrics.clone_inner().iter().count();
+        let second = partition_zero.prepare_file(&source, &file).unwrap();
+        assert_eq!(source.metrics.clone_inner().iter().count(), registrations);
+
+        first.file_metrics(&source).unwrap().add_bytes_scanned(3);
+        second.file_metrics(&source).unwrap().add_bytes_scanned(5);
+        assert_eq!(
+            first.file_metrics(&source).unwrap().bytes_scanned.value(),
+            8
+        );
+
+        let partition_one = source.create_morselizer_context(&args, 1).unwrap();
+        let other = partition_one.prepare_file(&source, &file).unwrap();
+        assert!(source.metrics.clone_inner().iter().count() > registrations);
+        other.file_metrics(&source).unwrap().add_bytes_scanned(13);
+        assert_eq!(
+            first.file_metrics(&source).unwrap().bytes_scanned.value(),
+            8
+        );
+        assert_eq!(
+            other.file_metrics(&source).unwrap().bytes_scanned.value(),
+            13
+        );
+    }
+
+    #[test]
+    fn morselizer_context_scopes_verbose_metrics_to_file_preparation() {
+        use datafusion_common::config::MetricsCardinality;
+        use datafusion_datasource::PartitionedFile;
+        use object_store::memory::InMemory;
+
+        let source = ParquetSource::new(Arc::new(Schema::empty()));
+        let args = FileSourceArgs::new(Arc::new(InMemory::new()), 1024)
+            .with_metrics_cardinality(MetricsCardinality::Verbose);
+        let context = source.create_morselizer_context(&args, 2).unwrap();
+        let first_file = PartitionedFile::new("first.parquet", 100);
+        let second_file = PartitionedFile::new("second.parquet", 100);
+        let first = context.prepare_file(&source, &first_file).unwrap();
+        let after_first = source.metrics.clone_inner().iter().count();
+
+        let first_morselizer = first.create_morselizer(&source).unwrap();
+        let _first_live_planner = first_morselizer.plan_file(first_file.clone()).unwrap();
+        let _second_live_planner = first
+            .create_morselizer(&source)
+            .unwrap()
+            .plan_file(first_file.clone())
+            .unwrap();
+        assert_eq!(source.metrics.clone_inner().iter().count(), after_first);
+
+        let second = context.prepare_file(&source, &second_file).unwrap();
+        let after_second = source.metrics.clone_inner().iter().count();
+        assert!(after_second > after_first);
+        first.file_metrics(&source).unwrap().add_bytes_scanned(3);
+        second.file_metrics(&source).unwrap().add_bytes_scanned(5);
+        assert_eq!(
+            first.file_metrics(&source).unwrap().bytes_scanned.value(),
+            3
+        );
+        assert_eq!(
+            second.file_metrics(&source).unwrap().bytes_scanned.value(),
+            5
+        );
+        let rendered = source
+            .metrics
+            .clone_inner()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(rendered.contains("filename=first.parquet"), "{rendered}");
+        assert!(rendered.contains("filename=second.parquet"), "{rendered}");
+    }
+
+    #[test]
+    fn morselizer_context_accepts_configured_clones_and_rejects_unrelated_sources() {
+        use datafusion_common::config::MetricsCardinality;
+        use datafusion_datasource::PartitionedFile;
+        use object_store::memory::InMemory;
+
+        let source = ParquetSource::new(Arc::new(Schema::empty()))
+            .with_metadata_size_hint(4096)
+            .with_reverse_row_groups(true);
+        let args = FileSourceArgs::new(Arc::new(InMemory::new()), 1024)
+            .with_metrics_cardinality(MetricsCardinality::Compact);
+        let context = source.create_morselizer_context(&args, 0).unwrap();
+        let file = PartitionedFile::new("configured.parquet", 100);
+        let prepared = context.prepare_file(&source, &file).unwrap();
+        let configured_clone = source
+            .clone()
+            .with_predicate(lit(true))
+            .with_metadata_size_hint(8192);
+        let morselizer = prepared.create_morselizer(&configured_clone).unwrap();
+        let _live_planner = morselizer.plan_file(file.clone()).unwrap();
+        assert_eq!(prepared.metadata_size_hint(), Some(4096));
+
+        let replacement = source.create_morselizer_context(&args, 0).unwrap();
+        let replacement_file = replacement.prepare_file(&source, &file).unwrap();
+        prepared.file_metrics(&source).unwrap().add_bytes_scanned(3);
+        replacement_file
+            .file_metrics(&source)
+            .unwrap()
+            .add_bytes_scanned(5);
+        assert_eq!(
+            prepared
+                .file_metrics(&source)
+                .unwrap()
+                .bytes_scanned
+                .value(),
+            3
+        );
+        assert_eq!(
+            replacement_file
+                .file_metrics(&source)
+                .unwrap()
+                .bytes_scanned
+                .value(),
+            5
+        );
+
+        let unrelated = ParquetSource::new(Arc::new(Schema::empty()));
+        assert!(context.prepare_file(&unrelated, &file).is_err());
+        assert!(prepared.create_morselizer(&unrelated).is_err());
+    }
+
+    #[test]
+    fn morselizer_file_context_applies_file_hint_before_source_hint() {
+        use datafusion_common::config::MetricsCardinality;
+        use datafusion_datasource::PartitionedFile;
+        use object_store::memory::InMemory;
+
+        let source =
+            ParquetSource::new(Arc::new(Schema::empty())).with_metadata_size_hint(4096);
+        let args = FileSourceArgs::new(Arc::new(InMemory::new()), 1024)
+            .with_metrics_cardinality(MetricsCardinality::Compact);
+        let context = source.create_morselizer_context(&args, 0).unwrap();
+        let fallback = context
+            .prepare_file(&source, &PartitionedFile::new("fallback.parquet", 100))
+            .unwrap();
+        assert_eq!(fallback.metadata_size_hint(), Some(4096));
+
+        let override_file =
+            PartitionedFile::new("override.parquet", 100).with_metadata_size_hint(2048);
+        let overridden = context.prepare_file(&source, &override_file).unwrap();
+        assert_eq!(overridden.metadata_size_hint(), Some(2048));
     }
 
     #[test]
