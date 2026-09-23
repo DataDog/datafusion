@@ -99,6 +99,7 @@ use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::TryStreamExt;
 use parking_lot::Mutex;
 
+use super::dictionary::compact_dictionary_payloads;
 use super::partitioned_hash_eval::SeededRandomState;
 
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
@@ -117,6 +118,7 @@ fn try_create_array_map(
     perfect_hash_join_small_build_threshold: usize,
     perfect_hash_join_min_key_density: f64,
     null_equality: NullEquality,
+    metrics: &BuildProbeJoinMetrics,
 ) -> Result<Option<(ArrayMap, RecordBatch, Vec<ArrayRef>)>> {
     if on_left.len() != 1 {
         return Ok(None);
@@ -182,7 +184,11 @@ fn try_create_array_map(
     let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, num_row);
     reservation.try_grow(mem_size)?;
 
-    let batch = concat_batches(schema, batches)?;
+    let batch = compact_dictionary_payloads(
+        concat_batches(schema, batches)?,
+        reservation,
+        metrics,
+    )?;
     let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
     let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
@@ -2310,6 +2316,7 @@ async fn collect_left_input(
             config.execution.perfect_hash_join_small_build_threshold,
             config.execution.perfect_hash_join_min_key_density,
             null_equality,
+            &metrics,
         )? {
             array_map_created_count.add(1);
             metrics.build_mem_used.add(array_map.size());
@@ -2362,7 +2369,11 @@ async fn collect_left_input(
             }
 
             // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
+            let batch = compact_dictionary_payloads(
+                concat_batches(&schema, batches_iter.clone())?,
+                &reservation,
+                &metrics,
+            )?;
 
             let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
 
@@ -2482,10 +2493,11 @@ mod tests {
     };
 
     use arrow::array::{
-        Date32Array, Int32Array, Int64Array, StructArray, UInt32Array, UInt64Array,
+        Date32Array, DictionaryArray, Int32Array, Int64Array, StringArray, StructArray,
+        UInt32Array, UInt64Array,
     };
     use arrow::buffer::NullBuffer;
-    use arrow::datatypes::{DataType, Field};
+    use arrow::datatypes::{DataType, Field, Int32Type};
     use datafusion_common::hash_utils::create_hashes;
     use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
     use datafusion_common::{
@@ -2927,6 +2939,155 @@ mod tests {
         let metrics = join.metrics().unwrap();
 
         Ok((columns, batches, metrics))
+    }
+
+    #[tokio::test]
+    async fn join_compacts_dictionary_payloads_without_reordering_rows() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("left_id", DataType::Int32, false),
+            Field::new(
+                "tag",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+        let mut left_batches = Vec::new();
+        for (start, values) in [(1, vec!["red", "blue"]), (7, vec!["blue", "red"])] {
+            let tags = DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 1, 0, 1, 0, 1]),
+                Arc::new(StringArray::from(values)),
+            )?;
+            left_batches.push(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(start..start + 6)),
+                    Arc::new(tags),
+                ],
+            )?);
+        }
+        let left: Arc<dyn ExecutionPlan> =
+            TestMemoryExec::try_new_exec(&[left_batches], schema, None)?;
+        let right_schema = Arc::new(Schema::new(vec![Field::new(
+            "right_id",
+            DataType::Int32,
+            false,
+        )]));
+        let right_batch = RecordBatch::try_new(
+            Arc::clone(&right_schema),
+            vec![Arc::new(Int32Array::from(vec![2, 8, 99]))],
+        )?;
+        let right: Arc<dyn ExecutionPlan> =
+            TestMemoryExec::try_new_exec(&[vec![right_batch]], right_schema, None)?;
+        for perfect_hash in [false, true] {
+            let on = vec![(
+                Arc::new(Column::new_with_schema("left_id", &left.schema())?) as _,
+                Arc::new(Column::new_with_schema("right_id", &right.schema())?) as _,
+            )];
+            let (_, batches, metrics) = join_collect(
+                Arc::clone(&left),
+                Arc::clone(&right),
+                on,
+                &JoinType::Inner,
+                NullEquality::NullEqualsNothing,
+                prepare_task_ctx(8192, perfect_hash),
+            )
+            .await?;
+            assert_batches_eq!(
+                [
+                    "+---------+------+----------+",
+                    "| left_id | tag  | right_id |",
+                    "+---------+------+----------+",
+                    "| 2       | blue | 2        |",
+                    "| 8       | red  | 8        |",
+                    "+---------+------+----------+",
+                ],
+                &batches
+            );
+            assert_eq!(
+                metrics
+                    .sum_by_name("build_dictionary_values_deduplicated")
+                    .unwrap()
+                    .as_usize(),
+                2
+            );
+            assert_phj_used(&metrics, perfect_hash);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_compacts_dictionary_keys_across_batches() -> Result<()> {
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("build_tag", dictionary_type.clone(), false),
+        ]));
+        let mut left_batches = Vec::new();
+        for (start, values) in [(1, vec!["red", "blue"]), (4, vec!["blue", "red"])] {
+            let tags = DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 1, 0]),
+                Arc::new(StringArray::from(values)),
+            )?;
+            left_batches.push(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(start..start + 3)),
+                    Arc::new(tags),
+                ],
+            )?);
+        }
+        let left: Arc<dyn ExecutionPlan> =
+            TestMemoryExec::try_new_exec(&[left_batches], schema, None)?;
+        let probe_tags = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![2, 1, 0]),
+            Arc::new(StringArray::from(vec!["missing", "blue", "red"])),
+        )?;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "probe_tag",
+            dictionary_type,
+            false,
+        )]));
+        let right_batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(probe_tags)])?;
+        let right: Arc<dyn ExecutionPlan> =
+            TestMemoryExec::try_new_exec(&[vec![right_batch]], schema, None)?;
+        let on = vec![(
+            Arc::new(Column::new_with_schema("build_tag", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("probe_tag", &right.schema())?) as _,
+        )];
+        let (_, batches, metrics) = join_collect(
+            left,
+            right,
+            on,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            prepare_task_ctx(8192, false),
+        )
+        .await?;
+        assert_batches_sorted_eq!(
+            [
+                "+----+-----------+-----------+",
+                "| id | build_tag | probe_tag |",
+                "+----+-----------+-----------+",
+                "| 1  | red       | red       |",
+                "| 2  | blue      | blue      |",
+                "| 3  | red       | red       |",
+                "| 4  | blue      | blue      |",
+                "| 5  | red       | red       |",
+                "| 6  | blue      | blue      |",
+                "+----+-----------+-----------+",
+            ],
+            &batches
+        );
+        assert_eq!(
+            metrics
+                .sum_by_name("build_dictionary_values_deduplicated")
+                .unwrap()
+                .as_usize(),
+            2
+        );
+        Ok(())
     }
 
     #[apply(hash_join_exec_configs)]

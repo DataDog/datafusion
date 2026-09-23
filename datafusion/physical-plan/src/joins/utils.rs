@@ -1761,6 +1761,8 @@ pub(crate) struct BuildProbeJoinMetrics {
     pub(crate) build_input_batches: metrics::Count,
     /// Number of rows consumed by build-side
     pub(crate) build_input_rows: metrics::Count,
+    /// Repeated build-side dictionary values removed after concatenation
+    pub(crate) build_dictionary_values_deduplicated: metrics::Count,
     /// Memory used by build-side in bytes
     pub(crate) build_mem_used: metrics::Gauge,
     /// Total time for joining probe-side batches to the build-side batches
@@ -1810,6 +1812,10 @@ impl BuildProbeJoinMetrics {
             .with_category(MetricCategory::Rows)
             .counter("build_input_rows", partition);
 
+        let build_dictionary_values_deduplicated = MetricBuilder::new(metrics)
+            .with_category(MetricCategory::Rows)
+            .counter("build_dictionary_values_deduplicated", partition);
+
         let build_mem_used =
             MetricBuilder::new(metrics).peak_memory_usage("build_mem_used", partition);
 
@@ -1833,6 +1839,7 @@ impl BuildProbeJoinMetrics {
             build_time,
             build_input_batches,
             build_input_rows,
+            build_dictionary_values_deduplicated,
             build_mem_used,
             join_time,
             input_batches,
