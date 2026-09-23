@@ -17,10 +17,11 @@
 
 use std::mem;
 
-use arrow::array::ArrayRef;
+use arrow::array::{ArrayRef, AsArray};
+use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
-use arrow_ord::partition::partition;
-use datafusion_common::{Result, not_impl_err};
+use arrow_ord::cmp::distinct;
+use datafusion_common::{Result, exec_datafusion_err, internal_err, not_impl_err};
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::EmitTo;
 
@@ -29,10 +30,11 @@ use crate::aggregates::group_values::GroupValues;
 
 /// Columnar group keys for input fully ordered by all grouping expressions.
 ///
-/// Equal keys must be contiguous across input batches. Within a batch Arrow's
-/// partition kernel finds those runs. Only the first run can continue the last
-/// buffered group; compare it with the stored columns, without retaining the
-/// input batch. New group representatives use the existing column builders.
+/// Equal keys must be contiguous across input batches. An adjacent-key boundary
+/// bitmap finds the runs without materializing ranges. Only the first run can
+/// continue the last buffered group; compare it with the stored columns, without
+/// retaining the input batch. New group representatives use the existing column
+/// builders.
 ///
 /// This removes hashing and hash-table storage, but does not change the dense
 /// group-id or emission contracts. In particular, `First(n)` shifts the remaining
@@ -91,10 +93,26 @@ impl GroupValuesOrdered {
 impl GroupValues for GroupValuesOrdered {
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
         groups.clear();
-        let ranges = partition(cols)?.ranges();
-        if ranges.is_empty() {
+        let Some(first) = cols.first() else {
+            return internal_err!("Ordered grouping requires at least one column");
+        };
+        let num_rows = first.len();
+        if cols.iter().any(|column| column.len() != num_rows) {
+            return internal_err!("Ordered grouping columns have different row counts");
+        }
+        if num_rows == 0 {
             return Ok(());
         }
+
+        let boundaries = if num_rows == 1 {
+            BooleanBuffer::new_unset(0)
+        } else {
+            let mut boundaries = adjacent_distinct(first)?;
+            for column in &cols[1..] {
+                boundaries = &boundaries | &adjacent_distinct(column)?;
+            }
+            boundaries
+        };
 
         let old_len = self.len();
         let continues = old_len > 0
@@ -105,19 +123,23 @@ impl GroupValues for GroupValuesOrdered {
                 .all(|(stored, input)| stored.equal_to(old_len - 1, input, 0));
 
         self.new_groups.clear();
-        self.new_groups.extend(
-            ranges
-                .iter()
-                .skip(usize::from(continues))
-                .map(|range| range.start),
-        );
+        if !continues {
+            self.new_groups.push(0);
+        }
+        groups.try_reserve(num_rows).map_err(|e| {
+            exec_datafusion_err!("failed to reserve {num_rows} group IDs: {e}")
+        })?;
+        let mut group_id = old_len - usize::from(continues);
+        for boundary in boundaries.set_indices() {
+            let next_start = boundary + 1;
+            groups.resize(next_start, group_id);
+            self.new_groups.push(next_start);
+            group_id += 1;
+        }
+        groups.resize(num_rows, group_id);
+
         for (stored, input) in self.columns.iter_mut().zip(cols) {
             stored.vectorized_append(input, &self.new_groups)?;
-        }
-
-        let first_group = old_len - usize::from(continues);
-        for (index, range) in ranges.iter().enumerate() {
-            groups.resize(range.end, first_group + index);
         }
         Ok(())
     }
@@ -161,6 +183,25 @@ impl GroupValues for GroupValuesOrdered {
         self.new_groups.clear();
         self.new_groups.shrink_to(num_rows);
     }
+}
+
+// Bit i means that rows i and i + 1 differ. The caller passes a nonempty column,
+// and the schema gate admits Arrow distinct-supported types. Arrow's fallback
+// keeps adjacent nulls equal, independent of sort direction or array offsets.
+fn adjacent_distinct(column: &ArrayRef) -> Result<BooleanBuffer> {
+    let length = column.len() - 1;
+    if column.null_count() == 0
+        && matches!(column.data_type(), DataType::FixedSizeBinary(16))
+    {
+        // Constant-width equality avoids a dynamic slice comparison per row.
+        let (values, _) = column.as_fixed_size_binary().value_data().as_chunks::<16>();
+        return Ok(BooleanBuffer::collect_bool(length, |index| {
+            values[index] != values[index + 1]
+        }));
+    }
+    let left = column.slice(0, length);
+    let right = column.slice(1, length);
+    Ok(distinct(&left, &right)?.values().clone())
 }
 
 #[cfg(test)]
@@ -370,6 +411,50 @@ mod tests {
                 assert!(ordered.is_empty());
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_grouping_starts_a_group_when_any_key_changes() -> Result<()> {
+        let zero = [0_u8; 16];
+        let mut low_half = zero;
+        low_half[15] = 1;
+        let mut high_half = low_half;
+        high_half[0] = 1;
+        let input: Vec<ArrayRef> = vec![
+            Arc::new(FixedSizeBinaryArray::try_from_iter(
+                [
+                    zero, zero, zero, zero, low_half, high_half, high_half, high_half,
+                    high_half,
+                ]
+                .into_iter(),
+            )?),
+            Arc::new(TimestampNanosecondArray::from(vec![
+                None,
+                None,
+                None,
+                Some(30),
+                Some(30),
+                Some(30),
+                Some(30),
+                Some(60),
+                Some(60),
+            ])),
+            Arc::new(Int32Array::from(vec![0, 0, 1, 1, 1, 1, 1, 1, 2])),
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("handle", DataType::FixedSizeBinary(16), false),
+            Field::new(
+                "bucket",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+            Field::new("category", DataType::Int32, false),
+        ]));
+        let mut ordered = GroupValuesOrdered::try_new(schema)?;
+        let mut groups = Vec::new();
+        ordered.intern(&input, &mut groups)?;
+        assert_eq!(groups, [0, 0, 1, 2, 3, 4, 4, 5, 6]);
         Ok(())
     }
 

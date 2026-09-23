@@ -131,7 +131,7 @@ fn grouping(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(1));
     for kind in [KeyKind::Integer, KeyKind::String, KeyKind::Metrics] {
         for batch_size in [127, 8192] {
-            for run_length in [1, 8, 128, 8192] {
+            for run_length in [1, 3, 8, 128, 8192] {
                 let (schema, batches) = inputs(run_length, batch_size, kind);
                 let case = format!("{}_batch{batch_size}_run{run_length}", kind.name());
                 let (hashed_bytes, selected_bytes) = check_case(&schema, &batches);
@@ -285,7 +285,7 @@ fn aggregation(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(250));
     group.measurement_time(Duration::from_secs(1));
     for kind in [KeyKind::Integer, KeyKind::String, KeyKind::Metrics] {
-        for run_length in [1, 8, 128, 8192] {
+        for run_length in [1, 3, 8, 128, 8192] {
             let (schema, keys) = inputs(run_length, 8192, kind);
             let plan = aggregate_plan(&schema, keys, kind);
             let name = format!("{}_run{run_length}", kind.name());
