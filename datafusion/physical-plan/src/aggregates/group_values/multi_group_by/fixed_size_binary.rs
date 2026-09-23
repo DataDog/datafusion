@@ -188,8 +188,20 @@ impl GroupColumn for FixedSizeBinaryGroupValueBuilder {
 
             Nulls::None => {
                 self.nulls.append_n(rows.len(), false);
-                for &row in rows {
-                    self.buffer.extend_from_slice(arr.value(row));
+                if self.byte_width == 16 {
+                    // One fixed-width gather avoids a dynamic memcpy and Vec length
+                    // update for every representative, including sparse selections.
+                    let start = self.buffer.len();
+                    self.buffer.resize(start + reserve_bytes, 0);
+                    let (source, _) = arr.value_data().as_chunks::<16>();
+                    let (destination, _) = self.buffer[start..].as_chunks_mut::<16>();
+                    for (value, &row) in destination.iter_mut().zip(rows) {
+                        *value = source[row];
+                    }
+                } else {
+                    for &row in rows {
+                        self.buffer.extend_from_slice(arr.value(row));
+                    }
                 }
                 self.len += rows.len();
             }
@@ -441,6 +453,39 @@ mod tests {
         assert!(results[2]);
         assert!(results[3]);
         assert!(results[4]);
+    }
+
+    #[test]
+    fn fixed_16_gather_preserves_sliced_repeated_rows_and_existing_nulls() {
+        let input = make_array(
+            vec![
+                Some(b"0000000000000000".as_slice()),
+                Some(b"aaaaaaaaBBBBBBBB".as_slice()),
+                Some(b"ccccccccDDDDDDDD".as_slice()),
+                Some(b"eeeeeeeeFFFFFFFF".as_slice()),
+            ],
+            16,
+        )
+        .slice(1, 3);
+        let mut builder = FixedSizeBinaryGroupValueBuilder::new(16);
+        builder.append_val(&make_array(vec![None], 16), 0).unwrap();
+        builder.vectorized_append(&input, &[2, 0, 2]).unwrap();
+        builder.vectorized_append(&input, &[]).unwrap();
+        assert_eq!(builder.len(), 4);
+        assert_eq!(
+            &builder.take_n(2),
+            &make_array(vec![None, Some(b"eeeeeeeeFFFFFFFF".as_slice())], 16)
+        );
+        assert_eq!(
+            &Box::new(builder).build(),
+            &make_array(
+                vec![
+                    Some(b"aaaaaaaaBBBBBBBB".as_slice()),
+                    Some(b"eeeeeeeeFFFFFFFF".as_slice()),
+                ],
+                16,
+            )
+        );
     }
 
     #[test]

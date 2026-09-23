@@ -232,9 +232,8 @@ where
 
             (true, Nulls::None) => {
                 self.nulls.append_n(rows.len(), false);
-                for &row in rows {
-                    self.group_values.push(arr.value(row).canonicalize());
-                }
+                self.group_values
+                    .extend(rows.iter().map(|&row| arr.value(row).canonicalize()));
             }
 
             (true, Nulls::All) => {
@@ -244,9 +243,8 @@ where
             }
 
             (false, _) => {
-                for &row in rows {
-                    self.group_values.push(arr.value(row).canonicalize());
-                }
+                self.group_values
+                    .extend(rows.iter().map(|&row| arr.value(row).canonicalize()));
             }
         }
 
