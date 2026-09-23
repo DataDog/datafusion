@@ -18,7 +18,7 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, TimestampSecondArray};
+use arrow::array::{Array, ArrayRef, TimestampNanosecondArray, TimestampSecondArray};
 use arrow::datatypes::Field;
 use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
@@ -67,6 +67,49 @@ fn criterion_benchmark(c: &mut Criterion) {
                 .expect("date_bin should work on valid values"),
             )
         })
+    });
+
+    c.bench_function("date_bin_nanoseconds_8192", |b| {
+        // Ordered five-second samples, as in the captured four-hour metrics batch.
+        let timestamps =
+            TimestampNanosecondArray::from_iter_values((0..8192).map(|index| {
+                1_787_068_800_000_000_000_i64 + (index % 2880) * 5_000_000_000
+            }));
+        let args = vec![
+            ColumnarValue::Scalar(ScalarValue::new_interval_mdn(0, 0, 30_000_000_000)),
+            ColumnarValue::Array(Arc::new(timestamps)),
+            ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
+                Some(1_262_304_000_000_000_000),
+                None,
+            )),
+        ];
+        let arg_fields = args
+            .iter()
+            .map(|arg| Arc::new(Field::new("a", arg.data_type(), true)))
+            .collect::<Vec<_>>();
+        let udf = date_bin();
+        let return_type = udf
+            .return_type(
+                &args
+                    .iter()
+                    .map(ColumnarValue::data_type)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let return_field = Arc::new(Field::new("f", return_type, true));
+        let config_options = Arc::new(ConfigOptions::default());
+        b.iter(|| {
+            black_box(
+                udf.invoke_with_args(ScalarFunctionArgs {
+                    args: args.clone(),
+                    arg_fields: arg_fields.clone(),
+                    number_rows: 8192,
+                    return_field: Arc::clone(&return_field),
+                    config_options: Arc::clone(&config_options),
+                })
+                .expect("date_bin should work on valid nanosecond values"),
+            )
+        });
     });
 }
 

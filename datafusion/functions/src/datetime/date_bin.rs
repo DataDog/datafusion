@@ -591,6 +591,8 @@ fn date_bin_impl(
         }
     };
 
+    let positive_nanos_stride =
+        matches!(&stride, Interval::Nanoseconds(nanos) if *nanos > 0);
     let (stride, stride_fn) = stride.bin_fn();
 
     // Return error if stride is 0
@@ -702,6 +704,22 @@ fn date_bin_impl(
             }
 
             match array.data_type() {
+                Timestamp(Nanosecond, tz_opt) if positive_nanos_stride => {
+                    let array = as_primitive_array::<TimestampNanosecondType>(array)?;
+                    // Select fixed-width binning once for the array, keeping the hot
+                    // loop inline and avoiding errors that are immediately mapped
+                    // to NULL. Preserve each overflow check from the scalar path.
+                    let result: PrimitiveArray<TimestampNanosecondType> = array
+                        .unary_opt(|value| {
+                            let time_diff = value.checked_sub(origin)?;
+                            let time_delta =
+                                time_diff.checked_sub(time_diff.rem_euclid(stride))?;
+                            origin.checked_add(time_delta)
+                        });
+                    ColumnarValue::Array(Arc::new(
+                        result.with_timezone_opt(tz_opt.clone()),
+                    ))
+                }
                 Timestamp(Nanosecond, tz_opt) => {
                     transform_array_with_stride::<TimestampNanosecondType>(
                         origin, stride, stride_fn, array, tz_opt,
@@ -1056,6 +1074,113 @@ mod tests {
             res.err().unwrap().strip_backtrace(),
             "This feature is not implemented: DATE_BIN only supports literal values for the origin argument, not arrays"
         );
+    }
+
+    #[test]
+    fn test_date_bin_fixed_nanos_array_boundaries() {
+        let cases = [
+            // Round down on either side of a nonzero origin, including before epoch.
+            (
+                30,
+                7,
+                vec![
+                    Some(-24),
+                    Some(-23),
+                    Some(6),
+                    Some(7),
+                    Some(36),
+                    Some(37),
+                    None,
+                ],
+                vec![
+                    Some(-53),
+                    Some(-23),
+                    Some(-23),
+                    Some(7),
+                    Some(7),
+                    Some(37),
+                    None,
+                ],
+            ),
+            (
+                30,
+                -7,
+                vec![Some(-38), Some(-37), Some(-8), Some(-7), Some(22), Some(23)],
+                vec![
+                    Some(-67),
+                    Some(-37),
+                    Some(-37),
+                    Some(-7),
+                    Some(-7),
+                    Some(23),
+                ],
+            ),
+            // The captured metrics query uses this nonzero, stride-aligned origin.
+            (
+                30_000_000_000,
+                1_262_304_000_000_000_000,
+                vec![
+                    Some(-1),
+                    Some(1_262_303_999_999_999_999),
+                    Some(1_262_304_000_000_000_000),
+                    Some(1_262_304_030_000_000_000),
+                ],
+                vec![
+                    Some(-30_000_000_000),
+                    Some(1_262_303_970_000_000_000),
+                    Some(1_262_304_000_000_000_000),
+                    Some(1_262_304_030_000_000_000),
+                ],
+            ),
+            // Binning below i64::MIN becomes NULL; exact bins remain valid.
+            (
+                3,
+                0,
+                vec![Some(i64::MIN), Some(i64::MIN + 2), Some(i64::MAX)],
+                vec![None, Some(i64::MIN + 2), Some(i64::MAX - 1)],
+            ),
+            // Preserve overflow in source - origin, even for aligned origins.
+            (1, 1, vec![Some(i64::MIN), Some(1)], vec![None, Some(1)]),
+            (1, -1, vec![Some(i64::MAX), Some(-1)], vec![None, Some(-1)]),
+            // The floored delta must fit before adding origin back.
+            (3, i64::MAX, vec![Some(-1)], vec![None]),
+            // A valid delta can still underflow when added to the origin.
+            (
+                3,
+                i64::MIN + 2,
+                vec![Some(i64::MIN + 1), Some(i64::MIN + 2)],
+                vec![None, Some(i64::MIN + 2)],
+            ),
+        ];
+        for (stride, origin, values, expected) in cases {
+            // A sliced null bitmap and timezone must survive the specialized path.
+            let length = values.len();
+            let input = TimestampNanosecondArray::from(
+                std::iter::once(None).chain(values).collect::<Vec<_>>(),
+            )
+            .with_timezone("America/New_York")
+            .slice(1, length);
+            let expected = TimestampNanosecondArray::from(expected)
+                .with_timezone("America/New_York");
+            let return_field = Arc::new(Field::new("f", input.data_type().clone(), true));
+            let args = vec![
+                ColumnarValue::Scalar(ScalarValue::new_interval_mdn(0, 0, stride)),
+                ColumnarValue::Array(Arc::new(input)),
+                ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
+                    Some(origin),
+                    None,
+                )),
+            ];
+            let result = invoke_date_bin_with_args(args, length, &return_field).unwrap();
+            let ColumnarValue::Array(result) = result else {
+                panic!("expected timestamp array");
+            };
+            assert_eq!(
+                result.as_ref(),
+                &expected as &dyn Array,
+                "stride={stride}, origin={origin}",
+            );
+        }
     }
 
     #[test]
