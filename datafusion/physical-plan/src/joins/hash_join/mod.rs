@@ -24,5 +24,6 @@ mod dictionary;
 mod exec;
 mod inlist_builder;
 mod partitioned_hash_eval;
+mod probe_runs;
 mod shared_bounds;
 mod stream;

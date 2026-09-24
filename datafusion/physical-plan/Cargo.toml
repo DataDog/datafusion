@@ -151,3 +151,8 @@ name = "bounded_window"
 [[bench]]
 harness = false
 name = "ordered_group_values"
+
+[[bench]]
+name = "hash_join_probe_runs"
+harness = false
+required-features = ["test_utils"]

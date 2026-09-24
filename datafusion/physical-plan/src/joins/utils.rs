@@ -1339,6 +1339,45 @@ pub(crate) fn build_batch_from_indices(
     build_side: JoinSide,
     join_type: JoinType,
 ) -> Result<RecordBatch> {
+    build_batch_from_indices_with_probe_range(
+        schema,
+        build_input_buffer,
+        probe_batch,
+        build_indices,
+        probe_indices,
+        column_indices,
+        build_side,
+        join_type,
+        None,
+    )
+}
+
+/// Materialize a join, reusing probe buffers when the caller has proved that
+/// every probe index is exactly the supplied contiguous range. Size and bounds
+/// are checked here; the producer establishes contiguity without rescanning.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserve the existing join materializer interface while adding optional range metadata"
+)]
+pub(crate) fn build_batch_from_indices_with_probe_range(
+    schema: &Schema,
+    build_input_buffer: &RecordBatch,
+    probe_batch: &RecordBatch,
+    build_indices: &UInt64Array,
+    probe_indices: &UInt32Array,
+    column_indices: &[ColumnIndex],
+    build_side: JoinSide,
+    join_type: JoinType,
+    contiguous_probe_range: Option<&Range<usize>>,
+) -> Result<RecordBatch> {
+    if let Some(range) = contiguous_probe_range
+        && (range.start > range.end
+            || range.end > probe_batch.num_rows()
+            || range.len() != probe_indices.len()
+            || probe_indices.null_count() != 0)
+    {
+        return Err(internal_datafusion_err!("Invalid contiguous probe range"));
+    }
     if schema.fields().is_empty() {
         // For RightAnti and RightSemi joins, after `adjust_indices_by_join_type`
         // the build_indices were untouched so only probe_indices hold the actual
@@ -1372,7 +1411,11 @@ pub(crate) fn build_batch_from_indices(
             }
         } else {
             let array = probe_batch.column(column_index.index);
-            if array.is_empty() || probe_indices.null_count() == probe_indices.len() {
+            if let Some(range) = contiguous_probe_range {
+                array.slice(range.start, range.len())
+            } else if array.is_empty()
+                || probe_indices.null_count() == probe_indices.len()
+            {
                 assert_eq!(probe_indices.null_count(), probe_indices.len());
                 new_null_array(array.data_type(), probe_indices.len())
             } else {
@@ -1771,6 +1814,12 @@ pub(crate) struct BuildProbeJoinMetrics {
     pub(crate) input_batches: metrics::Count,
     /// Number of rows consumed by probe-side this operator
     pub(crate) input_rows: metrics::Count,
+    /// Probe rows in batches accepted by the exact-key run optimization
+    pub(crate) run_probe_rows: metrics::Count,
+    /// Representative keys hashed/probed for those accepted batches
+    pub(crate) run_probe_keys: metrics::Count,
+    /// Probe rows materialized by reusing a proven contiguous input slice
+    pub(crate) probe_rows_sliced: metrics::Count,
     /// Fraction of probe rows that found more than one match
     pub(crate) probe_hit_rate: metrics::RatioMetrics,
     /// Average number of build matches per matched probe row
@@ -1827,6 +1876,18 @@ impl BuildProbeJoinMetrics {
             .with_category(MetricCategory::Rows)
             .counter("input_rows", partition);
 
+        let run_probe_rows = MetricBuilder::new(metrics)
+            .with_category(MetricCategory::Rows)
+            .counter("run_probe_rows", partition);
+
+        let run_probe_keys = MetricBuilder::new(metrics)
+            .with_category(MetricCategory::Rows)
+            .counter("run_probe_keys", partition);
+
+        let probe_rows_sliced = MetricBuilder::new(metrics)
+            .with_category(MetricCategory::Rows)
+            .counter("probe_rows_sliced", partition);
+
         let probe_hit_rate = MetricBuilder::new(metrics)
             .with_type(MetricType::Summary)
             .ratio_metrics("probe_hit_rate", partition);
@@ -1845,6 +1906,9 @@ impl BuildProbeJoinMetrics {
             input_batches,
             input_rows,
             baseline,
+            run_probe_rows,
+            run_probe_keys,
+            probe_rows_sliced,
             probe_hit_rate,
             avg_fanout,
         }

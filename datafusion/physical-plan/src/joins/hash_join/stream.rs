@@ -29,6 +29,7 @@ use crate::joins::Map;
 use crate::joins::MapOffset;
 use crate::joins::PartitionMode;
 use crate::joins::hash_join::exec::JoinLeftData;
+use crate::joins::hash_join::probe_runs::ProbeRuns;
 use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
 };
@@ -43,7 +44,7 @@ use crate::{
         BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinHashMapType,
         StatefulStreamResult, adjust_indices_by_join_type, apply_join_filter_to_indices,
         build_batch_empty_build_side, build_batch_from_indices,
-        need_produce_result_in_final,
+        build_batch_from_indices_with_probe_range, need_produce_result_in_final,
     },
 };
 
@@ -165,6 +166,8 @@ pub(super) struct ProcessProbeBatchState {
     offset: MapOffset,
     /// Max joined probe-side index from current batch
     joined_probe_idx: Option<usize>,
+    /// Matches computed once per adjacent equal-key run for inner joins.
+    runs: Option<Box<ProbeRuns>>,
 }
 
 impl ProcessProbeBatchState {
@@ -701,7 +704,35 @@ impl HashJoinStream {
                 // Precalculate hash values for fetched batch
                 let keys_values = evaluate_expressions_to_arrays(&self.on_right, &batch)?;
 
-                let valid_keys = if let Map::HashMap(_) =
+                let mut runs = None;
+                if self.join_type == JoinType::Inner && self.filter.is_none() {
+                    let left_data = &self.build_side.try_as_ready()?.left_data;
+                    if let Map::HashMap(map) = left_data.map() {
+                        let timer = self.join_metrics.join_time.timer();
+                        runs = ProbeRuns::try_new(
+                            &keys_values,
+                            left_data.values(),
+                            map.as_ref(),
+                            self.null_equality,
+                            &self.random_state,
+                            self.batch_size,
+                            &mut self.hashes_buffer,
+                            &mut self.probe_indices_buffer,
+                            &mut self.build_indices_buffer,
+                        )?
+                        .map(Box::new);
+                        timer.done();
+                    }
+                }
+
+                if let Some(runs) = &runs {
+                    self.join_metrics.run_probe_rows.add(batch.num_rows());
+                    self.join_metrics.run_probe_keys.add(runs.run_count());
+                }
+
+                let valid_keys = if runs.is_some() {
+                    None
+                } else if let Map::HashMap(_) =
                     self.build_side.try_as_ready()?.left_data.map()
                 {
                     self.hashes_buffer.clear();
@@ -726,6 +757,7 @@ impl HashJoinStream {
                         valid_keys,
                         offset: (0, None),
                         joined_probe_idx: None,
+                        runs,
                     });
             }
             Some(Err(err)) => return Poll::Ready(Err(err)),
@@ -805,37 +837,48 @@ impl HashJoinStream {
         }
 
         // get the matched by join keys indices
-        let (left_indices, right_indices, next_offset) = match build_side.left_data.map()
+        let mut contiguous_probe_range = None;
+        let (left_indices, right_indices, next_offset) = if let Some(runs) =
+            &mut state.runs
         {
-            Map::HashMap(map) => lookup_join_hashmap(
-                map.as_ref(),
-                build_side.left_data.values(),
-                &state.values,
-                self.null_equality,
-                &self.hashes_buffer,
-                state.valid_keys.as_ref(),
-                self.batch_size,
-                state.offset,
-                &mut self.probe_indices_buffer,
-                &mut self.build_indices_buffer,
-            )?,
-            Map::ArrayMap(array_map) => {
-                let next_offset = array_map.get_matched_indices_with_limit_offset(
+            let (left, right, next, range) = runs.next_indices(self.batch_size);
+            contiguous_probe_range = range;
+            (left, right, next)
+        } else {
+            match build_side.left_data.map() {
+                Map::HashMap(map) => lookup_join_hashmap(
+                    map.as_ref(),
+                    build_side.left_data.values(),
                     &state.values,
+                    self.null_equality,
+                    &self.hashes_buffer,
+                    state.valid_keys.as_ref(),
                     self.batch_size,
                     state.offset,
                     &mut self.probe_indices_buffer,
                     &mut self.build_indices_buffer,
-                )?;
-                (
-                    UInt64Array::from(self.build_indices_buffer.clone()),
-                    UInt32Array::from(self.probe_indices_buffer.clone()),
-                    next_offset,
-                )
+                )?,
+                Map::ArrayMap(array_map) => {
+                    let next_offset = array_map.get_matched_indices_with_limit_offset(
+                        &state.values,
+                        self.batch_size,
+                        state.offset,
+                        &mut self.probe_indices_buffer,
+                        &mut self.build_indices_buffer,
+                    )?;
+                    (
+                        UInt64Array::from(self.build_indices_buffer.clone()),
+                        UInt32Array::from(self.probe_indices_buffer.clone()),
+                        next_offset,
+                    )
+                }
             }
         };
 
-        let distinct_right_indices_count = count_distinct_sorted_indices(&right_indices);
+        let distinct_right_indices_count = contiguous_probe_range.as_ref().map_or_else(
+            || count_distinct_sorted_indices(&right_indices),
+            |range| range.len(),
+        );
 
         self.join_metrics
             .probe_hit_rate
@@ -918,7 +961,15 @@ impl HashJoinStream {
                 (build_side.left_data.batch(), &state.batch, JoinSide::Left)
             };
 
-        let batch = build_batch_from_indices(
+        if let Some(range) = &contiguous_probe_range
+            && self
+                .column_indices
+                .iter()
+                .any(|column| column.side != join_side && column.side != JoinSide::None)
+        {
+            self.join_metrics.probe_rows_sliced.add(range.len());
+        }
+        let batch = build_batch_from_indices_with_probe_range(
             &self.schema,
             build_batch,
             probe_batch,
@@ -927,6 +978,7 @@ impl HashJoinStream {
             &self.column_indices,
             join_side,
             self.join_type,
+            contiguous_probe_range.as_ref(),
         )?;
 
         let push_status = self.output_buffer.push_batch(batch)?;

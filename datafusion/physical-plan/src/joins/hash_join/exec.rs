@@ -2493,8 +2493,8 @@ mod tests {
     };
 
     use arrow::array::{
-        Date32Array, DictionaryArray, Int32Array, Int64Array, StringArray, StructArray,
-        UInt32Array, UInt64Array,
+        AsArray, Date32Array, DictionaryArray, Int32Array, Int64Array, StringArray,
+        StructArray, UInt32Array, UInt64Array,
     };
     use arrow::buffer::NullBuffer;
     use arrow::datatypes::{DataType, Field, Int32Type};
@@ -3087,6 +3087,73 @@ mod tests {
                 .as_usize(),
             2
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_inner_repeated_probe_runs_cross_batch_limits() -> Result<()> {
+        let left = build_table(
+            ("key", &vec![1, 1, 2]),
+            ("build_id", &vec![10, 11, 20]),
+            ("unused", &vec![0; 3]),
+        );
+        let right = build_table(
+            ("key", &vec![1, 1, 1, 1, 2, 2, 2, 2]),
+            ("probe_id", &vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            ("unused", &vec![0; 8]),
+        );
+        let on = vec![(
+            Arc::new(Column::new("key", 0)) as _,
+            Arc::new(Column::new("key", 0)) as _,
+        )];
+        // Four admits the bounded representative lookup; one forces its fallback.
+        for batch_size in [1, 4] {
+            let (_, batches, metrics) = join_collect(
+                Arc::clone(&left),
+                Arc::clone(&right),
+                on.clone(),
+                &JoinType::Inner,
+                NullEquality::NullEqualsNothing,
+                prepare_task_ctx(batch_size, false),
+            )
+            .await?;
+            for (name, expected) in [("run_probe_rows", 8), ("run_probe_keys", 2)] {
+                assert_eq!(
+                    metrics.sum_by_name(name).unwrap().as_usize(),
+                    if batch_size == 4 { expected } else { 0 },
+                );
+            }
+            let mut pairs = vec![];
+            for batch in &batches {
+                assert!(batch.num_rows() <= batch_size);
+                let build = batch.column(1).as_primitive::<Int32Type>();
+                let probe = batch.column(4).as_primitive::<Int32Type>();
+                pairs.extend(
+                    build
+                        .values()
+                        .iter()
+                        .copied()
+                        .zip(probe.values().iter().copied()),
+                );
+            }
+            assert_eq!(
+                pairs,
+                vec![
+                    (10, 0),
+                    (11, 0),
+                    (10, 1),
+                    (11, 1),
+                    (10, 2),
+                    (11, 2),
+                    (10, 3),
+                    (11, 3),
+                    (20, 4),
+                    (20, 5),
+                    (20, 6),
+                    (20, 7),
+                ],
+            );
+        }
         Ok(())
     }
 
