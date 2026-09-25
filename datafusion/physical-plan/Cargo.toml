@@ -156,3 +156,7 @@ name = "ordered_group_values"
 name = "hash_join_probe_runs"
 harness = false
 required-features = ["test_utils"]
+
+[[bench]]
+name = "native_dense_group_values"
+harness = false

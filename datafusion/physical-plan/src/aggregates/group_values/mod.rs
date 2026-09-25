@@ -34,7 +34,7 @@ mod row;
 pub use row::GroupValuesRows;
 mod single_group_by;
 use datafusion_physical_expr::binary_map::OutputType;
-use multi_group_by::{GroupValuesColumn, GroupValuesOrdered};
+use multi_group_by::{GroupValuesColumn, GroupValuesDense, GroupValuesOrdered};
 
 pub(crate) use single_group_by::primitive::HashValue;
 
@@ -144,6 +144,11 @@ pub fn new_group_values(
         && GroupValuesOrdered::supports_schema(&schema)
     {
         return Ok(Box::new(GroupValuesOrdered::try_new(schema)?));
+    }
+    if matches!(group_ordering, GroupOrdering::None)
+        && GroupValuesDense::supports_schema(&schema)
+    {
+        return Ok(Box::new(GroupValuesDense::try_new(schema)?));
     }
     if schema.fields.len() == 1 {
         let d = schema.fields[0].data_type();

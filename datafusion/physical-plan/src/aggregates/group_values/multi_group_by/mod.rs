@@ -20,7 +20,9 @@
 mod boolean;
 mod bytes;
 pub mod bytes_view;
+mod dense;
 mod dictionary;
+pub(super) use dense::GroupValuesDense;
 mod fixed_size_binary;
 mod ordered;
 pub(super) use ordered::GroupValuesOrdered;
@@ -263,6 +265,44 @@ impl VectorizedOperationBuffers {
         self.equal_to_row_indices.clear();
         self.equal_to_group_indices.clear();
         self.remaining_row_indices.clear();
+    }
+}
+
+// Seed the non-streaming representation from distinct keys in existing accumulator-ID
+// order. Scalar interning uses a different collision representation and cannot seed a
+// table which subsequently runs vectorized interning.
+impl GroupValuesColumn<false> {
+    fn try_new_from_distinct(schema: SchemaRef, cols: &[ArrayRef]) -> Result<Self> {
+        let mut result = Self::try_new(schema)?;
+        let rows: Vec<usize> = (0..cols[0].len()).collect();
+        for (column, input) in result.group_values.iter_mut().zip(cols) {
+            column.vectorized_append(input, &rows)?;
+        }
+        result.hashes_buffer.resize(rows.len(), 0);
+        create_hashes(cols, &result.random_state, &mut result.hashes_buffer)?;
+        for (group_id, &hash) in result.hashes_buffer.iter().enumerate() {
+            if let Some((_, view)) =
+                result.map.find_mut(hash, |(stored, _)| *stored == hash)
+            {
+                if view.is_non_inlined() {
+                    result.group_index_lists[view.value() as usize].push(group_id);
+                } else {
+                    let list = result.group_index_lists.len();
+                    result
+                        .group_index_lists
+                        .push(vec![view.value() as usize, group_id]);
+                    *view = GroupIndexView::new_non_inlined(list as u64);
+                }
+            } else {
+                result.map.insert_unique(
+                    hash,
+                    (hash, GroupIndexView::new_inlined(group_id as u64)),
+                    |(hash, _)| *hash,
+                );
+            }
+        }
+        result.map_size = result.map.allocation_size();
+        Ok(result)
     }
 }
 
