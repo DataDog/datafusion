@@ -204,13 +204,6 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     ///   `latest group index -> older group index -> even older group index -> ...`
     group_index_lists: Vec<Vec<usize>>,
 
-    /// When emitting first n, we need to decrease/erase group indices in
-    /// `map` and `group_index_lists`.
-    ///
-    /// This buffer is used to temporarily store the remaining group indices in
-    /// a specific list in `group_index_lists`.
-    emit_group_index_list_buffer: Vec<usize>,
-
     /// Buffers for `vectorized_append` and `vectorized_equal_to`
     vectorized_operation_buffers: VectorizedOperationBuffers,
 
@@ -286,7 +279,6 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             schema,
             map,
             group_index_lists: Vec::new(),
-            emit_group_index_list_buffer: Vec::new(),
             vectorized_operation_buffers: VectorizedOperationBuffers::default(),
             map_size: 0,
             group_values,
@@ -1229,47 +1221,38 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                     .iter_mut()
                     .map(|v| v.take_n(n))
                     .collect::<Vec<_>>();
-                let mut next_new_list_offset = 0;
+                // Hash-table traversal is unrelated to collision-list order. Keep old
+                // slots separate so compacting one list cannot overwrite an unvisited list.
+                let mut old_group_index_lists = mem::take(&mut self.group_index_lists);
 
                 self.map.retain(|(_exist_hash, group_idx_view)| {
-                    // In non-streaming case, we need to check if the `group index view`
-                    // is `inlined` or `non-inlined`
                     if !STREAMING && group_idx_view.is_non_inlined() {
-                        // Non-inlined case
-                        // We take `group_index_list` from `old_group_index_lists`
-
-                        // list_offset is incrementally
-                        self.emit_group_index_list_buffer.clear();
                         let list_offset = group_idx_view.value() as usize;
-                        for group_index in self.group_index_lists[list_offset].iter() {
+                        let mut group_index_list =
+                            mem::take(&mut old_group_index_lists[list_offset]);
+                        group_index_list.retain_mut(|group_index| {
                             if let Some(remaining) = group_index.checked_sub(n) {
-                                self.emit_group_index_list_buffer.push(remaining);
+                                *group_index = remaining;
+                                true
+                            } else {
+                                false
                             }
-                        }
-
-                        // The possible results:
-                        //   - `new_group_index_list` is empty, we should erase this bucket
-                        //   - only one value in `new_group_index_list`, switch the `view` to `inlined`
-                        //   - still multiple values in `new_group_index_list`, build and set the new `unlined view`
-                        if self.emit_group_index_list_buffer.is_empty() {
-                            false
-                        } else if self.emit_group_index_list_buffer.len() == 1 {
-                            let group_index =
-                                self.emit_group_index_list_buffer.first().unwrap();
-                            *group_idx_view =
-                                GroupIndexView::new_inlined(*group_index as u64);
-                            true
-                        } else {
-                            let group_index_list =
-                                &mut self.group_index_lists[next_new_list_offset];
-                            group_index_list.clear();
-                            group_index_list
-                                .extend(self.emit_group_index_list_buffer.iter());
-                            *group_idx_view = GroupIndexView::new_non_inlined(
-                                next_new_list_offset as u64,
-                            );
-                            next_new_list_offset += 1;
-                            true
+                        });
+                        match group_index_list.len() {
+                            0 => false,
+                            1 => {
+                                *group_idx_view = GroupIndexView::new_inlined(
+                                    group_index_list[0] as u64,
+                                );
+                                true
+                            }
+                            _ => {
+                                *group_idx_view = GroupIndexView::new_non_inlined(
+                                    self.group_index_lists.len() as u64,
+                                );
+                                self.group_index_lists.push(group_index_list);
+                                true
+                            }
                         }
                     } else {
                         // In `streaming case`, the `group index view` is ensured to be `inlined`
@@ -1288,10 +1271,6 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                         }
                     }
                 });
-
-                if !STREAMING {
-                    self.group_index_lists.truncate(next_new_list_offset);
-                }
 
                 output
             }
@@ -1316,7 +1295,6 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         // Such structures are only used in `non-streaming` case
         if !STREAMING {
             self.group_index_lists.clear();
-            self.emit_group_index_list_buffer.clear();
             self.vectorized_operation_buffers.clear();
         }
     }
@@ -2107,6 +2085,54 @@ mod tests {
             let actual_batch = concat_batches(&schema, &actual_sub_batches).unwrap();
             check_result(&actual_batch, &data_set.expected_batch);
         }
+    }
+
+    #[test]
+    fn test_emit_first_preserves_unvisited_collision_lists() {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
+        let mut group_values = GroupValuesColumn::<false>::try_new(schema).unwrap();
+        let seed: ArrayRef = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5]));
+        group_values.group_values[0]
+            .vectorized_append(&seed, &[0, 1, 2, 3, 4, 5])
+            .unwrap();
+        insert_non_inline_group_index_view(&mut group_values, 7, vec![0, 1, 2]);
+        insert_non_inline_group_index_view(&mut group_values, 13, vec![3, 4, 5]);
+
+        // Determine this table's traversal order, then deliberately make it visit
+        // list 1 before list 0. No hash-table layout or collision feature is assumed.
+        let mut visited = Vec::new();
+        group_values.map.retain(|(hash, _)| {
+            visited.push(*hash);
+            true
+        });
+        for (hash, list_offset) in visited.iter().zip([1, 0]) {
+            let (_, view) = group_values
+                .map
+                .find_mut(*hash, |(key, _)| key == hash)
+                .unwrap();
+            *view = GroupIndexView::new_non_inlined(list_offset);
+        }
+
+        let emitted = group_values.emit(EmitTo::First(1)).unwrap();
+        assert_eq!(
+            emitted[0].as_any().downcast_ref::<Int32Array>().unwrap(),
+            &Int32Array::from(vec![0]),
+        );
+        assert_eq!(group_values.len(), 5);
+        assert_eq!(
+            group_values.get_indices_by_hash(visited[0]).unwrap().0,
+            vec![2, 3, 4],
+        );
+        assert_eq!(
+            group_values.get_indices_by_hash(visited[1]).unwrap().0,
+            vec![0, 1],
+        );
+        let remaining = group_values.emit(EmitTo::All).unwrap();
+        assert_eq!(
+            remaining[0].as_any().downcast_ref::<Int32Array>().unwrap(),
+            &Int32Array::from(vec![1, 2, 3, 4, 5]),
+        );
     }
 
     #[test]
