@@ -35,9 +35,10 @@ use futures::stream::{Stream, StreamExt};
 
 use super::AggregateExec;
 use super::aggregate_hash_table::{AggregateHashTable, PartialReduceMarker};
+use crate::aggregates::GroupClusteringMode;
 use crate::metrics::{BaselineMetrics, RecordOutput, SpillMetrics};
 use crate::stream::EmptyRecordBatchStream;
-use crate::{InputOrderMode, RecordBatchStream, SendableRecordBatchStream};
+use crate::{RecordBatchStream, SendableRecordBatchStream};
 
 /// Hash aggregation can combine multiple partial stages before final
 /// evaluation. This stream implements the partial-reduce stage.
@@ -154,7 +155,7 @@ impl PartialReduceHashAggregateStream {
         partition: usize,
     ) -> Result<Self> {
         debug_assert_eq!(agg.mode, super::AggregateMode::PartialReduce);
-        debug_assert_eq!(agg.input_order_mode, InputOrderMode::Linear);
+        debug_assert_eq!(agg.group_clustering_mode, GroupClusteringMode::None);
 
         let schema = Arc::clone(&agg.schema);
         let input = agg.input.execute(partition, Arc::clone(context))?;
