@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod clustered_final_table;
+mod clustered_partial_table;
 mod common;
-mod common_ordered;
+mod common_clustered;
 mod final_table;
-mod ordered_final_table;
-mod ordered_partial_table;
 mod partial_reduce_table;
 mod partial_table;
 mod single_table;
@@ -28,4 +28,4 @@ pub(super) use common::{
     AggregateHashTable, FinalMarker, PartialMarker, PartialReduceMarker,
     PartialSkipMarker, SingleMarker,
 };
-pub(super) use common_ordered::OrderedAggregateTable;
+pub(super) use common_clustered::ClusteredAggregateTable;

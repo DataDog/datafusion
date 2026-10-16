@@ -41,7 +41,7 @@ use datafusion_common_runtime::JoinSet;
 use datafusion_functions_aggregate::sum::sum_udaf;
 use datafusion_physical_expr::PhysicalSortExpr;
 use datafusion_physical_expr::expressions::{Column, col, lit};
-use datafusion_physical_plan::InputOrderMode;
+use datafusion_physical_plan::aggregates::GroupClusteringMode;
 use test_utils::{StringBatchGenerator, add_empty_batches};
 
 use datafusion_execution::TaskContext;
@@ -352,8 +352,8 @@ async fn run_aggregate_test(input1: Vec<RecordBatch>, group_by_columns: Vec<&str
         .unwrap(),
     );
     assert_ne!(
-        aggregate_exec_running.input_order_mode(),
-        &InputOrderMode::Linear,
+        aggregate_exec_running.group_clustering_mode(),
+        &GroupClusteringMode::None,
         "running aggregate should observe ordered input for group_by: {group_by:?}"
     );
 
@@ -555,11 +555,11 @@ async fn verify_ordered_aggregate(frame: &DataFrame, expected_sort: bool) {
             if let Some(exec) = node.downcast_ref::<AggregateExec>() {
                 if self.expected_sort {
                     assert!(matches!(
-                        exec.input_order_mode(),
-                        InputOrderMode::PartiallySorted(_) | InputOrderMode::Sorted
+                        exec.group_clustering_mode(),
+                        GroupClusteringMode::Partial(_) | GroupClusteringMode::Full
                     ));
                 } else {
-                    assert_eq!(*exec.input_order_mode(), InputOrderMode::Linear);
+                    assert_eq!(*exec.group_clustering_mode(), GroupClusteringMode::None);
                 }
             }
             Ok(TreeNodeRecursion::Continue)

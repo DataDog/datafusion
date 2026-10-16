@@ -32,24 +32,25 @@ use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use futures::stream::{Stream, StreamExt};
 
 use super::AggregateExec;
-use super::aggregate_hash_table::{FinalMarker, OrderedAggregateTable};
+use super::aggregate_hash_table::{ClusteredAggregateTable, FinalMarker};
 use super::group_values::GroupByMetrics;
 use crate::aggregates::AggregateMode;
+use crate::aggregates::GroupClusteringMode;
 use crate::metrics::{BaselineMetrics, RecordOutput, SpillMetrics};
 use crate::sorts::IncrementalSortIterator;
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::EmptyRecordBatchStream;
-use crate::{InputOrderMode, RecordBatchStream, SendableRecordBatchStream};
+use crate::{RecordBatchStream, SendableRecordBatchStream};
 
-/// Final aggregate stream for `InputOrderMode::Sorted` and
-/// `InputOrderMode::PartiallySorted`.
+/// Final aggregate stream for `GroupClusteringMode::Full` and
+/// `GroupClusteringMode::Partial`.
 ///
-/// See comments at [`super::ordered_partial_stream::OrderedPartialAggregateStream`] for details.
+/// See comments at [`super::clustered_partial_stream::ClusteredPartialAggregateStream`] for details.
 ///
 /// # Spilling
 ///
-/// This section is only for implementation notes, for background, see [`super::ordered_partial_stream::OrderedPartialAggregateStream`]
+/// This section is only for implementation notes, for background, see [`super::clustered_partial_stream::ClusteredPartialAggregateStream`]
 ///
 /// For partially sorted input, spilling works as follows:
 ///
@@ -61,12 +62,12 @@ use crate::{InputOrderMode, RecordBatchStream, SendableRecordBatchStream};
 ///   batch and full index remain live until the run is written.
 /// - After input ends, merge the sorted runs and replay them through a fully
 ///   ordered final aggregate stream.
-pub(crate) struct OrderedFinalAggregateStream {
+pub(crate) struct ClusteredFinalAggregateStream {
     schema: SchemaRef,
     input: SendableRecordBatchStream,
     reservation: MemoryReservation,
     baseline_metrics: BaselineMetrics,
-    state: Option<OrderedFinalAggregateState>,
+    state: Option<ClusteredFinalAggregateState>,
 }
 
 /// Spill configuration and accumulated runs for partially ordered final
@@ -94,23 +95,23 @@ struct OrderedFinalSpillContext {
 }
 
 /// See comments at `poll_next()` for details.
-enum OrderedFinalAggregateState {
+enum ClusteredFinalAggregateState {
     ReadingInput {
-        table: OrderedAggregateTable<FinalMarker>,
+        table: ClusteredAggregateTable<FinalMarker>,
         /// None if either
         /// - Disk Manager doesn't enable temporary file creation
         /// - The group keys are fully ordered, it's expected to use bounded memory
         spill_context: Option<Box<OrderedFinalSpillContext>>,
     },
     Spilling {
-        table: OrderedAggregateTable<FinalMarker>,
+        table: ClusteredAggregateTable<FinalMarker>,
         spill_context: Box<OrderedFinalSpillContext>,
     },
     ProducingOutput {
-        table: OrderedAggregateTable<FinalMarker>,
+        table: ClusteredAggregateTable<FinalMarker>,
     },
     PreparingMergeInput {
-        table: OrderedAggregateTable<FinalMarker>,
+        table: ClusteredAggregateTable<FinalMarker>,
         spill_context: Box<OrderedFinalSpillContext>,
     },
     MergingSpills {
@@ -119,10 +120,10 @@ enum OrderedFinalAggregateState {
     Done,
 }
 
-type OrderedFinalAggregatePoll = Poll<Option<Result<RecordBatch>>>;
-type OrderedFinalAggregateStateTransition = ControlFlow<
-    (OrderedFinalAggregatePoll, OrderedFinalAggregateState),
-    OrderedFinalAggregateState,
+type ClusteredFinalAggregatePoll = Poll<Option<Result<RecordBatch>>>;
+type ClusteredFinalAggregateStateTransition = ControlFlow<
+    (ClusteredFinalAggregatePoll, ClusteredFinalAggregateState),
+    ClusteredFinalAggregateState,
 >;
 
 impl OrderedFinalSpillContext {
@@ -131,13 +132,13 @@ impl OrderedFinalSpillContext {
         context: &Arc<TaskContext>,
         partition: usize,
         batch_size: usize,
-        input_order_mode: &InputOrderMode,
+        group_clustering_mode: &GroupClusteringMode,
         spill_schema: &SchemaRef,
         spill_metrics: SpillMetrics,
     ) -> Result<Self> {
         let group_schema = agg.group_by.group_schema(spill_schema)?;
         let output_ordering = agg.cache.output_ordering();
-        let InputOrderMode::PartiallySorted(order_indices) = input_order_mode else {
+        let GroupClusteringMode::Partial(order_indices) = group_clustering_mode else {
             return internal_err!("Ordered final spill requires partially ordered input");
         };
         let spill_indices = order_indices.iter().copied().chain(
@@ -182,10 +183,10 @@ impl OrderedFinalSpillContext {
     ///
     /// Individual spill files are ordered by the `group by` keys.
     ///
-    /// See [`OrderedFinalAggregateStream`] for spilling details.
+    /// See [`ClusteredFinalAggregateStream`] for spilling details.
     fn spill_table(
         &mut self,
-        table: &mut OrderedAggregateTable<FinalMarker>,
+        table: &mut ClusteredAggregateTable<FinalMarker>,
     ) -> Result<()> {
         let Some(batch) = table.take_state_batch()? else {
             return Ok(());
@@ -197,7 +198,7 @@ impl OrderedFinalSpillContext {
             .spill_manager
             .spill_record_batch_iter_and_return_max_batch_memory(
                 sorted_iter,
-                "OrderedFinalAggregateSpill",
+                "ClusteredFinalAggregateSpill",
             )?;
 
         let Some((file, max_record_batch_memory)) = spill_file else {
@@ -243,12 +244,12 @@ impl OrderedFinalSpillContext {
             .with_batch_size(batch_size)
             .with_reservation(merge_reservation)
             .build()?;
-        let replay = OrderedFinalAggregateStream::new_with_input_and_metrics(
+        let replay = ClusteredFinalAggregateStream::new_with_input_and_metrics(
             &agg,
             &context,
             partition,
             merged,
-            &InputOrderMode::Sorted,
+            &GroupClusteringMode::Full,
             baseline_metrics.clone(),
             group_by_metrics,
             None,
@@ -258,7 +259,7 @@ impl OrderedFinalSpillContext {
     }
 }
 
-impl OrderedFinalAggregateStream {
+impl ClusteredFinalAggregateStream {
     pub fn new(
         agg: &AggregateExec,
         context: &Arc<TaskContext>,
@@ -268,10 +269,10 @@ impl OrderedFinalAggregateStream {
             agg.mode,
             AggregateMode::Final | AggregateMode::FinalPartitioned
         ));
-        debug_assert_ne!(agg.input_order_mode, InputOrderMode::Linear);
+        debug_assert_ne!(agg.group_clustering_mode, GroupClusteringMode::None);
 
         let input = agg.input.execute(partition, Arc::clone(context))?;
-        Self::new_with_input(agg, context, partition, input, &agg.input_order_mode)
+        Self::new_with_input(agg, context, partition, input, &agg.group_clustering_mode)
     }
 
     pub(in crate::aggregates) fn new_with_input(
@@ -279,13 +280,13 @@ impl OrderedFinalAggregateStream {
         context: &Arc<TaskContext>,
         partition: usize,
         input: SendableRecordBatchStream,
-        input_order_mode: &InputOrderMode,
+        group_clustering_mode: &GroupClusteringMode,
     ) -> Result<Self> {
         let baseline_metrics = BaselineMetrics::new(&agg.metrics, partition);
         let group_by_metrics = GroupByMetrics::new(&agg.metrics, partition);
         let spill_metrics = SpillMetrics::new(&agg.metrics, partition);
         let reservation =
-            MemoryConsumer::new(format!("OrderedFinalAggregateStream[{partition}]"))
+            MemoryConsumer::new(format!("ClusteredFinalAggregateStream[{partition}]"))
                 // HACK: Technically, fully ordered aggregate is a non-spillable
                 // consumer, since it uses bounded memory. There is a known race
                 // condition bug, and we set it to spillable to let it have larger
@@ -298,7 +299,7 @@ impl OrderedFinalAggregateStream {
             context,
             partition,
             input,
-            input_order_mode,
+            group_clustering_mode,
             baseline_metrics,
             group_by_metrics,
             Some(spill_metrics),
@@ -318,7 +319,7 @@ impl OrderedFinalAggregateStream {
         context: &Arc<TaskContext>,
         partition: usize,
         input: SendableRecordBatchStream,
-        input_order_mode: &InputOrderMode,
+        group_clustering_mode: &GroupClusteringMode,
         baseline_metrics: BaselineMetrics,
         group_by_metrics: GroupByMetrics,
         spill_metrics: Option<SpillMetrics>,
@@ -328,13 +329,13 @@ impl OrderedFinalAggregateStream {
             agg.mode,
             AggregateMode::Final | AggregateMode::FinalPartitioned
         ));
-        debug_assert_ne!(*input_order_mode, InputOrderMode::Linear);
+        debug_assert_ne!(*group_clustering_mode, GroupClusteringMode::None);
 
         let schema = Arc::clone(&agg.schema);
         let input_schema = input.schema();
         let batch_size = context.session_config().batch_size();
 
-        let can_spill = matches!(input_order_mode, InputOrderMode::PartiallySorted(_))
+        let can_spill = matches!(group_clustering_mode, GroupClusteringMode::Partial(_))
             && context.runtime_env().disk_manager.tmp_files_enabled();
         let spill_context = if can_spill {
             let Some(spill_metrics) = spill_metrics else {
@@ -345,7 +346,7 @@ impl OrderedFinalAggregateStream {
                 context,
                 partition,
                 batch_size,
-                input_order_mode,
+                group_clustering_mode,
                 &input_schema,
                 spill_metrics,
             )?))
@@ -353,12 +354,12 @@ impl OrderedFinalAggregateStream {
             None
         };
 
-        let table = OrderedAggregateTable::<FinalMarker>::new_with_input_order(
+        let table = ClusteredAggregateTable::<FinalMarker>::new_with_input_order(
             agg,
             &input_schema,
             Arc::clone(&schema),
             batch_size,
-            input_order_mode,
+            group_clustering_mode,
             group_by_metrics,
         )?;
         Ok(Self {
@@ -366,7 +367,7 @@ impl OrderedFinalAggregateStream {
             input,
             reservation,
             baseline_metrics,
-            state: Some(OrderedFinalAggregateState::ReadingInput {
+            state: Some(ClusteredFinalAggregateState::ReadingInput {
                 table,
                 spill_context,
             }),
@@ -378,21 +379,21 @@ impl OrderedFinalAggregateStream {
         self.input = Box::pin(EmptyRecordBatchStream::new(input_schema));
     }
 
-    fn break_with_internal_err(message: &str) -> OrderedFinalAggregateStateTransition {
+    fn break_with_internal_err(message: &str) -> ClusteredFinalAggregateStateTransition {
         ControlFlow::Break((
             Poll::Ready(Some(internal_err!("{message}"))),
-            OrderedFinalAggregateState::Done,
+            ClusteredFinalAggregateState::Done,
         ))
     }
 
     /// Reserve memory for the current aggregate table.
     fn reservation_size_for_table(
-        table: &OrderedAggregateTable<FinalMarker>,
+        table: &ClusteredAggregateTable<FinalMarker>,
         spill_context: Option<&OrderedFinalSpillContext>,
     ) -> usize {
         let table_size = table.memory_size();
         if spill_context.is_some() {
-            // See `OrderedFinalAggregateStream` comments for how is it estimated
+            // See `ClusteredFinalAggregateStream` comments for how is it estimated
             table_size.saturating_add(table.num_groups().saturating_mul(size_of::<u32>()))
         } else {
             table_size
@@ -408,9 +409,9 @@ impl OrderedFinalAggregateStream {
     fn handle_reading_input(
         &mut self,
         cx: &mut Context<'_>,
-        original_state: OrderedFinalAggregateState,
-    ) -> OrderedFinalAggregateStateTransition {
-        let OrderedFinalAggregateState::ReadingInput {
+        original_state: ClusteredFinalAggregateState,
+    ) -> ClusteredFinalAggregateStateTransition {
+        let ClusteredFinalAggregateState::ReadingInput {
             mut table,
             spill_context,
         } = original_state
@@ -423,7 +424,7 @@ impl OrderedFinalAggregateStream {
         match self.input.poll_next_unpin(cx) {
             Poll::Pending => ControlFlow::Break((
                 Poll::Pending,
-                OrderedFinalAggregateState::ReadingInput {
+                ClusteredFinalAggregateState::ReadingInput {
                     table,
                     spill_context,
                 },
@@ -437,7 +438,7 @@ impl OrderedFinalAggregateStream {
                 if let Err(e) = result {
                     return ControlFlow::Break((
                         Poll::Ready(Some(Err(e))),
-                        OrderedFinalAggregateState::ReadingInput {
+                        ClusteredFinalAggregateState::ReadingInput {
                             table,
                             spill_context,
                         },
@@ -458,20 +459,20 @@ impl OrderedFinalAggregateStream {
                     Err(e @ DataFusionError::ResourcesExhausted(_)) => {
                         let Some(spill_context) = spill_context else {
                             // `None` means spilling is not supported, see comments
-                            // at `OrderedFinalAggregateState` for details.
+                            // at `ClusteredFinalAggregateState` for details.
                             return ControlFlow::Break((
                                 Poll::Ready(Some(Err(e))),
-                                OrderedFinalAggregateState::Done,
+                                ClusteredFinalAggregateState::Done,
                             ));
                         };
                         if table.is_empty() {
                             return ControlFlow::Break((
                                 Poll::Ready(Some(Err(e))),
-                                OrderedFinalAggregateState::Done,
+                                ClusteredFinalAggregateState::Done,
                             ));
                         }
                         return ControlFlow::Continue(
-                            OrderedFinalAggregateState::Spilling {
+                            ClusteredFinalAggregateState::Spilling {
                                 table,
                                 spill_context,
                             },
@@ -480,7 +481,7 @@ impl OrderedFinalAggregateStream {
                     Err(e) => {
                         return ControlFlow::Break((
                             Poll::Ready(Some(Err(e))),
-                            OrderedFinalAggregateState::Done,
+                            ClusteredFinalAggregateState::Done,
                         ));
                     }
                 }
@@ -512,10 +513,10 @@ impl OrderedFinalAggregateStream {
                         {
                             return ControlFlow::Break((
                                 Poll::Ready(Some(Err(e))),
-                                OrderedFinalAggregateState::Done,
+                                ClusteredFinalAggregateState::Done,
                             ));
                         }
-                        let next_state = OrderedFinalAggregateState::ReadingInput {
+                        let next_state = ClusteredFinalAggregateState::ReadingInput {
                             table,
                             spill_context,
                         };
@@ -528,15 +529,15 @@ impl OrderedFinalAggregateStream {
                         ))
                     }
                     // Can't do early emit, continue aggregating.
-                    Ok(None) => {
-                        ControlFlow::Continue(OrderedFinalAggregateState::ReadingInput {
+                    Ok(None) => ControlFlow::Continue(
+                        ClusteredFinalAggregateState::ReadingInput {
                             table,
                             spill_context,
-                        })
-                    }
+                        },
+                    ),
                     Err(e) => ControlFlow::Break((
                         Poll::Ready(Some(Err(e))),
-                        OrderedFinalAggregateState::ReadingInput {
+                        ClusteredFinalAggregateState::ReadingInput {
                             table,
                             spill_context,
                         },
@@ -545,7 +546,7 @@ impl OrderedFinalAggregateStream {
             }
             Poll::Ready(Some(Err(e))) => ControlFlow::Break((
                 Poll::Ready(Some(Err(e))),
-                OrderedFinalAggregateState::ReadingInput {
+                ClusteredFinalAggregateState::ReadingInput {
                     table,
                     spill_context,
                 },
@@ -555,7 +556,7 @@ impl OrderedFinalAggregateStream {
                 match spill_context {
                     Some(spill_context) if spill_context.has_spills() => {
                         ControlFlow::Continue(
-                            OrderedFinalAggregateState::PreparingMergeInput {
+                            ClusteredFinalAggregateState::PreparingMergeInput {
                                 table,
                                 spill_context,
                             },
@@ -564,7 +565,7 @@ impl OrderedFinalAggregateStream {
                     _ => {
                         table.input_done();
                         ControlFlow::Continue(
-                            OrderedFinalAggregateState::ProducingOutput { table },
+                            ClusteredFinalAggregateState::ProducingOutput { table },
                         )
                     }
                 }
@@ -579,9 +580,9 @@ impl OrderedFinalAggregateStream {
     /// Returns the next operator state with control flow decision.
     fn handle_spilling(
         &mut self,
-        original_state: OrderedFinalAggregateState,
-    ) -> OrderedFinalAggregateStateTransition {
-        let OrderedFinalAggregateState::Spilling {
+        original_state: ClusteredFinalAggregateState,
+    ) -> ClusteredFinalAggregateStateTransition {
+        let ClusteredFinalAggregateState::Spilling {
             mut table,
             mut spill_context,
         } = original_state
@@ -597,7 +598,7 @@ impl OrderedFinalAggregateStream {
                 Poll::Ready(Some(internal_err!(
                     "Ordered final aggregation entered Spilling with an empty table"
                 ))),
-                OrderedFinalAggregateState::Done,
+                ClusteredFinalAggregateState::Done,
             ));
         }
 
@@ -616,13 +617,13 @@ impl OrderedFinalAggregateStream {
 
         match result {
             // Finished spilling the aggregate table, continue aggregating from input
-            Ok(()) => ControlFlow::Continue(OrderedFinalAggregateState::ReadingInput {
+            Ok(()) => ControlFlow::Continue(ClusteredFinalAggregateState::ReadingInput {
                 table,
                 spill_context: Some(spill_context),
             }),
             Err(e) => ControlFlow::Break((
                 Poll::Ready(Some(Err(e))),
-                OrderedFinalAggregateState::Done,
+                ClusteredFinalAggregateState::Done,
             )),
         }
     }
@@ -638,9 +639,9 @@ impl OrderedFinalAggregateStream {
     /// Returns the next operator state with control flow decision.
     fn handle_preparing_merge_input(
         &mut self,
-        original_state: OrderedFinalAggregateState,
-    ) -> OrderedFinalAggregateStateTransition {
-        let OrderedFinalAggregateState::PreparingMergeInput {
+        original_state: ClusteredFinalAggregateState,
+    ) -> ClusteredFinalAggregateStateTransition {
+        let ClusteredFinalAggregateState::PreparingMergeInput {
             mut table,
             mut spill_context,
         } = original_state
@@ -671,13 +672,13 @@ impl OrderedFinalAggregateStream {
 
         match replay {
             Ok(stream) => {
-                ControlFlow::Continue(OrderedFinalAggregateState::MergingSpills {
+                ControlFlow::Continue(ClusteredFinalAggregateState::MergingSpills {
                     stream,
                 })
             }
             Err(e) => ControlFlow::Break((
                 Poll::Ready(Some(Err(e))),
-                OrderedFinalAggregateState::Done,
+                ClusteredFinalAggregateState::Done,
             )),
         }
     }
@@ -691,9 +692,9 @@ impl OrderedFinalAggregateStream {
     fn handle_merging_spills(
         &mut self,
         cx: &mut Context<'_>,
-        original_state: OrderedFinalAggregateState,
-    ) -> OrderedFinalAggregateStateTransition {
-        let OrderedFinalAggregateState::MergingSpills { mut stream } = original_state
+        original_state: ClusteredFinalAggregateState,
+    ) -> ClusteredFinalAggregateStateTransition {
+        let ClusteredFinalAggregateState::MergingSpills { mut stream } = original_state
         else {
             return Self::break_with_internal_err(
                 "Ordered final aggregate stream expected MergingSpills state",
@@ -703,17 +704,19 @@ impl OrderedFinalAggregateStream {
         match stream.poll_next_unpin(cx) {
             Poll::Pending => ControlFlow::Break((
                 Poll::Pending,
-                OrderedFinalAggregateState::MergingSpills { stream },
+                ClusteredFinalAggregateState::MergingSpills { stream },
             )),
             Poll::Ready(Some(Ok(batch))) => ControlFlow::Break((
                 Poll::Ready(Some(Ok(batch))),
-                OrderedFinalAggregateState::MergingSpills { stream },
+                ClusteredFinalAggregateState::MergingSpills { stream },
             )),
             Poll::Ready(Some(Err(e))) => ControlFlow::Break((
                 Poll::Ready(Some(Err(e))),
-                OrderedFinalAggregateState::Done,
+                ClusteredFinalAggregateState::Done,
             )),
-            Poll::Ready(None) => ControlFlow::Continue(OrderedFinalAggregateState::Done),
+            Poll::Ready(None) => {
+                ControlFlow::Continue(ClusteredFinalAggregateState::Done)
+            }
         }
     }
 
@@ -727,9 +730,10 @@ impl OrderedFinalAggregateStream {
     /// Returns the next operator state with control flow decision.
     fn handle_producing_output(
         &mut self,
-        original_state: OrderedFinalAggregateState,
-    ) -> OrderedFinalAggregateStateTransition {
-        let OrderedFinalAggregateState::ProducingOutput { table } = original_state else {
+        original_state: ClusteredFinalAggregateState,
+    ) -> ClusteredFinalAggregateStateTransition {
+        let ClusteredFinalAggregateState::ProducingOutput { table } = original_state
+        else {
             return Self::break_with_internal_err(
                 "Ordered final aggregate stream expected ProducingOutput state",
             );
@@ -748,18 +752,18 @@ impl OrderedFinalAggregateStream {
                     if let Err(e) = self.reservation.try_resize(0) {
                         return ControlFlow::Break((
                             Poll::Ready(Some(Err(e))),
-                            OrderedFinalAggregateState::Done,
+                            ClusteredFinalAggregateState::Done,
                         ));
                     }
-                    OrderedFinalAggregateState::Done
+                    ClusteredFinalAggregateState::Done
                 } else {
                     if let Err(e) = self.reservation.try_resize(table.memory_size()) {
                         return ControlFlow::Break((
                             Poll::Ready(Some(Err(e))),
-                            OrderedFinalAggregateState::ProducingOutput { table },
+                            ClusteredFinalAggregateState::ProducingOutput { table },
                         ));
                     }
-                    OrderedFinalAggregateState::ProducingOutput { table }
+                    ClusteredFinalAggregateState::ProducingOutput { table }
                 };
 
                 ControlFlow::Break((
@@ -769,11 +773,11 @@ impl OrderedFinalAggregateStream {
             }
             Err(e) => ControlFlow::Break((
                 Poll::Ready(Some(Err(e))),
-                OrderedFinalAggregateState::ProducingOutput { table },
+                ClusteredFinalAggregateState::ProducingOutput { table },
             )),
             Ok(None) => {
                 drop(table);
-                let next_state = OrderedFinalAggregateState::Done;
+                let next_state = ClusteredFinalAggregateState::Done;
                 if let Err(e) = self.reservation.try_resize(0) {
                     return ControlFlow::Break((Poll::Ready(Some(Err(e))), next_state));
                 }
@@ -783,12 +787,12 @@ impl OrderedFinalAggregateStream {
     }
 }
 
-impl Stream for OrderedFinalAggregateStream {
+impl Stream for ClusteredFinalAggregateStream {
     type Item = Result<RecordBatch>;
 
     /// Entry point for the ordered final aggregate state machine.
     ///
-    /// See comments in [`OrderedFinalAggregateStream`] for high-level ideas.
+    /// See comments in [`ClusteredFinalAggregateStream`] for high-level ideas.
     ///
     /// State transition graph:
     ///
@@ -847,25 +851,25 @@ impl Stream for OrderedFinalAggregateStream {
             let cur_state = self
                 .state
                 .take()
-                .expect("OrderedFinalAggregateStream state should not be None");
+                .expect("ClusteredFinalAggregateStream state should not be None");
 
             let next_state = match cur_state {
-                state @ OrderedFinalAggregateState::ReadingInput { .. } => {
+                state @ ClusteredFinalAggregateState::ReadingInput { .. } => {
                     self.handle_reading_input(cx, state)
                 }
-                state @ OrderedFinalAggregateState::Spilling { .. } => {
+                state @ ClusteredFinalAggregateState::Spilling { .. } => {
                     self.handle_spilling(state)
                 }
-                state @ OrderedFinalAggregateState::PreparingMergeInput { .. } => {
+                state @ ClusteredFinalAggregateState::PreparingMergeInput { .. } => {
                     self.handle_preparing_merge_input(state)
                 }
-                state @ OrderedFinalAggregateState::MergingSpills { .. } => {
+                state @ ClusteredFinalAggregateState::MergingSpills { .. } => {
                     self.handle_merging_spills(cx, state)
                 }
-                state @ OrderedFinalAggregateState::ProducingOutput { .. } => {
+                state @ ClusteredFinalAggregateState::ProducingOutput { .. } => {
                     self.handle_producing_output(state)
                 }
-                state @ OrderedFinalAggregateState::Done => {
+                state @ ClusteredFinalAggregateState::Done => {
                     let _ = self.reservation.try_resize(0);
                     self.state = Some(state);
                     return Poll::Ready(None);
@@ -883,7 +887,7 @@ impl Stream for OrderedFinalAggregateStream {
                     drop(next_state);
                     self.close_input();
                     self.reservation.free();
-                    self.state = Some(OrderedFinalAggregateState::Done);
+                    self.state = Some(ClusteredFinalAggregateState::Done);
                     return Poll::Ready(Some(Err(e)));
                 }
                 ControlFlow::Break((poll, next_state)) => {
@@ -895,7 +899,7 @@ impl Stream for OrderedFinalAggregateStream {
     }
 }
 
-impl RecordBatchStream for OrderedFinalAggregateStream {
+impl RecordBatchStream for ClusteredFinalAggregateStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

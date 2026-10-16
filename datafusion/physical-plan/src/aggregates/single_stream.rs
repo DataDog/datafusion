@@ -37,16 +37,17 @@ use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use futures::stream::{Stream, StreamExt};
 
 use super::aggregate_hash_table::{AggregateHashTable, SingleMarker};
+use super::clustered_final_stream::ClusteredFinalAggregateStream;
 use super::group_values::GroupByMetrics;
-use super::ordered_final_stream::OrderedFinalAggregateStream;
 use super::{AggregateExec, create_schema};
 use crate::aggregates::AggregateMode;
+use crate::aggregates::GroupClusteringMode;
 use crate::metrics::{BaselineMetrics, RecordOutput, SpillMetrics};
 use crate::sorts::IncrementalSortIterator;
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::EmptyRecordBatchStream;
-use crate::{InputOrderMode, RecordBatchStream, SendableRecordBatchStream};
+use crate::{RecordBatchStream, SendableRecordBatchStream};
 
 /// Hash aggregation can run the full logical aggregation in one operator. This
 /// stream implements the single stage for grouped hash aggregation.
@@ -83,7 +84,7 @@ use crate::{InputOrderMode, RecordBatchStream, SendableRecordBatchStream};
 /// 3. Perform a sort-preserving merge of all spill files and feed the merged output
 ///    into an ordered streaming aggregation, which ensures bounded memory usage and
 ///    evaluates the final result.
-///    - [`OrderedFinalAggregateStream`] is reused for the streaming aggregation.
+///    - [`ClusteredFinalAggregateStream`] is reused for the streaming aggregation.
 pub(crate) struct SingleHashAggregateStream {
     /// Output schema: group columns followed by final aggregate value columns.
     schema: SchemaRef,
@@ -115,7 +116,7 @@ struct SingleSpillContext {
     /// and column-based group expressions rather than evaluating the raw input
     /// expressions a second time. After the spill files are merged into ordered
     /// input, this configuration is used to construct an
-    /// [`OrderedFinalAggregateStream`], and perform the final evaluation step.
+    /// [`ClusteredFinalAggregateStream`], and perform the final evaluation step.
     final_agg: AggregateExec,
     /// Task context.
     context: Arc<TaskContext>,
@@ -210,7 +211,7 @@ impl SingleSpillContext {
             }
         };
         final_agg.group_by = Arc::new(agg.group_by.as_final());
-        final_agg.input_order_mode = InputOrderMode::Sorted;
+        final_agg.group_clustering_mode = GroupClusteringMode::Full;
 
         Ok(Self {
             final_agg,
@@ -263,7 +264,7 @@ impl SingleSpillContext {
     }
 
     /// Merges every sorted run, and do the aggregate evaluation with
-    /// [`OrderedFinalAggregateStream`]
+    /// [`ClusteredFinalAggregateStream`]
     fn into_replay_stream(
         self,
         baseline_metrics: &BaselineMetrics,
@@ -294,12 +295,12 @@ impl SingleSpillContext {
             .with_batch_size(batch_size)
             .with_reservation(merge_reservation)
             .build()?;
-        let replay = OrderedFinalAggregateStream::new_with_input_and_metrics(
+        let replay = ClusteredFinalAggregateStream::new_with_input_and_metrics(
             &final_agg,
             &context,
             partition,
             merged,
-            &InputOrderMode::Sorted,
+            &GroupClusteringMode::Full,
             baseline_metrics.clone(),
             group_by_metrics,
             None,
@@ -319,7 +320,7 @@ impl SingleHashAggregateStream {
             agg.mode,
             AggregateMode::Single | AggregateMode::SinglePartitioned
         ));
-        debug_assert_eq!(agg.input_order_mode, InputOrderMode::Linear);
+        debug_assert_eq!(agg.group_clustering_mode, GroupClusteringMode::None);
 
         let schema = Arc::clone(&agg.schema);
         let input = agg.input.execute(partition, Arc::clone(context))?;
