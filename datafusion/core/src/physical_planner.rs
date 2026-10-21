@@ -863,7 +863,9 @@ impl DefaultPhysicalPlanner {
                         e.context(format!("MERGE INTO operation on table '{table_name}'"))
                     })?
             }
-            LogicalPlan::Window(Window { window_expr, .. }) => {
+            LogicalPlan::Window(Window {
+                window_expr, input, ..
+            }) => {
                 assert_or_internal_err!(
                     !window_expr.is_empty(),
                     "Impossibly got empty window expression"
@@ -906,13 +908,32 @@ impl DefaultPhysicalPlanner {
                     );
                 }
 
-                let logical_schema = node.schema();
+                // Keep logical names for expression resolution, but take types and
+                // nullability from the physical input (providers may relax their
+                // logical schemas for write planning).
+                let physical_schema = input_exec.schema();
+                let logical_schema = DFSchema::new_with_metadata(
+                    input
+                        .schema()
+                        .iter()
+                        .zip(physical_schema.fields())
+                        .map(|((qualifier, logical), physical)| {
+                            (
+                                qualifier.cloned(),
+                                Arc::new(
+                                    physical.as_ref().clone().with_name(logical.name()),
+                                ),
+                            )
+                        })
+                        .collect(),
+                    physical_schema.metadata().clone(),
+                )?;
                 let window_expr = window_expr
                     .iter()
                     .map(|e| {
                         create_window_expr(
                             e,
-                            logical_schema,
+                            &logical_schema,
                             execution_props,
                             planning_ctx,
                         )

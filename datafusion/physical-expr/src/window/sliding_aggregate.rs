@@ -227,8 +227,7 @@ impl AggregateWindowExpr for SlidingAggregateWindowExpr {
                     .collect::<Result<Vec<_>>>()?;
                 accumulator.retract_batch(&retract)?
             }
-            self.aggregate
-                .default_value(self.aggregate.field().data_type())
+            self.aggregate.default_value_for_window()
         } else {
             // Accumulate any new rows that have entered the window:
             let update_bound = cur_range.end - last_range.end;

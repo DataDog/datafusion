@@ -1169,3 +1169,156 @@ async fn test_metadata_based_aggregate_as_window() -> Result<()> {
 
     Ok(())
 }
+
+/// Mimics a provider with nullable logical fields and stricter physical fields.
+#[derive(Debug)]
+struct RelaxedSchemaTable(MemTable);
+
+#[async_trait::async_trait]
+impl datafusion::catalog::TableProvider for RelaxedSchemaTable {
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        Arc::new(Schema::new(
+            self.0
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone().with_nullable(true))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn table_type(&self) -> datafusion_expr::TableType {
+        datafusion_expr::TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.0.scan(state, projection, filters, limit).await
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct InputAwareWindowDefault {
+    signature: Signature,
+}
+
+impl AggregateUDFImpl for InputAwareWindowDefault {
+    fn name(&self) -> &str {
+        "input_aware_window_default"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        datafusion_functions_aggregate::average::Avg::new().accumulator(args)
+    }
+
+    fn default_value(&self, _data_type: &DataType) -> Result<ScalarValue> {
+        Ok(ScalarValue::Float64(Some(-999.0)))
+    }
+
+    fn default_value_for_window(&self, args: AccumulatorArgs) -> Result<ScalarValue> {
+        if args.expr_fields[0].is_nullable() {
+            return Ok(ScalarValue::Float64(None));
+        }
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let datafusion_expr::ColumnarValue::Scalar(value) =
+            args.exprs[1].evaluate(&batch)?
+        else {
+            return exec_err!("expected a constant default");
+        };
+        Ok(value)
+    }
+}
+
+#[tokio::test]
+async fn empty_window_defaults_use_physical_input_fields_and_arguments() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::UInt64, false),
+        Field::new("n", DataType::UInt64, false),
+        Field::new("x", DataType::Float64, false),
+        Field::new("nx", DataType::Float64, true),
+    ]));
+    let partitions = (0..2)
+        .map(|g| {
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(UInt64Array::from(vec![g; 4])),
+                Arc::new(UInt64Array::from(vec![0, 1, 2, 3])),
+                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0])),
+                Arc::new(Float64Array::from(vec![
+                    None,
+                    Some(2.0),
+                    Some(3.0),
+                    Some(4.0),
+                ])),
+            ];
+            Ok(vec![RecordBatch::try_new(Arc::clone(&schema), columns)?])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ctx = SessionContext::new_with_config(
+        datafusion::prelude::SessionConfig::new()
+            .with_batch_size(2)
+            .with_target_partitions(2),
+    );
+    ctx.register_table(
+        "t",
+        Arc::new(RelaxedSchemaTable(MemTable::try_new(schema, partitions)?)),
+    )?;
+    let udf = AggregateUDF::from(InputAwareWindowDefault {
+        signature: Signature::exact(
+            vec![DataType::Float64, DataType::Float64],
+            Volatility::Immutable,
+        ),
+    })
+    .with_aliases(["window_default_alias"]);
+    ctx.register_udaf(udf);
+    for (frame, last) in [
+        ("UNBOUNDED PRECEDING AND 1 PRECEDING", 2.0),
+        ("2 PRECEDING AND 1 PRECEDING", 2.5),
+    ] {
+        let batches = ctx.sql(&format!(
+            "SELECT g, n, window_default_alias(x, 7.0) OVER w AS a, \
+             window_default_alias(x, 9.0) OVER w AS b, \
+             window_default_alias(nx, 7.0) OVER w AS c, count(*) OVER w AS cnt \
+             FROM t WINDOW w AS (PARTITION BY g ORDER BY n ROWS BETWEEN {frame}) ORDER BY g, n"
+        )).await?.collect().await?;
+        let mut row_number = 0;
+        for batch in batches {
+            for row in 0..batch.num_rows() {
+                let n = row_number % 4;
+                for (column, default) in [(2, 7.0), (3, 9.0)] {
+                    let expected = [default, 1.0, 1.5, last][n];
+                    assert_eq!(
+                        ScalarValue::try_from_array(batch.column(column), row)?,
+                        ScalarValue::Float64(Some(expected))
+                    );
+                }
+                let expected = [None, None, Some(2.0), Some(2.5)][n];
+                assert_eq!(
+                    ScalarValue::try_from_array(batch.column(4), row)?,
+                    ScalarValue::Float64(expected)
+                );
+                if n == 0 {
+                    assert_eq!(
+                        ScalarValue::try_from_array(batch.column(5), row)?,
+                        ScalarValue::Int64(Some(0))
+                    );
+                }
+                row_number += 1;
+            }
+        }
+        assert_eq!(row_number, 8);
+    }
+    Ok(())
+}

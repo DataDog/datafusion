@@ -340,6 +340,13 @@ impl AggregateUDF {
         self.inner.default_value(data_type)
     }
 
+    /// Return the default for an empty window frame with resolved arguments.
+    ///
+    /// See [`AggregateUDFImpl::default_value_for_window`] for more details.
+    pub fn default_value_for_window(&self, args: AccumulatorArgs) -> Result<ScalarValue> {
+        self.inner.default_value_for_window(args)
+    }
+
     /// See [`AggregateUDFImpl::supports_null_handling_clause`] for more details.
     pub fn supports_null_handling_clause(&self) -> bool {
         self.inner.supports_null_handling_clause()
@@ -827,6 +834,16 @@ pub trait AggregateUDFImpl: Debug + DynEq + DynHash + Send + Sync + Any {
     /// while `count` returns 0 if input is Null
     fn default_value(&self, data_type: &DataType) -> Result<ScalarValue> {
         ScalarValue::try_from(data_type)
+    }
+
+    /// Return the value for an empty window frame using the resolved input
+    /// fields and arguments. Unlike [`Self::default_value`], this hook can
+    /// distinguish input nullability and inspect constant function parameters.
+    ///
+    /// The default preserves [`Self::default_value`]. Aggregates whose empty
+    /// result depends on the arguments can evaluate a fresh accumulator here.
+    fn default_value_for_window(&self, args: AccumulatorArgs) -> Result<ScalarValue> {
+        self.default_value(args.return_type())
     }
 
     /// If this function supports `[IGNORE NULLS | RESPECT NULLS]` SQL clause,
@@ -1376,6 +1393,10 @@ impl AggregateUDFImpl for AliasedAggregateUDFImpl {
 
     fn default_value(&self, data_type: &DataType) -> Result<ScalarValue> {
         self.inner.default_value(data_type)
+    }
+
+    fn default_value_for_window(&self, args: AccumulatorArgs) -> Result<ScalarValue> {
+        self.inner.default_value_for_window(args)
     }
 
     fn supports_null_handling_clause(&self) -> bool {

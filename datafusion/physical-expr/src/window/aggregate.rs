@@ -247,8 +247,7 @@ impl AggregateWindowExpr for PlainAggregateWindowExpr {
         filter_mask: Option<&BooleanArray>,
     ) -> Result<ScalarValue> {
         if cur_range.start == cur_range.end {
-            self.aggregate
-                .default_value(self.aggregate.field().data_type())
+            self.aggregate.default_value_for_window()
         } else {
             // Accumulate any new rows that have entered the window:
             let update_bound = cur_range.end - last_range.end;

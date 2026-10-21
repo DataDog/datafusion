@@ -735,7 +735,16 @@ impl AggregateFunctionExpr {
     /// the accumulator expects the same number of arguments as `expressions` and must
     /// return states with the same description as `state_fields`
     pub fn create_accumulator(&self) -> Result<Box<dyn Accumulator>> {
-        let acc_args = AccumulatorArgs {
+        self.fun.accumulator(self.accumulator_args())
+    }
+
+    /// Return the empty-window default with resolved input fields and arguments.
+    pub fn default_value_for_window(&self) -> Result<ScalarValue> {
+        self.fun.default_value_for_window(self.accumulator_args())
+    }
+
+    fn accumulator_args(&self) -> AccumulatorArgs<'_> {
+        AccumulatorArgs {
             return_field: Arc::clone(&self.return_field),
             schema: &self.schema,
             expr_fields: &self.arg_fields,
@@ -745,9 +754,7 @@ impl AggregateFunctionExpr {
             name: &self.name,
             is_reversed: self.is_reversed,
             exprs: &self.args,
-        };
-
-        self.fun.accumulator(acc_args)
+        }
     }
 
     /// the field of the final result of this aggregation.
