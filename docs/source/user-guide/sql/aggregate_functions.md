@@ -415,7 +415,7 @@ median(expression)
 ```sql
 > SELECT median(column_name) FROM table_name;
 +----------------------+
-| median(column_name)   |
+| median(column_name)  |
 +----------------------+
 | 45.5                 |
 +----------------------+
@@ -461,11 +461,11 @@ percentile_cont(percentile) WITHIN GROUP (ORDER BY expression)
 
 ```sql
 > SELECT percentile_cont(0.75) WITHIN GROUP (ORDER BY column_name) FROM table_name;
-+----------------------------------------------------------+
++-----------------------------------------------------------+
 | percentile_cont(0.75) WITHIN GROUP (ORDER BY column_name) |
-+----------------------------------------------------------+
-| 45.5                                                     |
-+----------------------------------------------------------+
++-----------------------------------------------------------+
+| 45.5                                                      |
++-----------------------------------------------------------+
 ```
 
 An alternate syntax is also supported:
