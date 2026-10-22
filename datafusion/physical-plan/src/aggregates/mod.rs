@@ -3868,11 +3868,11 @@ mod tests {
         check_grouping_sets(input, true).await
     }
 
-    // Median(a)
+    // Median(b)
     fn test_median_agg_expr(schema: SchemaRef) -> Result<AggregateFunctionExpr> {
-        AggregateExprBuilder::new(median_udaf(), vec![col("a", &schema)?])
+        AggregateExprBuilder::new(median_udaf(), vec![col("b", &schema)?])
             .schema(schema)
-            .alias("MEDIAN(a)")
+            .alias("MEDIAN(b)")
             .build()
     }
 
