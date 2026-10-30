@@ -64,6 +64,8 @@ enum EvalMethod {
     ///     [ELSE result]
     /// END
     WithExpression(ProjectedCaseBody),
+    /// Route remaining literal WHEN matches after evaluating the leading branches.
+    WithLiteralWhen(ProjectedCaseBody, LiteralLookupTable),
     /// This is a specialization for a specific use case where we can take a fast path
     /// for expressions that are infallible and can be cheaply computed for the entire
     /// record batch rather than just for the rows where the predicate is true.
@@ -128,6 +130,108 @@ struct CaseBody {
 }
 
 impl CaseBody {
+    fn literal_branch_lookup(&self) -> Option<LiteralLookupTable> {
+        // For short CASE expressions, sequential comparisons avoid lookup/gather setup.
+        if self.when_then_expr.len() <= 8 {
+            return None;
+        }
+        // Map keys to original branch indices using the existing first-match/NULL rules.
+        let count = u32::try_from(self.when_then_expr.len()).ok()?;
+        let body = Self {
+            expr: self.expr.clone(),
+            when_then_expr: self
+                .when_then_expr
+                .iter()
+                .zip(0..count)
+                .map(|((when, _), index)| (Arc::clone(when), lit(index)))
+                .collect(),
+            else_expr: Some(lit(count)),
+        };
+        LiteralLookupTable::maybe_new(&body)
+    }
+
+    fn case_when_literal_branches(
+        &self,
+        batch: &RecordBatch,
+        keys: &ArrayRef,
+        return_type: &DataType,
+        lookup: &LiteralLookupTable,
+    ) -> Result<ColumnarValue> {
+        let row_count = batch.num_rows();
+        let count = u32::try_from(row_count).map_err(|_| {
+            internal_datafusion_err!("CASE batch exceeds row index limit")
+        })?;
+        let branch_expr = |branch: usize| -> Result<Option<Arc<dyn PhysicalExpr>>> {
+            if let Some((_, then)) = self.when_then_expr.get(branch) {
+                Ok(Some(Arc::clone(then)))
+            } else {
+                self.else_expr
+                    .as_ref()
+                    .map(|otherwise| {
+                        try_cast(
+                            Arc::clone(otherwise),
+                            &batch.schema(),
+                            return_type.clone(),
+                        )
+                    })
+                    .transpose()
+            }
+        };
+        let mut result = ResultBuilder::new(return_type, row_count);
+        if row_count == 0 {
+            return result.finish();
+        }
+        // A constant batch needs one lookup and no gathers, including a batch of NULLs.
+        let first = keys.slice(0, 1);
+        let same_key = if keys.logical_null_count() == row_count {
+            true
+        } else {
+            let value = ScalarValue::try_from_array(keys, 0)?.to_scalar()?;
+            let equal = compare_with_eq(&value, keys, keys.data_type().is_nested())?;
+            equal.null_count() == 0 && !equal.has_false()
+        };
+        if same_key {
+            let index = lookup.map_keys_to_values(&first)?;
+            let branch = index.as_primitive::<UInt32Type>().value(0) as usize;
+            return match branch_expr(branch)? {
+                Some(expr) => expr.evaluate(batch),
+                None => result.finish(),
+            };
+        }
+        let branches = lookup.map_keys_to_values(keys)?;
+        let mut selections = vec![Vec::new(); self.when_then_expr.len() + 1];
+        for (row, branch) in
+            (0..count).zip(branches.as_primitive::<UInt32Type>().values())
+        {
+            selections[*branch as usize].push(row);
+        }
+        for (branch, rows) in selections.into_iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
+            let Some(expr) = branch_expr(branch)? else {
+                continue;
+            };
+            if rows.len() == row_count {
+                return expr.evaluate(batch);
+            }
+            let indices: ArrayRef = Arc::new(UInt32Array::from(rows));
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| arrow::compute::take(column, &indices, None))
+                .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
+            // Expressions without column references still need the selected row count.
+            let selected = RecordBatch::try_new_with_options(
+                batch.schema(),
+                columns,
+                &RecordBatchOptions::new().with_row_count(Some(indices.len())),
+            )?;
+            result.add_branch_result(&indices, expr.evaluate(&selected)?)?;
+        }
+        result.finish()
+    }
+
     /// Derives a [ProjectedCaseBody] from this [CaseBody].
     fn project(&self) -> Result<ProjectedCaseBody> {
         // Determine the set of columns that are used in all the expressions of the case body.
@@ -685,6 +789,9 @@ impl CaseExpr {
                 return Ok(EvalMethod::WithExprScalarLookupTable(mapping));
             }
 
+            if let Some(mapping) = body.literal_branch_lookup() {
+                return Ok(EvalMethod::WithLiteralWhen(body.project()?, mapping));
+            }
             return Ok(EvalMethod::WithExpression(body.project()?));
         }
 
@@ -750,6 +857,7 @@ impl CaseBody {
         &self,
         batch: &RecordBatch,
         return_type: &DataType,
+        lookup: Option<&LiteralLookupTable>,
     ) -> Result<ColumnarValue> {
         let mut result_builder = ResultBuilder::new(return_type, batch.num_rows());
 
@@ -817,6 +925,19 @@ impl CaseBody {
         let base_value_is_nested = base_values.data_type().is_nested();
 
         for i in 0..self.when_then_expr.len() {
+            // Preserve early exits for common leading branches before paying for routing.
+            if i == 2
+                && let Some(lookup) = lookup
+            {
+                let value = self.case_when_literal_branches(
+                    &remainder_batch,
+                    &base_values,
+                    return_type,
+                    lookup,
+                )?;
+                result_builder.add_branch_result(&remainder_rows, value)?;
+                return result_builder.finish();
+            }
             // Evaluate the 'when' predicate for the remainder batch
             // This results in a boolean array with the same length as the remaining number of rows
             let when_expr = &self.when_then_expr[i].0;
@@ -1047,6 +1168,7 @@ impl CaseExpr {
         &self,
         batch: &RecordBatch,
         projected: &ProjectedCaseBody,
+        lookup: Option<&LiteralLookupTable>,
     ) -> Result<ColumnarValue> {
         let return_type = self.data_type(&batch.schema())?;
         // projected.projection may include indexes of lambda variables not available on this batch
@@ -1060,9 +1182,9 @@ impl CaseExpr {
             let projected_batch = batch.project(&projection)?;
             projected
                 .body
-                .case_when_with_expr(&projected_batch, &return_type)
+                .case_when_with_expr(&projected_batch, &return_type, lookup)
         } else {
-            self.body.case_when_with_expr(batch, &return_type)
+            self.body.case_when_with_expr(batch, &return_type, lookup)
         }
     }
 
@@ -1326,7 +1448,10 @@ impl PhysicalExpr for CaseExpr {
             EvalMethod::WithExpression(p) => {
                 // this use case evaluates "expr" and then compares the values with the "when"
                 // values
-                self.case_when_with_expr(batch, p)
+                self.case_when_with_expr(batch, p, None)
+            }
+            EvalMethod::WithLiteralWhen(p, lookup) => {
+                self.case_when_with_expr(batch, p, Some(lookup))
             }
             EvalMethod::NoExpression(p) => {
                 // The "when" conditions all evaluate to boolean in this use case and can be
@@ -3524,3 +3649,6 @@ mod proto_tests {
         assert!(matches!(err, DataFusionError::Internal(msg) if msg.contains("call 2")));
     }
 }
+
+#[cfg(test)]
+mod literal_branches_tests;
