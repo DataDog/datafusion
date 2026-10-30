@@ -906,3 +906,30 @@ drop table floats;
 #####
 # End of lookup table CASE tests
 #####
+
+# Literal branch routing preserves first-match precedence and nullable expression results.
+statement ok
+CREATE TABLE literal_case_values (id BIGINT, category BIGINT, amount BIGINT) AS VALUES (1, 1, 10), (2, 2, 20), (3, 1, NULL), (4, 5, 40), (5, NULL, 50), (6, 99, 60);
+
+query II
+SELECT id, CASE category WHEN 1 THEN amount + 10 WHEN 2 THEN amount * 2 WHEN 3 THEN amount - 2 WHEN 4 THEN amount + 4 WHEN 5 THEN amount * 3 WHEN 6 THEN amount + 6 WHEN 7 THEN amount + 7 WHEN 8 THEN amount + 8 WHEN 9 THEN amount + 9 WHEN 1 THEN amount + 999 ELSE -amount END FROM literal_case_values ORDER BY id;
+----
+1 20
+2 40
+3 NULL
+4 120
+5 -50
+6 -60
+
+query II
+SELECT id, CASE category WHEN 1 THEN amount + 10 WHEN 2 THEN amount * 2 WHEN 3 THEN amount - 2 WHEN 4 THEN amount + 4 WHEN 5 THEN amount * 3 WHEN 6 THEN amount + 6 WHEN 7 THEN amount + 7 WHEN 8 THEN amount + 8 WHEN 9 THEN amount + 9 END FROM literal_case_values ORDER BY id;
+----
+1 20
+2 40
+3 NULL
+4 120
+5 NULL
+6 NULL
+
+statement ok
+DROP TABLE literal_case_values;
