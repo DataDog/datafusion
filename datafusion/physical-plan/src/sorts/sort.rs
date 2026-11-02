@@ -21,11 +21,11 @@
 
 use std::fmt;
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 
-use crate::common::spawn_buffered;
 use crate::execution_plan::{
     Boundedness, CardinalityEffect, EmissionType, has_same_children_properties,
     replace_children_if_necessary,
@@ -38,7 +38,8 @@ use crate::filter_pushdown::{
 };
 use crate::limit::LimitStream;
 use crate::metrics::{
-    BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, SpillMetrics,
+    BaselineMetrics, ElapsedComputeFutureExt, ExecutionPlanMetricsSet, MetricsSet,
+    SpillMetrics,
 };
 use crate::projection::{ProjectionExec, make_with_child, update_ordering};
 use crate::sorts::IncrementalSortIterator;
@@ -62,10 +63,12 @@ use arrow::compute::{concat_batches, lexsort_to_indices, take_arrays};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::config::SpillCompression;
 use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::utils::get_available_parallelism;
 use datafusion_common::{
     DataFusionError, Result, assert_or_internal_err, internal_datafusion_err,
     unwrap_or_internal_err,
 };
+use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::runtime_env::RuntimeEnv;
@@ -73,8 +76,10 @@ use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
 
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use log::{debug, trace};
+use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::sync::Semaphore;
 
 struct ExternalSorterMetrics {
     /// metrics
@@ -89,6 +94,43 @@ impl ExternalSorterMetrics {
             baseline: BaselineMetrics::new(metrics, partition),
             spill_metrics: SpillMetrics::new(metrics, partition),
         }
+    }
+}
+
+/// Limits concurrent batch sorting across the partitions of one [`SortExec`].
+#[derive(Debug, Clone)]
+struct SortConcurrency {
+    /// Each partition can use the full concurrency budget, but queues at most this
+    /// many jobs so it cannot put all its runs ahead of other partitions.
+    per_partition_limit: usize,
+    /// Shared budget: a job holds a permit until its run has been sorted.
+    permits: Arc<Semaphore>,
+}
+
+impl SortConcurrency {
+    /// Returns the shared limit on multithreaded Tokio runtimes, initialized
+    /// on first use.
+    fn for_current_runtime(cell: &OnceLock<Self>) -> Option<Self> {
+        let handle = Handle::try_current().ok()?;
+        if handle.runtime_flavor() != RuntimeFlavor::MultiThread {
+            return None;
+        }
+        Some(
+            cell.get_or_init(|| {
+                // These jobs are CPU-bound. Cap concurrency by the worker count
+                // to avoid queuing jobs that cannot run, and by estimated CPU
+                // parallelism to avoid oversubscribing CPUs on larger runtimes.
+                let limit = handle
+                    .metrics()
+                    .num_workers()
+                    .min(get_available_parallelism());
+                Self {
+                    per_partition_limit: limit,
+                    permits: Arc::new(Semaphore::new(limit)),
+                }
+            })
+            .clone(),
+        )
     }
 }
 
@@ -264,6 +306,9 @@ struct ExternalSorter {
     /// How much memory to reserve for performing in-memory sort/merges
     /// prior to spilling.
     sort_spill_reservation_bytes: usize,
+    /// Shared by the owning SortExec's partitions. Initialized on the runtime
+    /// that polls the sort, which may differ from the one calling `execute`.
+    sort_concurrency: Arc<OnceLock<SortConcurrency>>,
 }
 
 impl ExternalSorter {
@@ -312,6 +357,7 @@ impl ExternalSorter {
             batch_size,
             sort_spill_reservation_bytes,
             sort_in_place_threshold_bytes,
+            sort_concurrency: Arc::new(OnceLock::new()),
         })
     }
 
@@ -376,7 +422,7 @@ impl ExternalSorter {
             // allocation. Only needed for the non-spill path; the spill
             // path transfers the reservation to the merge stream instead.
             self.merge_reservation.free();
-            self.in_mem_sort_stream(true, true)
+            self.in_mem_sort_stream(true, true).await
         }
     }
 
@@ -478,11 +524,13 @@ impl ExternalSorter {
         // reserved again for the next spill.
         self.merge_reservation.free();
 
-        let mut sorted_stream = self.in_mem_sort_stream(
-            false,
-            // No coalescing on the spill path: it raises per-run peak memory.
-            false,
-        )?;
+        let mut sorted_stream = self
+            .in_mem_sort_stream(
+                false,
+                // No coalescing on the spill path: it raises per-run peak memory.
+                false,
+            )
+            .await?;
         // After `in_mem_sort_stream()` is constructed, all `in_mem_batches` is taken
         // to construct a globally sorted stream.
         assert_or_internal_err!(
@@ -589,7 +637,7 @@ impl ExternalSorter {
     /// ```
     /// `coalesce_runs` merges buffered batches into fewer, larger sorted runs to
     /// reduce merge fan-in. Disabled on the spill path to keep peak memory low.
-    fn in_mem_sort_stream(
+    async fn in_mem_sort_stream(
         &mut self,
         is_output_stream: bool,
         coalesce_runs: bool,
@@ -603,13 +651,11 @@ impl ExternalSorter {
         // The elapsed compute timer is updated when the value is dropped.
         // There is no need for an explicit call to drop.
         let elapsed_compute = self.metrics.baseline.elapsed_compute().clone();
-        let _timer = elapsed_compute.timer();
+        let mut timer = elapsed_compute.timer();
 
-        // Please pay attention that any operation inside of `in_mem_sort_stream` will
-        // not perform any memory reservation. This is for avoiding the need of handling
-        // reservation failure and spilling in the middle of the sort/merge. The memory
-        // space for batches produced by the resulting stream will be reserved by the
-        // consumer of the stream.
+        // Sorting can resize reservations.
+        // Prepared output stays reserved until each batch is read from its run stream.
+        // The consumer of the merged stream reserves its final output.
 
         if self.in_mem_batches.len() == 1 {
             let batch = self.in_mem_batches.swap_remove(0);
@@ -643,16 +689,20 @@ impl ExternalSorter {
             batches
         };
 
-        let streams = runs
-            .into_iter()
-            .map(|batch| {
-                let reservation = self
-                    .reservation
-                    .split(get_reserved_bytes_for_record_batch(&batch)?);
-                let input = self.sort_batch_stream(batch, reservation)?;
-                Ok(spawn_buffered(input, 1))
-            })
-            .collect::<Result<_>>()?;
+        let concurrency = SortConcurrency::for_current_runtime(&self.sort_concurrency);
+        let streams = if let Some(concurrency) = concurrency {
+            // Time this task's setup and collection work, excluding waits for jobs.
+            timer.stop();
+            let streams = self
+                .prepare_sort_runs(runs, &concurrency)
+                .with_elapsed_compute(elapsed_compute.clone())
+                .await?;
+            timer.restart();
+            streams
+        } else {
+            // Outside a multithreaded runtime, sort each run when the merge polls it.
+            self.sort_run_streams(runs)?
+        };
 
         StreamingMergeBuilder::new()
             .with_streams(streams)
@@ -667,6 +717,82 @@ impl ExternalSorter {
             .with_fetch(None)
             .with_reservation(self.merge_reservation.new_empty())
             .build()
+    }
+
+    /// Sort runs concurrently, returning their streams in input order.
+    async fn prepare_sort_runs(
+        &mut self,
+        runs: Vec<RecordBatch>,
+        concurrency: &SortConcurrency,
+    ) -> Result<Vec<SendableRecordBatchStream>> {
+        let run_count = runs.len();
+        let jobs = runs.into_iter().enumerate().map(move |(index, batch)| {
+            let reservation = self
+                .reservation
+                .split(get_reserved_bytes_for_record_batch(&batch)?);
+            let sort = self.sort_run(batch, reservation)?;
+            let permits = Arc::clone(&concurrency.permits);
+            Ok::<_, DataFusionError>(async move {
+                let stream = Self::prepare_sort_run(sort, permits).await?;
+                Ok((index, stream))
+            })
+        });
+        // Ordered buffering would keep completed runs behind a slow earlier run,
+        // filling the window and preventing new jobs from starting.
+        let jobs = futures::stream::iter(jobs)
+            .try_buffer_unordered(concurrency.per_partition_limit);
+        Self::collect_prepared_runs(run_count, jobs).await
+    }
+
+    /// Restore input order so job completion order does not affect the merge's output.
+    async fn collect_prepared_runs(
+        run_count: usize,
+        mut jobs: impl Stream<Item = Result<(usize, SendableRecordBatchStream)>> + Unpin,
+    ) -> Result<Vec<SendableRecordBatchStream>> {
+        let mut streams: Vec<_> = (0..run_count).map(|_| None).collect();
+        while let Some((index, stream)) = jobs.try_next().await? {
+            streams[index] = Some(stream);
+        }
+        streams
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| internal_datafusion_err!("Missing prepared sort run"))
+    }
+
+    /// Sort one run under a shared permit, retaining its output reservations.
+    ///
+    /// The sort must finish independently of other runs and partitions so its
+    /// permit can be returned before the merge starts consuming output.
+    async fn prepare_sort_run(
+        sort: impl Future<Output = Result<SendableRecordBatchStream>> + Send + 'static,
+        permits: Arc<Semaphore>,
+    ) -> Result<SendableRecordBatchStream> {
+        // Acquire before spawning so queued runs do not become Tokio tasks.
+        let permit = permits
+            .acquire_owned()
+            .await
+            .map_err(|e| internal_datafusion_err!("Sort concurrency closed: {e}"))?;
+        let stream = SpawnedTask::spawn(async move {
+            // Keep the permit until this job exits, even if its caller is cancelled.
+            let _permit = permit;
+            sort.await
+        })
+        .join_unwind()
+        .await
+        .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
+        Ok(Self::with_lookahead(stream))
+    }
+
+    /// [`Self::sort_run`] materializes all output and releases each batch's
+    /// reservation when that batch is pulled. Reading one batch ahead returns
+    /// memory for the merge's current batch and cursor.
+    /// Each run can hold one prefetched batch whose reservation is already released.
+    fn with_lookahead(stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
+        let schema = stream.schema();
+        // Buffer the current batch and one ahead to release its reservation
+        // before the merge processes the current batch.
+        let batches = stream.map(std::future::ready).buffered(2);
+        Box::pin(RecordBatchStreamAdapter::new(schema, batches))
     }
 
     /// Concatenates `batches` into fewer, larger runs, each bounded by
@@ -721,39 +847,58 @@ impl ExternalSorter {
         Ok(runs)
     }
 
-    /// Sorts a single `RecordBatch` into a single stream.
-    ///
-    /// This may output multiple batches depending on the size of the
-    /// sorted data and the target batch size.
-    /// For single-batch output cases, `reservation` will be freed immediately after sorting,
-    /// as the batch will be output and is expected to be reserved by the consumer of the stream.
-    /// For multi-batch output cases, `reservation` will be grown to match the actual
-    /// size of sorted output, and as each batch is output, its memory will be freed from the reservation.
-    /// (This leads to the same behaviour, as futures are only evaluated when polled by the consumer.)
+    /// Sorts each run into its own stream, splitting the input reservation.
+    fn sort_run_streams(
+        &self,
+        runs: Vec<RecordBatch>,
+    ) -> Result<Vec<SendableRecordBatchStream>> {
+        runs.into_iter()
+            .map(|batch| {
+                let reservation = self
+                    .reservation
+                    .split(get_reserved_bytes_for_record_batch(&batch)?);
+                self.sort_batch_stream(batch, reservation)
+            })
+            .collect()
+    }
+
+    /// Sorts a single batch on the first poll, retaining its output reservation
+    /// until the consumer takes each output batch.
     fn sort_batch_stream(
         &self,
         batch: RecordBatch,
         reservation: MemoryReservation,
     ) -> Result<SendableRecordBatchStream> {
+        let schema = batch.schema();
+        let stream =
+            futures::stream::once(self.sort_run(batch, reservation)?).try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+
+    /// Sorts a batch and reserves its complete output before returning a stream.
+    /// The stream releases reservations as its consumer takes each output batch.
+    fn sort_run(
+        &self,
+        batch: RecordBatch,
+        reservation: MemoryReservation,
+    ) -> Result<impl Future<Output = Result<SendableRecordBatchStream>> + Send + use<>>
+    {
         assert_eq!(
             get_reserved_bytes_for_record_batch(&batch)?,
             reservation.size()
         );
-
-        let schema = batch.schema();
         let expressions = self.expr.clone();
         let batch_size = self.batch_size;
+        let elapsed_compute = self.metrics.baseline.elapsed_compute().clone();
 
-        let stream = futures::stream::once(async move {
+        Ok(async move {
+            // Measure sorting where it runs, including on spawned tasks.
+            let _timer = elapsed_compute.timer();
             let schema = batch.schema();
-
-            // Sort the batch immediately and get all output batches
             let sorted_batches = sort_batch_chunked(&batch, &expressions, batch_size)?;
 
-            // Resize the reservation to match the actual sorted output size.
-            // Using try_resize avoids a release-then-reacquire cycle, which
-            // matters for MemoryPool implementations where grow/shrink have
-            // non-trivial cost (e.g. JNI calls in Comet).
+            // Keep prepared output reserved until merging consumes it. Resize
+            // directly rather than releasing and reacquiring the reservation.
             let total_sorted_size: usize = sorted_batches
                 .iter()
                 .map(get_record_batch_memory_size)
@@ -762,19 +907,15 @@ impl ExternalSorter {
                 .try_resize(total_sorted_size)
                 .map_err(Self::err_with_oom_context)?;
 
-            // Wrap in ReservationStream to hold the reservation
-            Result::<_, DataFusionError>::Ok(Box::pin(ReservationStream::new(
+            Ok(Box::pin(ReservationStream::new(
                 Arc::clone(&schema),
                 Box::pin(RecordBatchStreamAdapter::new(
-                    Arc::clone(&schema),
+                    schema,
                     futures::stream::iter(sorted_batches.into_iter().map(Ok)),
                 )),
                 reservation,
             )) as SendableRecordBatchStream)
         })
-        .try_flatten();
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
     /// If this sort may spill, pre-allocates
@@ -928,6 +1069,15 @@ pub fn sort_batch_chunked(
 ///
 /// Support sorting datasets that are larger than the memory allotted
 /// by the memory manager, by spilling to disk.
+///
+/// On multithreaded Tokio runtimes, large inputs are sorted in batches on
+/// separate tasks before merging. All partitions share a task limit capped by
+/// both the worker count of the runtime that first performs this sorting and
+/// the estimated available CPU parallelism. Clones and concurrent executions
+/// of the same plan share this limit. The plan returned by
+/// [`ExecutionPlan::reset_state`] starts with a fresh limit.
+/// Inputs sorted in a single pass, current-thread runtimes, execution outside
+/// Tokio, and TopK sorting continue sorting inline.
 #[derive(Debug, Clone)]
 pub struct SortExec {
     /// Input schema
@@ -949,6 +1099,9 @@ pub struct SortExec {
     /// If `fetch` is `Some`, this will also be set and a TopK operator may be used.
     /// If `fetch` is `None`, this will be `None`.
     filter: Option<Arc<RwLock<TopKDynamicFilters>>>,
+    /// Batch-sort limit shared by partitions and clones.
+    /// `reset_state` returns a new plan with a fresh limit.
+    sort_concurrency: Arc<OnceLock<SortConcurrency>>,
 }
 
 impl SortExec {
@@ -968,6 +1121,7 @@ impl SortExec {
             common_sort_prefix: sort_prefix,
             cache: Arc::new(cache),
             filter: None,
+            sort_concurrency: Arc::new(OnceLock::new()),
         }
     }
 
@@ -1044,6 +1198,7 @@ impl SortExec {
             fetch: self.fetch,
             cache: Arc::clone(&self.cache),
             filter: self.filter.clone(),
+            sort_concurrency: Arc::clone(&self.sort_concurrency),
         }
     }
 
@@ -1360,6 +1515,7 @@ impl ExecutionPlan for SortExec {
         // Our dynamic filter and execution metrics are the state we need to reset.
         new_sort.filter = Some(new_sort.create_filter());
         new_sort.metrics_set = ExecutionPlanMetricsSet::new();
+        new_sort.sort_concurrency = Arc::new(OnceLock::new());
 
         Ok(Arc::new(new_sort))
     }
@@ -1436,6 +1592,7 @@ impl ExecutionPlan for SortExec {
                     &self.metrics_set,
                     context.runtime_env(),
                 )?;
+                sorter.sort_concurrency = Arc::clone(&self.sort_concurrency);
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     self.schema(),
                     futures::stream::once(async move {
@@ -1721,15 +1878,17 @@ mod tests {
 
     use super::*;
     use crate::coalesce_partitions::CoalescePartitionsExec;
-    use crate::collect;
     use crate::empty::EmptyExec;
     use crate::execution_plan::Boundedness;
     use crate::expressions::col;
     use crate::filter_pushdown::{FilterPushdownPhase, PushedDown};
     use crate::test;
     use crate::test::TestMemoryExec;
-    use crate::test::exec::{BlockingExec, assert_strong_count_converges_to_zero};
+    use crate::test::exec::{
+        BlockingExec, TestStream, assert_strong_count_converges_to_zero,
+    };
     use crate::test::{assert_is_pending, make_partition};
+    use crate::{collect, collect_partitioned};
 
     use arrow::array::*;
     use arrow::compute::SortOptions;
@@ -1750,6 +1909,213 @@ mod tests {
     use datafusion_physical_expr_common::metrics::MetricValue;
     use futures::{FutureExt, Stream, TryStreamExt};
     use insta::assert_snapshot;
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn sort_run_records_compute_before_consumption() -> Result<()> {
+        let batch = RecordBatch::try_from_iter([(
+            "a",
+            Arc::new(Int32Array::from_iter_values((0..4096).rev())) as ArrayRef,
+        )])?;
+        let sorter = ExternalSorter::new(
+            0,
+            batch.schema(),
+            [PhysicalSortExpr::new_default(col("a", &batch.schema())?)].into(),
+            1024,
+            0,
+            0,
+            SpillCompression::Uncompressed,
+            &ExecutionPlanMetricsSet::new(),
+            Arc::new(RuntimeEnv::default()),
+        )?;
+        let elapsed_compute = sorter.metrics.baseline.elapsed_compute();
+        for spawned in [false, true] {
+            let reservation = sorter.reservation.new_empty();
+            reservation.try_grow(get_reserved_bytes_for_record_batch(&batch)?)?;
+            let before = elapsed_compute.value();
+            let sort = sorter.sort_run(batch.clone(), reservation)?;
+            assert_eq!(elapsed_compute.value(), before);
+
+            let stream = if spawned {
+                ExternalSorter::prepare_sort_run(sort, Arc::new(Semaphore::new(1)))
+                    .await?
+            } else {
+                sort.await?
+            };
+            assert!(elapsed_compute.value() > before);
+            drop(stream);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sort_preparation_keeps_output_reserved() -> Result<()> {
+        let batch = RecordBatch::try_from_iter([(
+            "a",
+            Arc::new(Int32Array::from_iter_values((0..4096).rev())) as ArrayRef,
+        )])?;
+        let ordering: LexOrdering =
+            [PhysicalSortExpr::new_default(col("a", &batch.schema())?)].into();
+        let batches = vec![batch.clone(); 4];
+        let input_bytes = batches.len() * get_reserved_bytes_for_record_batch(&batch)?;
+        let sorted_bytes = batches.len()
+            * get_record_batch_memory_size(&sort_batch(&batch, &ordering, None)?);
+        // Leave room for merge cursors while a competing consumer takes the
+        // scratch space released by preparation.
+        let merge_workspace = sorted_bytes;
+        let capacity = input_bytes + merge_workspace;
+        for consume_output in [false, true] {
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(GreedyMemoryPool::new(capacity)))
+                .build_arc()?;
+            let mut sorter = ExternalSorter::new(
+                0,
+                batch.schema(),
+                ordering.clone(),
+                8192,
+                merge_workspace,
+                0,
+                SpillCompression::Uncompressed,
+                &ExecutionPlanMetricsSet::new(),
+                Arc::clone(&runtime),
+            )?;
+            for batch in &batches {
+                sorter.insert_batch(batch.clone()).await?;
+            }
+            sorter.merge_reservation.free();
+            let stream = sorter.in_mem_sort_stream(false, false).await?;
+            assert_eq!(runtime.memory_pool.reserved(), sorted_bytes);
+            let other = MemoryConsumer::new("other").register(&runtime.memory_pool);
+            other.try_grow(capacity - sorted_bytes - merge_workspace)?;
+            if consume_output {
+                let output: Vec<RecordBatch> = stream.try_collect().await?;
+                let expected = sort_batch(
+                    &concat_batches(&batch.schema(), &batches)?,
+                    &ordering,
+                    None,
+                )?;
+                assert_eq!(concat_batches(&batch.schema(), &output)?, expected);
+            } else {
+                drop(stream);
+            }
+            drop(sorter);
+            drop(other);
+            assert_eq!(runtime.memory_pool.reserved(), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sort_preparation_holds_permit_and_releases_on_drop() {
+        let permits = Arc::new(Semaphore::new(1));
+        let held = permits.acquire().await.unwrap();
+        let started = Arc::new(Notify::new());
+        let sort = {
+            let started = Arc::clone(&started);
+            async move {
+                started.notify_one();
+                futures::future::pending::<Result<SendableRecordBatchStream>>().await
+            }
+        };
+        let mut preparation =
+            ExternalSorter::prepare_sort_run(sort, Arc::clone(&permits)).boxed();
+        assert_is_pending(&mut preparation);
+        assert_eq!(Handle::current().metrics().num_alive_tasks(), 0);
+        drop(held);
+        assert_is_pending(&mut preparation);
+        started.notified().await;
+        assert_eq!(permits.available_permits(), 0);
+        drop(preparation);
+        let _permit =
+            tokio::time::timeout(std::time::Duration::from_secs(10), permits.acquire())
+                .await
+                .expect("cancelled preparation must release its permit")
+                .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sort_preparation_propagates_errors_and_releases_permit() {
+        let permits = Arc::new(Semaphore::new(1));
+        let sort = async { Err(internal_datafusion_err!("sort failed")) };
+        let error = ExternalSorter::prepare_sort_run(sort, Arc::clone(&permits))
+            .await
+            .err()
+            .expect("preparation must propagate the sort error");
+        assert!(error.to_string().contains("sort failed"), "{error}");
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn sort_preparation_restores_run_order() -> Result<()> {
+        let runs = [
+            record_batch!(("a", Int32, [1]), ("payload", Utf8, ["first"]))?,
+            record_batch!(("a", Int32, [1]), ("payload", Utf8, ["second"]))?,
+        ];
+        // Completed runs arrive in reverse order; the merge needs their input order.
+        let jobs = runs
+            .iter()
+            .cloned()
+            .enumerate()
+            .rev()
+            .map(|(index, batch)| {
+                let stream = TestStream::new(vec![batch]);
+                Ok((index, Box::pin(stream) as SendableRecordBatchStream))
+            });
+        let streams = ExternalSorter::collect_prepared_runs(
+            runs.len(),
+            futures::stream::iter(jobs),
+        )
+        .await?;
+        assert_eq!(streams.len(), runs.len());
+        for (stream, expected) in streams.into_iter().zip(runs) {
+            assert_eq!(stream.try_collect::<Vec<_>>().await?, vec![expected]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sort_execution_initializes_and_resets_concurrency() -> Result<()> {
+        let batch = record_batch!(
+            ("a", Int32, [2, 1, 2, 1]),
+            ("payload", Utf8, ["b", "a", "d", "c"])
+        )?;
+        // Distinct payloads make equal-key ordering across runs observable.
+        let runs = vec![batch.slice(0, 2), batch.slice(2, 2)];
+        let input =
+            TestMemoryExec::try_new_exec(&[runs.clone(), runs], batch.schema(), None)?;
+        let sort = SortExec::new(
+            [PhysicalSortExpr::new_default(col("a", &batch.schema())?)].into(),
+            input,
+        )
+        .with_preserve_partitioning(true);
+        let context = Arc::new(TaskContext::default().with_session_config(
+            SessionConfig::new().with_sort_in_place_threshold_bytes(0),
+        ));
+
+        // Execution must initialize the cell owned by the plan, not a private sorter cell.
+        let output =
+            collect_partitioned(Arc::new(sort.clone()), Arc::clone(&context)).await?;
+        let expected = record_batch!(
+            ("a", Int32, [1, 1, 2, 2]),
+            ("payload", Utf8, ["a", "c", "b", "d"])
+        )?;
+        assert_eq!(output.len(), 2);
+        for partition in output {
+            assert_eq!(concat_batches(&batch.schema(), &partition)?, expected);
+        }
+        assert!(sort.sort_concurrency.get().is_some());
+        let reset = Arc::new(sort.clone()).reset_state()?;
+        assert!(
+            reset
+                .downcast_ref::<SortExec>()
+                .unwrap()
+                .sort_concurrency
+                .get()
+                .is_none()
+        );
+
+        Ok(())
+    }
 
     #[derive(Debug, Clone)]
     pub struct SortedUnboundedExec {
