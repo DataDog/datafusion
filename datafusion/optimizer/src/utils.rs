@@ -39,6 +39,26 @@ use std::sync::Arc;
 /// as it was initially placed here and then moved elsewhere.
 pub use datafusion_expr::expr_rewriter::NamePreserver;
 
+/// Whether an expression is free of volatile scalar functions and subqueries.
+/// Subqueries are conservative barriers because their plans may contain
+/// volatile expressions that [`Expr::is_volatile`] does not visit.
+///
+/// Backported from apache/datafusion#25385 for the join-predicate inference.
+pub(crate) fn is_repeatable(expr: &Expr) -> bool {
+    !expr
+        .exists(|expr| {
+            Ok(expr.is_volatile_node()
+                || matches!(
+                    expr,
+                    Expr::Exists(_)
+                        | Expr::InSubquery(_)
+                        | Expr::SetComparison(_)
+                        | Expr::ScalarSubquery(_)
+                ))
+        })
+        .expect("expression traversal is infallible")
+}
+
 /// Invokes `f` with the index, within `schema`, of every column referenced by
 /// `expr` — including columns reached through a correlated subquery's outer
 /// references. Columns absent from `schema` are skipped.
