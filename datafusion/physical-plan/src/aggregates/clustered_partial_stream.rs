@@ -27,15 +27,16 @@ use datafusion_execution::{TaskContext, TryEmitter, async_try_stream};
 use futures::stream::{Stream, StreamExt};
 
 use super::AggregateExec;
-use super::aggregate_hash_table::{OrderedAggregateTable, PartialMarker};
+use super::aggregate_hash_table::{ClusteredAggregateTable, PartialMarker};
 use crate::aggregates::AggregateMode;
-use crate::aggregates::order::GroupOrdering;
+use crate::aggregates::GroupClusteringMode;
+use crate::aggregates::order::GroupClustering;
 use crate::metrics::{BaselineMetrics, MetricBuilder, SpillMetrics};
 use crate::stream::{EmptyRecordBatchStream, ObservedStream, RecordBatchStreamAdapter};
-use crate::{InputOrderMode, SendableRecordBatchStream, metrics};
+use crate::{SendableRecordBatchStream, metrics};
 
-/// Partial aggregate stream for `InputOrderMode::Sorted` and
-/// `InputOrderMode::PartiallySorted`.
+/// Partial aggregate stream for `GroupClusteringMode::Full` and
+/// `GroupClusteringMode::Partial`.
 ///
 /// # Example
 ///
@@ -94,10 +95,10 @@ use crate::{InputOrderMode, SendableRecordBatchStream, metrics};
 /// If one `a` value contains many distinct `b` values, the table may accumulate
 /// enough groups to exceed the memory limit.
 ///
-/// - `OrderedPartialAggregateStream`: On reservation failure, it emits all current
+/// - `ClusteredPartialAggregateStream`: On reservation failure, it emits all current
 ///   intermediate states downstream and resets the table. The final stage can
 ///   merge repeated `(a, b)` state rows, so no disk spill is required.
-/// - `OrderedFinalAggregateStream`: It cannot emit incomplete final results. On
+/// - `ClusteredFinalAggregateStream`: It cannot emit incomplete final results. On
 ///   reservation failure, it sorts the current intermediate states by the complete
 ///   group key and spills them as one run. After the input ends, it spills any
 ///   remaining states, performs a sort-preserving merge of all runs, and feeds the
@@ -110,23 +111,23 @@ use crate::{InputOrderMode, SendableRecordBatchStream, metrics};
 ///
 /// See issue for details: <https://github.com/apache/datafusion/issues/22710>
 ///
-pub(crate) struct OrderedPartialAggregateStream {
+pub(crate) struct ClusteredPartialAggregateStream {
     schema: SchemaRef,
     input: SendableRecordBatchStream,
     reservation: MemoryReservation,
     baseline_metrics: BaselineMetrics,
     reduction_factor: metrics::RatioMetrics,
-    table: Option<OrderedAggregateTable<PartialMarker>>,
+    table: Option<ClusteredAggregateTable<PartialMarker>>,
 }
 
-impl OrderedPartialAggregateStream {
+impl ClusteredPartialAggregateStream {
     pub fn new(
         agg: &AggregateExec,
         context: &Arc<TaskContext>,
         partition: usize,
     ) -> Result<Self> {
         debug_assert_eq!(agg.mode, AggregateMode::Partial);
-        debug_assert_ne!(agg.input_order_mode, InputOrderMode::Linear);
+        debug_assert_ne!(agg.group_clustering_mode, GroupClusteringMode::None);
 
         let schema = Arc::clone(&agg.schema);
         let input = agg.input.execute(partition, Arc::clone(context))?;
@@ -139,17 +140,17 @@ impl OrderedPartialAggregateStream {
             .with_type(metrics::MetricType::Summary)
             .ratio_metrics("reduction_factor", partition);
 
-        let table = OrderedAggregateTable::<PartialMarker>::new(
+        let table = ClusteredAggregateTable::<PartialMarker>::new(
             agg,
             partition,
             Arc::clone(&schema),
             batch_size,
         )?;
         let reservation =
-            MemoryConsumer::new(format!("OrderedPartialAggregateStream[{partition}]"))
+            MemoryConsumer::new(format!("ClusteredPartialAggregateStream[{partition}]"))
                 .with_can_spill(matches!(
-                    table.group_ordering(),
-                    GroupOrdering::Partial(_)
+                    table.group_clustering(),
+                    GroupClustering::Partial(_)
                 ))
                 .register(context.memory_pool());
 
@@ -177,7 +178,7 @@ impl OrderedPartialAggregateStream {
 
     /// Entry point for the ordered partial aggregate state machine.
     ///
-    /// See comments in [`OrderedPartialAggregateStream`] for high-level ideas.
+    /// See comments in [`ClusteredPartialAggregateStream`] for high-level ideas.
     ///
     /// State transitions are implemented using the generator pattern; see the comments in [`async_try_stream`].
     ///
@@ -213,7 +214,7 @@ impl OrderedPartialAggregateStream {
             let mut table = self
                 .table
                 .take()
-                .expect("OrderedPartialAggregateStream state should not be None");
+                .expect("ClusteredPartialAggregateStream state should not be None");
 
             self.handle_reading_input(&mut table, &mut emitter).await?;
 
@@ -238,7 +239,7 @@ impl OrderedPartialAggregateStream {
     /// See comments at [`Self::create_stream`] for details.
     async fn handle_reading_input(
         &mut self,
-        table: &mut OrderedAggregateTable<PartialMarker>,
+        table: &mut ClusteredAggregateTable<PartialMarker>,
         emitter: &mut TryEmitter<RecordBatch, DataFusionError>,
     ) -> Result<()> {
         let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
@@ -291,7 +292,7 @@ impl OrderedPartialAggregateStream {
     /// Issue: <https://github.com/apache/datafusion/issues/7065>
     fn resize_or_take_state_batch(
         &mut self,
-        table: &mut OrderedAggregateTable<PartialMarker>,
+        table: &mut ClusteredAggregateTable<PartialMarker>,
     ) -> Result<Option<RecordBatch>> {
         let oom = match self.reservation.try_resize(table.memory_size()) {
             Ok(()) => return Ok(None),
@@ -299,7 +300,7 @@ impl OrderedPartialAggregateStream {
             Err(e) => return Err(e),
         };
 
-        if matches!(table.group_ordering(), GroupOrdering::Full(_)) {
+        if matches!(table.group_clustering(), GroupClustering::Full(_)) {
             return Err(oom);
         }
 
@@ -319,7 +320,7 @@ impl OrderedPartialAggregateStream {
     ///
     async fn handle_draining_final(
         &mut self,
-        mut table: OrderedAggregateTable<PartialMarker>,
+        mut table: ClusteredAggregateTable<PartialMarker>,
         emitter: &mut TryEmitter<RecordBatch, DataFusionError>,
     ) -> Result<()> {
         let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();

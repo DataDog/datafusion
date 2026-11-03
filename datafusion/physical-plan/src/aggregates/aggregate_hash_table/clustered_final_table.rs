@@ -17,7 +17,7 @@
 
 //! Aggregate table for final aggregation when partial-state input is ordered.
 //!
-//! See comments in [`super::ordered_partial_table`] for details.
+//! See comments in [`super::clustered_partial_table`] for details.
 
 use std::sync::Arc;
 
@@ -25,12 +25,12 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::Result;
 
-use crate::InputOrderMode;
+use crate::aggregates::GroupClusteringMode;
 use crate::aggregates::aggregate_hash_table::FinalMarker;
 use crate::aggregates::group_values::GroupByMetrics;
 use crate::aggregates::{AggregateExec, AggregateMode};
 
-use super::common_ordered::OrderedAggregateTable;
+use super::common_clustered::ClusteredAggregateTable;
 
 /// Implementation specific to final aggregation, where the table stores partial
 /// aggregate states and the input rows are also partial states.
@@ -40,14 +40,14 @@ use super::common_ordered::OrderedAggregateTable;
 /// - Aggregate table stores: `k, sum(x), count(x)`
 /// - Input rows: `k, sum(x), count(x)`
 ///
-/// See comments at [`OrderedAggregateTable`] for details.
-impl OrderedAggregateTable<FinalMarker> {
+/// See comments at [`ClusteredAggregateTable`] for details.
+impl ClusteredAggregateTable<FinalMarker> {
     pub(in crate::aggregates) fn new_with_input_order(
         agg: &AggregateExec,
         input_schema: &SchemaRef,
         output_schema: SchemaRef,
         batch_size: usize,
-        input_order_mode: &InputOrderMode,
+        group_clustering_mode: &GroupClusteringMode,
         group_by_metrics: GroupByMetrics,
     ) -> Result<Self> {
         Self::new_for_mode(
@@ -56,7 +56,7 @@ impl OrderedAggregateTable<FinalMarker> {
             output_schema,
             Arc::clone(input_schema),
             batch_size,
-            input_order_mode,
+            group_clustering_mode,
             &AggregateMode::Final,
             vec![None; agg.aggr_expr.len()],
             group_by_metrics,
@@ -76,7 +76,7 @@ impl OrderedAggregateTable<FinalMarker> {
         self.aggregate_evaluated_batch(&evaluated_batch, true)
     }
 
-    /// See comments in `ordered_partial_stream::next_output_batch`
+    /// See comments in `clustered_partial_stream::next_output_batch`
     pub(in crate::aggregates) fn next_output_batch(
         &mut self,
     ) -> Result<Option<RecordBatch>> {
