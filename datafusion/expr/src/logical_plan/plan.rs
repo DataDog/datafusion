@@ -43,7 +43,7 @@ use crate::logical_plan::{DmlStatement, Statement, WriteOp};
 use crate::utils::{
     check_aggregate_and_window_nesting, enumerate_grouping_sets, exprlist_to_fields,
     find_out_reference_exprs, grouping_set_expr_count, grouping_set_to_exprlist,
-    merge_schema, split_conjunction,
+    merge_schema, passthrough_field_index, split_conjunction,
 };
 use crate::{
     BinaryExpr, CreateMemoryTable, CreateView, Execute, Expr, ExprSchemable, GroupingSet,
@@ -67,7 +67,6 @@ use datafusion_common::{
     aggregate_functional_dependencies, assert_eq_or_internal_err, assert_or_internal_err,
     internal_err, plan_err, validate_range_split_points,
 };
-use indexmap::IndexSet;
 use itertools::Itertools as _;
 
 // backwards compatibility
@@ -4131,15 +4130,14 @@ fn calc_func_dependencies_for_aggregate(
     //   that GROUP BY expression results will be unique.
     // - Otherwise, it may be possible to propagate functional dependencies.
     if !contains_grouping_set(group_expr) {
-        let group_by_expr_names = group_expr
-            .iter()
-            .map(|item| item.schema_name().to_string())
-            .collect::<IndexSet<_>>()
+        // One entry per GROUP BY output field, in the order of `aggr_schema`
+        let group_by_input_indices = grouping_set_to_exprlist(group_expr)?
             .into_iter()
+            .map(|item| passthrough_field_index(item, input.schema()))
             .collect::<Vec<_>>();
         let aggregate_func_dependencies = aggregate_functional_dependencies(
             input.schema(),
-            &group_by_expr_names,
+            &group_by_input_indices,
             aggr_schema,
         );
         Ok(aggregate_func_dependencies)
@@ -4157,7 +4155,11 @@ fn calc_func_dependencies_for_project(
     // Sentinel for projection outputs that do not map back to any input field.
     const COMPUTED_EXPR_INDEX: usize = usize::MAX;
 
-    let input_fields = input.schema().field_names();
+    let input_schema = input.schema();
+    let input_index = |expr: &Expr| {
+        passthrough_field_index(expr, input_schema).unwrap_or(COMPUTED_EXPR_INDEX)
+    };
+
     // Map each projection output position to its input column index.
     // A projection expression can produce multiple output columns, such as `*`.
     let proj_indices = exprs
@@ -4176,33 +4178,14 @@ fn calc_func_dependencies_for_project(
                     wildcard_fields
                         .into_iter()
                         .map(|(qualifier, f)| {
-                            let flat_name = qualifier
-                                .map(|t| format!("{}.{}", t, f.name()))
-                                .unwrap_or_else(|| f.name().clone());
-                            input_fields
-                                .iter()
-                                .position(|item| *item == flat_name)
+                            input_schema
+                                .index_of_column_by_name(qualifier.as_ref(), f.name())
                                 .unwrap_or(COMPUTED_EXPR_INDEX)
                         })
                         .collect::<Vec<_>>(),
                 )
             }
-            Expr::Alias(alias) => {
-                let name = format!("{}", alias.expr);
-                let input_index = input_fields
-                    .iter()
-                    .position(|item| *item == name)
-                    .unwrap_or(COMPUTED_EXPR_INDEX);
-                Ok(vec![input_index])
-            }
-            _ => {
-                let name = format!("{expr}");
-                let input_index = input_fields
-                    .iter()
-                    .position(|item| *item == name)
-                    .unwrap_or(COMPUTED_EXPR_INDEX);
-                Ok(vec![input_index])
-            }
+            _ => Ok(vec![input_index(expr)]),
         })
         .collect::<Result<Vec<_>>>()?
         .into_iter()
@@ -5036,6 +5019,74 @@ mod tests {
         let deps = projection.schema.functional_dependencies();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].source_indices, vec![1]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_group_by_repeated_key_keeps_key_dependency() -> Result<()> {
+        let constraints =
+            Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+        let source = Arc::new(
+            LogicalTableSource::new(Arc::new(employee_schema()))
+                .with_constraints(constraints),
+        );
+        // `id` is in the GROUP BY list two times: as itself and as `k`.
+        let plan = LogicalPlanBuilder::scan("employee_csv", source, None)?
+            .aggregate(
+                vec![col("id"), col("state"), col("id").alias("k")],
+                Vec::<Expr>::new(),
+            )?
+            .build()?;
+
+        // `id` alone still determines the row.
+        let deps = plan.schema().functional_dependencies();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].source_indices, vec![0]);
+        assert_eq!(deps[0].target_indices, vec![0, 1, 2]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn projection_resolves_columns_not_flattened_names() -> Result<()> {
+        // Build an input schema where a qualified field (`orders`.`id`) and an
+        // unqualified field that is literally named `"orders.id"` (the name of
+        // e.g. `CAST(orders.id AS INT)`) have the same flattened name. The
+        // projection must resolve the column it references, not the first
+        // field with the same flattened name.
+        let schema = DFSchema::new_with_metadata(
+            vec![
+                (
+                    Some(TableReference::bare("orders")),
+                    Arc::new(Field::new("id", DataType::Int32, false)),
+                ),
+                (
+                    None,
+                    Arc::new(Field::new("orders.id", DataType::Int32, false)),
+                ),
+            ],
+            HashMap::new(),
+        )?
+        .with_functional_dependencies(FunctionalDependencies::new(vec![
+            FunctionalDependence::new(vec![0], vec![0, 1], false)
+                .with_mode(Dependency::Single),
+        ]))?;
+        let input = LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: true,
+            schema: Arc::new(schema),
+        });
+
+        // References the *unqualified* second field, which is not a key.
+        let exprs = vec![Expr::Column(Column::new_unqualified("orders.id"))];
+        let deps = calc_func_dependencies_for_project(&exprs, &input)?;
+        assert!(deps.is_empty());
+
+        // References the qualified first field, which is a key.
+        let exprs = vec![Expr::Column(Column::new(Some("orders"), "id"))];
+        let deps = calc_func_dependencies_for_project(&exprs, &input)?;
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].source_indices, vec![0]);
 
         Ok(())
     }
