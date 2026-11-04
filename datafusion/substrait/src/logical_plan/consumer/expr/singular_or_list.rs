@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::literal::name_struct_literals_like_siblings;
 use crate::logical_plan::consumer::{SubstraitConsumer, from_substrait_rex_vec};
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::Expr;
@@ -28,13 +29,18 @@ pub async fn from_singular_or_list(
 ) -> datafusion::common::Result<Expr> {
     let substrait_expr = expr.value.as_ref().unwrap();
     let substrait_list = expr.options.as_ref();
+    let mut value = consumer
+        .consume_expression(substrait_expr, input_schema)
+        .await?;
+    let mut list = from_substrait_rex_vec(consumer, substrait_list, input_schema).await?;
+    // the value is compared with each list item, field names included
+    let mut compared = std::iter::once(&mut value)
+        .chain(list.iter_mut())
+        .collect::<Vec<_>>();
+    name_struct_literals_like_siblings(&mut compared, input_schema);
     Ok(Expr::InList(InList {
-        expr: Box::new(
-            consumer
-                .consume_expression(substrait_expr, input_schema)
-                .await?,
-        ),
-        list: from_substrait_rex_vec(consumer, substrait_list, input_schema).await?,
+        expr: Box::new(value),
+        list,
         negated: false,
     }))
 }
