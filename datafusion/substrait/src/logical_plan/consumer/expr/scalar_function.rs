@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::literal::name_struct_literals_like_siblings;
 use crate::logical_plan::consumer::{SubstraitConsumer, from_substrait_func_args};
 use datafusion::common::Result;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -43,7 +44,13 @@ pub async fn from_scalar_function(
     };
 
     let fn_name = substrait_fun_name(fn_signature);
-    let args = from_substrait_func_args(consumer, &f.arguments, input_schema).await?;
+    let mut args = from_substrait_func_args(consumer, &f.arguments, input_schema).await?;
+    // struct literals come without field names, so `coalesce(s, [])` would combine
+    // `s: List<Struct{a, b}>` with a `List<Struct{c0, c1}>`
+    name_struct_literals_like_siblings(
+        &mut args.iter_mut().collect::<Vec<_>>(),
+        input_schema,
+    );
 
     let higher_order_func = consumer
         .get_function_registry()
