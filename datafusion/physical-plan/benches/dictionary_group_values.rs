@@ -29,7 +29,7 @@ use criterion::{
 };
 use datafusion_expr::EmitTo;
 use datafusion_physical_plan::aggregates::group_values::new_group_values;
-use datafusion_physical_plan::aggregates::order::GroupOrdering;
+use datafusion_physical_plan::aggregates::order::GroupClustering;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -106,7 +106,7 @@ fn bench_intern_emit(c: &mut Criterion) {
                     b.iter_batched_ref(
                         || {
                             (
-                                new_group_values(schema.clone(), &GroupOrdering::None)
+                                new_group_values(schema.clone(), &GroupClustering::None)
                                     .unwrap(),
                                 Vec::<usize>::with_capacity(size),
                             )
@@ -151,7 +151,7 @@ fn bench_repeated_intern_emit(c: &mut Criterion) {
                     b.iter_batched_ref(
                         || {
                             (
-                                new_group_values(schema.clone(), &GroupOrdering::None)
+                                new_group_values(schema.clone(), &GroupClustering::None)
                                     .unwrap(),
                                 Vec::<usize>::with_capacity(size),
                             )

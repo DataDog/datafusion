@@ -25,7 +25,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, assert_eq_or_internal_err};
 
 use crate::aggregates::group_values::new_group_values;
-use crate::aggregates::order::GroupOrdering;
+use crate::aggregates::order::GroupClustering;
 use crate::aggregates::{AggregateExec, group_id_array, max_duplicate_ordinal};
 
 use super::common::{
@@ -77,7 +77,7 @@ impl AggregateHashTable<PartialMarker> {
     ) -> Result<AggregateHashTable<PartialSkipMarker>> {
         let state = self.state.building();
         let group_schema = state.group_by.group_schema(&self.input_schema)?;
-        let group_values = new_group_values(group_schema, &GroupOrdering::None)?;
+        let group_values = new_group_values(group_schema, &GroupClustering::None)?;
         let accumulators = state
             .accumulators
             .iter()

@@ -17,7 +17,7 @@
 
 //! Aggregate table for partial aggregation when input is ordered by group keys.
 //!
-//! See the [`super::common_ordered`] comments for the high-level ideas.
+//! See the [`super::common_clustered`] comments for the high-level ideas.
 //!
 //! This operator handles input that is ordered by group keys:
 //! - Fully ordered: `GROUP BY a, b`, input is `ORDER BY a, b`
@@ -40,7 +40,7 @@ use crate::aggregates::{
     group_values::GroupByMetrics,
 };
 
-use super::common_ordered::OrderedAggregateTable;
+use super::common_clustered::ClusteredAggregateTable;
 
 /// Implementation specific to partial aggregation, where the table stores
 /// partial aggregate states and the input rows are raw rows.
@@ -50,8 +50,8 @@ use super::common_ordered::OrderedAggregateTable;
 /// - Aggregate table stores: `k, sum(x), count(x)`
 /// - Input rows: `k, x`
 ///
-/// See comments at [`OrderedAggregateTable`] for details.
-impl OrderedAggregateTable<PartialMarker> {
+/// See comments at [`ClusteredAggregateTable`] for details.
+impl ClusteredAggregateTable<PartialMarker> {
     pub(in crate::aggregates) fn new(
         agg: &AggregateExec,
         partition: usize,
@@ -67,7 +67,7 @@ impl OrderedAggregateTable<PartialMarker> {
             output_schema,
             state_schema,
             batch_size,
-            &agg.input_order_mode,
+            &agg.group_clustering_mode,
             &AggregateMode::Partial,
             agg.filter_expr.iter().cloned().collect(),
             group_by_metrics,
@@ -92,8 +92,8 @@ impl OrderedAggregateTable<PartialMarker> {
     /// are complete and safe to emit.
     ///
     /// Key steps:
-    /// 1. Ask `group_ordering` to decide how many groups can be emitted eagerly.
-    /// 2. Remove the emitted groups from `group_ordering`, `GroupValues`, and
+    /// 1. Ask `group_clustering` to decide how many groups can be emitted eagerly.
+    /// 2. Remove the emitted groups from `group_clustering`, `GroupValues`, and
     ///    all `GroupsAccumulator`s.
     ///
     /// This may output small batches. Avoiding tiny batches is left to future
