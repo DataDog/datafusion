@@ -24,8 +24,8 @@ use crate::expr::NullTreatment;
 #[cfg(feature = "sql")]
 use crate::logical_plan::LogicalPlan;
 use crate::{
-    AggregateUDF, Expr, GetFieldAccess, HigherOrderUDF, ScalarUDF, SortExpr, TableSource,
-    WindowFrame, WindowFunctionDefinition, WindowUDF,
+    AggregateUDF, Expr, GetFieldAccess, HigherOrderUDF, ScalarUDF, SortExpr, TableAccess,
+    TableSource, WindowFrame, WindowFunctionDefinition, WindowUDF,
 };
 use arrow::datatypes::{DataType, Field, FieldRef, SchemaRef};
 use datafusion_common::datatype::DataTypeExt;
@@ -44,6 +44,22 @@ use sqlparser::ast::{Expr as SQLExpr, Ident, ObjectName, TableAlias, TableFactor
 pub trait ContextProvider {
     /// Returns a table by reference, if it exists
     fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>>;
+
+    /// Resolves a table for an operation before the SQL planner uses its schema.
+    ///
+    /// The default preserves existing implementations by calling
+    /// [`Self::get_table_source`]. Authorization-aware implementations should
+    /// check the requested access before returning a source, and keep any cache
+    /// scoped to both the table and access. Legacy lookups must also have a
+    /// conservative policy, such as requiring read access or rejecting them.
+    /// Identity and the mapping from operations to privileges are application-owned.
+    fn get_table_source_with_access(
+        &self,
+        name: TableReference,
+        _access: TableAccess,
+    ) -> Result<Arc<dyn TableSource>> {
+        self.get_table_source(name)
+    }
 
     /// Return the type of a file based on its extension (e.g. `.parquet`)
     ///

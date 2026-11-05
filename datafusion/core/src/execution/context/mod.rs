@@ -84,7 +84,6 @@ use datafusion_execution::disk_manager::{
     DEFAULT_MAX_SPILL_MERGE_FAN_IN, DEFAULT_MAX_TEMP_DIRECTORY_SIZE, DiskManagerBuilder,
 };
 use datafusion_execution::registry::SerializerRegistry;
-use datafusion_expr::HigherOrderUDF;
 pub use datafusion_expr::execution_props::ExecutionProps;
 #[cfg(feature = "sql")]
 use datafusion_expr::planner::RelationPlanner;
@@ -95,6 +94,7 @@ use datafusion_expr::{
     logical_plan::{DdlStatement, Statement},
     planner::ExprPlanner,
 };
+use datafusion_expr::{HigherOrderUDF, TableAccess};
 use datafusion_optimizer::analyzer::type_coercion::TypeCoercion;
 use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_optimizer::{Analyzer, OptimizerContext};
@@ -2020,15 +2020,31 @@ impl SessionContext {
             .ok_or_else(|| plan_datafusion_err!("Table function '{name}' not found"))
     }
 
-    /// Return a [`TableProvider`] for the specified table.
+    /// Return a [`TableProvider`] for reading the specified table.
+    ///
+    /// Use [`Self::table_provider_with_access`] to request another operation.
     pub async fn table_provider(
         &self,
         table_ref: impl Into<TableReference>,
     ) -> Result<Arc<dyn TableProvider>> {
+        self.table_provider_with_access(table_ref, TableAccess::Read)
+            .await
+    }
+
+    /// Return a [`TableProvider`] for the specified table and operation.
+    ///
+    /// The schema provider may use `access` to authorize resolution before the
+    /// returned provider's schema is used. This does not authorize other
+    /// operations performed on the returned provider.
+    pub async fn table_provider_with_access(
+        &self,
+        table_ref: impl Into<TableReference>,
+        access: TableAccess,
+    ) -> Result<Arc<dyn TableProvider>> {
         let table_ref = table_ref.into();
         let table = table_ref.table().to_string();
         let schema = self.state.read().schema_for_ref(table_ref)?;
-        match schema.table(&table).await? {
+        match schema.table_with_access(&table, access).await? {
             Some(ref provider) => Ok(Arc::clone(provider)),
             _ => plan_err!("No table named '{table}'"),
         }

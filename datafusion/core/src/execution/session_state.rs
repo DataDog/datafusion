@@ -51,8 +51,6 @@ use datafusion_common::{
 use datafusion_execution::TaskContext;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::runtime_env::RuntimeEnv;
-#[cfg(feature = "sql")]
-use datafusion_expr::TableSource;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::expr_rewriter::FunctionRewrite;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
@@ -67,6 +65,8 @@ use datafusion_expr::simplify::SimplifyContext;
 use datafusion_expr::{
     AggregateUDF, Explain, Expr, HigherOrderUDF, LogicalPlan, ScalarUDF, WindowUDF,
 };
+#[cfg(feature = "sql")]
+use datafusion_expr::{TableAccess, TableSource};
 use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_optimizer::{
     Analyzer, AnalyzerRule, Optimizer, OptimizerConfig, OptimizerRule,
@@ -544,25 +544,45 @@ impl SessionState {
         Ok(table_refs)
     }
 
+    /// Resolve table references and the operation required by each occurrence.
+    ///
+    /// CTE references are excluded. A table used for both reading and writing is
+    /// returned separately for each operation.
+    #[cfg(feature = "sql")]
+    pub fn resolve_table_references_with_access(
+        &self,
+        statement: &Statement,
+    ) -> datafusion_common::Result<Vec<(TableReference, TableAccess)>> {
+        let enable_ident_normalization =
+            self.config.options().sql_parser.enable_ident_normalization;
+        let (table_refs, _) =
+            datafusion_sql::resolve::resolve_table_references_with_access(
+                statement,
+                enable_ident_normalization,
+            )?;
+        Ok(table_refs)
+    }
+
     /// Convert an AST Statement into a LogicalPlan
     #[cfg(feature = "sql")]
     pub async fn statement_to_plan(
         &self,
         statement: Statement,
     ) -> datafusion_common::Result<LogicalPlan> {
-        let references = self.resolve_table_references(&statement)?;
+        let references = self.resolve_table_references_with_access(&statement)?;
 
         let mut provider = SessionContextProvider {
             state: self,
             tables: HashMap::with_capacity(references.len()),
         };
 
-        for reference in references {
+        for (reference, access) in references {
             let resolved = self.resolve_table_ref(reference);
-            if let Entry::Vacant(v) = provider.tables.entry(resolved) {
-                let resolved = v.key();
+            if let Entry::Vacant(v) = provider.tables.entry((resolved, access)) {
+                let (resolved, access) = v.key();
                 if let Ok(schema) = self.schema_for_ref(resolved.clone())
-                    && let Some(table) = schema.table(&resolved.table).await?
+                    && let Some(table) =
+                        schema.table_with_access(&resolved.table, *access).await?
                 {
                     v.insert(provider_as_source(table));
                 }
@@ -1959,7 +1979,7 @@ impl From<SessionState> for SessionStateBuilder {
 #[cfg(feature = "sql")]
 struct SessionContextProvider<'a> {
     state: &'a SessionState,
-    tables: HashMap<ResolvedTableReference, Arc<dyn TableSource>>,
+    tables: HashMap<(ResolvedTableReference, TableAccess), Arc<dyn TableSource>>,
 }
 
 #[cfg(feature = "sql")]
@@ -1984,9 +2004,17 @@ impl ContextProvider for SessionContextProvider<'_> {
         &self,
         name: TableReference,
     ) -> datafusion_common::Result<Arc<dyn TableSource>> {
+        self.get_table_source_with_access(name, TableAccess::Read)
+    }
+
+    fn get_table_source_with_access(
+        &self,
+        name: TableReference,
+        access: TableAccess,
+    ) -> datafusion_common::Result<Arc<dyn TableSource>> {
         let name = self.state.resolve_table_ref(name);
         self.tables
-            .get(&name)
+            .get(&(name.clone(), access))
             .cloned()
             .ok_or_else(|| plan_datafusion_err!("table '{name}' not found"))
     }

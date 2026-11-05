@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 use datafusion_common::{DataFusionError, Result};
+use datafusion_expr::{TableAccess, dml::InsertOp};
 
 use crate::parser::{CopyToSource, CopyToStatement, Statement as DFStatement};
 use crate::planner::object_name_to_table_reference;
@@ -50,28 +51,59 @@ const INFORMATION_SCHEMA_TABLES: &[&str] = &[
 // Collect table/CTE references as `TableReference`s and normalize them during traversal.
 // This avoids a second normalization/conversion pass after visiting the AST.
 struct RelationVisitor {
-    relations: BTreeSet<TableReference>,
+    relations: BTreeMap<TableReference, Vec<TableAccess>>,
+    write_targets: HashMap<*const ObjectName, TableAccess>,
     all_ctes: BTreeSet<TableReference>,
     ctes_in_scope: Vec<TableReference>,
     enable_ident_normalization: bool,
 }
 
 impl RelationVisitor {
+    fn new(enable_ident_normalization: bool) -> Self {
+        Self {
+            relations: BTreeMap::new(),
+            write_targets: HashMap::new(),
+            all_ctes: BTreeSet::new(),
+            ctes_in_scope: vec![],
+            enable_ident_normalization,
+        }
+    }
+
     /// Record the reference to `relation`, if it's not a CTE reference.
     fn insert_relation(&mut self, relation: &ObjectName) -> ControlFlow<DataFusionError> {
+        let access = self
+            .write_targets
+            .get(&std::ptr::from_ref(relation))
+            .copied()
+            .unwrap_or(TableAccess::Read);
         match object_name_to_table_reference(
             relation.clone(),
             self.enable_ident_normalization,
         ) {
             Ok(relation) => {
-                if !self.relations.contains(&relation)
-                    && !self.ctes_in_scope.contains(&relation)
+                if access != TableAccess::Read || !self.ctes_in_scope.contains(&relation)
                 {
-                    self.relations.insert(relation);
+                    let accesses = self.relations.entry(relation).or_default();
+                    if !accesses.contains(&access) {
+                        accesses.push(access);
+                    }
                 }
                 ControlFlow::Continue(())
             }
             Err(e) => ControlFlow::Break(e),
+        }
+    }
+
+    fn mark_write_target(&mut self, relation: &ObjectName, access: TableAccess) {
+        // Match AST occurrences, not names: INSERT INTO t SELECT * FROM t needs
+        // separate insert and read lookups. These pointers are never dereferenced.
+        self.write_targets
+            .insert(std::ptr::from_ref(relation), access);
+    }
+
+    fn mark_write_table(&mut self, table: &TableFactor, access: TableAccess) {
+        if let TableFactor::Table { name, .. } = table {
+            self.mark_write_target(name, access);
         }
     }
 }
@@ -119,6 +151,47 @@ impl Visitor for RelationVisitor {
     }
 
     fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
+        match statement {
+            Statement::Insert(insert) => {
+                if let TableObject::TableName(name) = &insert.table {
+                    let replace_into = insert.replace_into
+                        || insert.or == Some(SqliteOnConflict::Replace);
+                    let operation = match (insert.overwrite, replace_into) {
+                        (false, false) => InsertOp::Append,
+                        (true, false) => InsertOp::Overwrite,
+                        (false, true) => InsertOp::Replace,
+                        (true, true) => {
+                            return ControlFlow::Break(
+                                datafusion_common::plan_datafusion_err!(
+                                    "Conflicting insert operations: `overwrite` and `replace_into` cannot both be true"
+                                ),
+                            );
+                        }
+                    };
+                    self.mark_write_target(name, TableAccess::Insert(operation));
+                }
+            }
+            Statement::Update(update) => {
+                self.mark_write_table(&update.table.relation, TableAccess::Update);
+            }
+            Statement::Delete(delete) => {
+                let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) =
+                    &delete.from;
+                for table in from {
+                    self.mark_write_table(&table.relation, TableAccess::Delete);
+                }
+            }
+            Statement::Merge(merge) => {
+                self.mark_write_table(&merge.table, TableAccess::Merge);
+            }
+            Statement::Truncate(truncate) => {
+                for table in &truncate.table_names {
+                    self.mark_write_target(&table.name, TableAccess::Truncate);
+                }
+            }
+            _ => {}
+        }
+
         if let Statement::ShowCreate {
             obj_type: ShowCreateObject::Table | ShowCreateObject::View,
             obj_name,
@@ -149,7 +222,9 @@ impl Visitor for RelationVisitor {
                 match object_name_to_table_reference(obj, self.enable_ident_normalization)
                 {
                     Ok(tbl_ref) => {
-                        self.relations.insert(tbl_ref);
+                        self.relations
+                            .entry(tbl_ref)
+                            .or_insert_with(|| vec![TableAccess::Read]);
                     }
                     Err(e) => return ControlFlow::Break(e),
                 }
@@ -228,17 +303,44 @@ pub fn resolve_table_references(
     statement: &crate::parser::Statement,
     enable_ident_normalization: bool,
 ) -> Result<(Vec<TableReference>, Vec<TableReference>)> {
-    let mut visitor = RelationVisitor {
-        relations: BTreeSet::new(),
-        all_ctes: BTreeSet::new(),
-        ctes_in_scope: vec![],
-        enable_ident_normalization,
-    };
+    let mut visitor = RelationVisitor::new(enable_ident_normalization);
 
     visit_statement(statement, &mut visitor)?;
 
     Ok((
-        visitor.relations.into_iter().collect(),
+        visitor.relations.into_keys().collect(),
+        visitor.all_ctes.into_iter().collect(),
+    ))
+}
+
+/// Table references paired with the operations required to resolve them.
+pub type TableReferencesWithAccess = Vec<(TableReference, TableAccess)>;
+
+/// Collects table references together with the operation performed on each occurrence.
+///
+/// Write targets use their specific operation, while query sources use [`TableAccess::Read`].
+/// A table used as both a target and a source appears once for each distinct operation.
+/// CTE aliases are excluded from table references and returned separately. Metadata and
+/// DDL lookups conservatively use [`TableAccess::Read`]; this is not a DDL authorization API.
+///
+/// Prefetch caches must retain the access alongside the table reference so that a provider
+/// authorized for one operation cannot satisfy a lookup for another operation.
+pub fn resolve_table_references_with_access(
+    statement: &crate::parser::Statement,
+    enable_ident_normalization: bool,
+) -> Result<(TableReferencesWithAccess, Vec<TableReference>)> {
+    let mut visitor = RelationVisitor::new(enable_ident_normalization);
+    visit_statement(statement, &mut visitor)?;
+    Ok((
+        visitor
+            .relations
+            .into_iter()
+            .flat_map(|(table, accesses)| {
+                accesses
+                    .into_iter()
+                    .map(move |access| (table.clone(), access))
+            })
+            .collect(),
         visitor.all_ctes.into_iter().collect(),
     ))
 }
@@ -246,6 +348,80 @@ pub fn resolve_table_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_aware_table_references() {
+        use crate::parser::DFParser;
+        use TableAccess::{Delete, Insert, Merge, Read, Truncate, Update};
+
+        let cases = [
+            (
+                "INSERT INTO dst VALUES (1)",
+                vec![("dst", Insert(InsertOp::Append))],
+            ),
+            (
+                "INSERT OVERWRITE dst SELECT * FROM src",
+                vec![("dst", Insert(InsertOp::Overwrite)), ("src", Read)],
+            ),
+            (
+                "REPLACE INTO dst SELECT * FROM src",
+                vec![("dst", Insert(InsertOp::Replace)), ("src", Read)],
+            ),
+            (
+                "INSERT OR REPLACE INTO dst VALUES (1)",
+                vec![("dst", Insert(InsertOp::Replace))],
+            ),
+            (
+                "INSERT INTO t SELECT * FROM t",
+                vec![("t", Insert(InsertOp::Append)), ("t", Read)],
+            ),
+            (
+                "INSERT INTO t WITH t AS (SELECT 1) SELECT * FROM t",
+                vec![("t", Insert(InsertOp::Append))],
+            ),
+            (
+                "INSERT INTO dst WITH t AS (SELECT * FROM src) SELECT * FROM t",
+                vec![("dst", Insert(InsertOp::Append)), ("src", Read)],
+            ),
+            ("UPDATE t SET id = 1", vec![("t", Update)]),
+            (
+                "UPDATE t SET id = (SELECT id FROM t)",
+                vec![("t", Update), ("t", Read)],
+            ),
+            (
+                "DELETE FROM t WHERE id IN (SELECT id FROM t)",
+                vec![("t", Delete), ("t", Read)],
+            ),
+            ("TRUNCATE TABLE t", vec![("t", Truncate)]),
+            (
+                "MERGE INTO t USING t AS s ON t.id = s.id WHEN MATCHED THEN DELETE",
+                vec![("t", Merge), ("t", Read)],
+            ),
+            (
+                "EXPLAIN INSERT INTO dst SELECT * FROM src",
+                vec![("dst", Insert(InsertOp::Append)), ("src", Read)],
+            ),
+            ("COPY t TO 'out.csv'", vec![("t", Read)]),
+            (
+                "SELECT * FROM t a JOIN t b ON a.id = b.id",
+                vec![("t", Read)],
+            ),
+        ];
+        for (sql, expected) in cases {
+            let statement = DFParser::parse_sql(sql).unwrap().pop_back().unwrap();
+            let (tables, _) =
+                resolve_table_references_with_access(&statement, true).unwrap();
+            let tables: Vec<_> = tables
+                .into_iter()
+                .map(|(name, access)| (name.to_string(), access))
+                .collect();
+            let expected: Vec<_> = expected
+                .iter()
+                .map(|(name, access)| (name.to_string(), *access))
+                .collect();
+            assert_eq!(tables, expected, "{sql}");
+        }
+    }
 
     #[test]
     fn resolve_table_references_shadowed_cte() {

@@ -313,3 +313,59 @@ To recap, you need to:
 2. Implement the `SchemaProvider` trait to create a schema provider, or use an existing one.
 3. Implement the `CatalogProvider` trait to create a catalog provider, or use an existing one.
 4. Implement the `CatalogProviderList` trait to create a CatalogProviderList, or use an existing one.
+
+## Operation-aware table resolution
+
+A caller may be allowed to insert into a table without being allowed to select
+from it. The SQL planner still needs the destination schema to validate the
+insert. Implement `SchemaProvider::table_with_access` to authorize that lookup
+before returning the provider and before the planner uses its schema.
+
+`TableAccess` describes the operation being planned. Applications decide which
+privileges each operation requires:
+
+| SQL occurrence                                         | Access                        |
+| ------------------------------------------------------ | ----------------------------- |
+| A source relation, including a subquery within a write | `Read`                        |
+| `INSERT INTO` destination                              | `Insert(InsertOp::Append)`    |
+| `INSERT OVERWRITE` destination                         | `Insert(InsertOp::Overwrite)` |
+| `REPLACE INTO` or `INSERT OR REPLACE` destination      | `Insert(InsertOp::Replace)`   |
+| `UPDATE` destination                                   | `Update`                      |
+| `DELETE` destination                                   | `Delete`                      |
+| `TRUNCATE` destination                                 | `Truncate`                    |
+| `MERGE INTO` destination                               | `Merge`                       |
+
+For `INSERT INTO destination SELECT * FROM source`, the destination lookup uses
+insert intent and the source lookup uses read intent. A self-insert checks both.
+Session planning caches providers by resolved table name and access, so a cached
+insert provider cannot satisfy a read lookup. CTE references use their planned
+relations without a catalog lookup; the tables inside their definitions are
+resolved normally.
+
+The default implementation calls the existing `table` method, preserving
+existing catalogs. A protected catalog must also define conservative behavior
+for legacy `table` calls: require read access, or reject them. Caller identity,
+query context, stable object identities, and the mapping from operations to
+privileges stay in the application.
+
+Custom SQL planning contexts can implement
+`ContextProvider::get_table_source_with_access`. `SessionContext` also exposes
+`table_provider_with_access`, and `DataFrame::write_table` forwards the insert
+operation. Catalog wrappers must forward access to their inner provider. For
+remote catalogs, use `resolve_table_references_with_access` together with the
+`AsyncSchemaProvider`, `AsyncCatalogProvider`, or `AsyncCatalogProviderList`
+`resolve_with_access` method. Those caches retain operation distinctions and
+only satisfy legacy table lookups when read access was resolved. Looking up a
+cached table for an unresolved operation returns an error, preventing wrappers
+from treating it as a missing table and falling back to another provider. Legacy
+`resolve` methods retain their previous behavior and do not establish
+operation-aware authorization. The existing FFI schema-provider ABI does not
+carry operation intent; catalogs exposed through FFI use legacy lookup behavior.
+
+This is a table-resolution hook, not a complete authorization system. DDL and
+metadata lookups without a dedicated operation conservatively request `Read`;
+that does not authorize creation, deletion, or alteration of catalog objects.
+Applications must separately protect metadata enumeration, table functions,
+externally supplied plans and providers, execution methods, and distributed
+execution. Permission changes after planning and provider reuse also require
+application policy; retain provider operation checks where needed.

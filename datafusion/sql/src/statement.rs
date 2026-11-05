@@ -54,8 +54,8 @@ use datafusion_expr::{
     DescribeTable, DmlStatement, DropCatalogSchema, DropFunction, DropTable, DropView,
     EmptyRelation, Execute, Explain, ExplainFormat, Expr, ExprSchemable, Filter,
     LogicalPlan, LogicalPlanBuilder, OperateFunctionArg, PlanType, Prepare,
-    ResetVariable, SetVariable, SortExpr, Statement as PlanStatement, ToStringifiedPlan,
-    TransactionAccessMode, TransactionConclusion, TransactionEnd,
+    ResetVariable, SetVariable, SortExpr, Statement as PlanStatement, TableAccess,
+    ToStringifiedPlan, TransactionAccessMode, TransactionConclusion, TransactionEnd,
     TransactionIsolationLevel, TransactionStart, Volatility, WriteOp, cast,
 };
 use sqlparser::ast::{
@@ -1548,7 +1548,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     return not_impl_err!("TRUNCATE .. with IF EXISTS is not supported");
                 }
                 let table = self.object_name_to_table_reference(target.name.clone())?;
-                let source = self.context_provider.get_table_source(table.clone())?;
+                let source = self
+                    .context_provider
+                    .get_table_source_with_access(table.clone(), TableAccess::Truncate)?;
 
                 // TRUNCATE does not operate on input rows. The EmptyRelation is a logical placeholder
                 // since the real operation is executed directly by the TableProvider's truncate() hook.
@@ -1575,7 +1577,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let table = self.object_name_to_table_reference(table_name)?;
                 let table_schema = self
                     .context_provider
-                    .get_table_source(table.clone())?
+                    .get_table_source_with_access(table.clone(), TableAccess::Read)?
                     .schema()
                     .to_dfschema_ref()?;
                 let using: Option<String> =
@@ -1650,7 +1652,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     fn describe_table_to_plan(&self, table_name: ObjectName) -> Result<LogicalPlan> {
         let table_ref = self.object_name_to_table_reference(table_name)?;
 
-        let table_source = self.context_provider.get_table_source(table_ref)?;
+        let table_source = self
+            .context_provider
+            .get_table_source_with_access(table_ref, TableAccess::Read)?;
 
         let schema = table_source.schema();
 
@@ -1682,8 +1686,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             CopyToSource::Relation(object_name) => {
                 let table_name = object_name_to_string(&object_name);
                 let table_ref = self.object_name_to_table_reference(object_name)?;
-                let table_source =
-                    self.context_provider.get_table_source(table_ref.clone())?;
+                let table_source = self
+                    .context_provider
+                    .get_table_source_with_access(table_ref.clone(), TableAccess::Read)?;
                 let plan =
                     LogicalPlanBuilder::scan(table_name, table_source, None)?.build()?;
                 let input_schema = Arc::clone(plan.schema());
@@ -2260,7 +2265,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     ) -> Result<LogicalPlan> {
         // Do a table lookup to verify the table exists
         let table_ref = self.object_name_to_table_reference(table_name.clone())?;
-        let table_source = self.context_provider.get_table_source(table_ref.clone())?;
+        let table_source = self
+            .context_provider
+            .get_table_source_with_access(table_ref.clone(), TableAccess::Delete)?;
         let schema = DFSchema::try_from_qualified_schema(
             table_ref.clone(),
             &table_source.schema(),
@@ -2318,7 +2325,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
         // Do a table lookup to verify the table exists
         let table_name = self.object_name_to_table_reference(table_name)?;
-        let table_source = self.context_provider.get_table_source(table_name.clone())?;
+        let table_source = self
+            .context_provider
+            .get_table_source_with_access(table_name.clone(), TableAccess::Update)?;
         let table_schema = Arc::new(DFSchema::try_from_qualified_schema(
             table_name.clone(),
             &table_source.schema(),
@@ -2346,10 +2355,19 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             })
             .collect::<Result<HashMap<String, SQLExpr>>>()?;
 
-        // Build scan, join with from table if it exists.
-        let mut input_tables = vec![table];
-        input_tables.extend(from);
-        let scan = self.plan_from_tables(input_tables, &mut planner_context)?;
+        // Only the target occurrence uses Update; FROM and subquery sources use Read.
+        let mut scan = self.plan_table_with_joins_with_access(
+            table,
+            &mut planner_context,
+            TableAccess::Update,
+        )?;
+        if let Some(from) = from {
+            let old_outer_from_schema =
+                planner_context.set_outer_from_schema(Some(Arc::clone(scan.schema())));
+            let source = self.plan_table_with_joins(from, &mut planner_context)?;
+            planner_context.set_outer_from_schema(old_outer_from_schema);
+            scan = LogicalPlanBuilder::from(scan).cross_join(source)?.build()?;
+        }
 
         // Filter
         let source = match predicate_expr {
@@ -2485,7 +2503,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let target_table_ref = self.object_name_to_table_reference(target_table_name)?;
         let target_table_source = self
             .context_provider
-            .get_table_source(target_table_ref.clone())?;
+            .get_table_source_with_access(target_table_ref.clone(), TableAccess::Merge)?;
         // Use alias as schema qualifier so `t.col` resolves when user writes
         // `MERGE INTO target AS t`. Fall back to the table reference itself.
         let target_qualifier = target_alias
@@ -2824,9 +2842,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         overwrite: bool,
         replace_into: bool,
     ) -> Result<LogicalPlan> {
+        let insert_op = match (overwrite, replace_into) {
+            (false, false) => InsertOp::Append,
+            (true, false) => InsertOp::Overwrite,
+            (false, true) => InsertOp::Replace,
+            (true, true) => plan_err!(
+                "Conflicting insert operations: `overwrite` and `replace_into` cannot both be true"
+            )?,
+        };
+
         // Do a table lookup to verify the table exists
         let table_name = self.object_name_to_table_reference(table_name)?;
-        let table_source = self.context_provider.get_table_source(table_name.clone())?;
+        let table_source = self.context_provider.get_table_source_with_access(
+            table_name.clone(),
+            TableAccess::Insert(insert_op),
+        )?;
         let table_schema = DFSchema::try_from(table_source.schema())?;
 
         let columns: Vec<Ident> = columns
@@ -2960,15 +2990,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             .collect::<Result<Vec<Expr>>>()?;
         let source = project(source, exprs)?;
 
-        let insert_op = match (overwrite, replace_into) {
-            (false, false) => InsertOp::Append,
-            (true, false) => InsertOp::Overwrite,
-            (false, true) => InsertOp::Replace,
-            (true, true) => plan_err!(
-                "Conflicting insert operations: `overwrite` and `replace_into` cannot both be true"
-            )?,
-        };
-
         let plan = LogicalPlan::Dml(DmlStatement::new(
             table_name,
             Arc::clone(&table_source),
@@ -2998,7 +3019,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
         // Do a table lookup to verify the table exists
         let table_ref = self.object_name_to_table_reference(sql_table_name)?;
-        let _ = self.context_provider.get_table_source(table_ref)?;
+        let _ = self
+            .context_provider
+            .get_table_source_with_access(table_ref, TableAccess::Read)?;
 
         // Treat both FULL and EXTENDED as the same
         let select_list = if full || extended {
@@ -3151,7 +3174,9 @@ FROM (
 
         // Do a table lookup to verify the table exists
         let table_ref = self.object_name_to_table_reference(sql_table_name)?;
-        let _ = self.context_provider.get_table_source(table_ref)?;
+        let _ = self
+            .context_provider
+            .get_table_source_with_access(table_ref, TableAccess::Read)?;
 
         let query = format!(
             "SELECT table_catalog, table_schema, table_name, definition FROM information_schema.views WHERE {where_clause}"
@@ -3169,7 +3194,7 @@ FROM (
             table: table.into(),
         };
         self.context_provider
-            .get_table_source(tables_reference)
+            .get_table_source_with_access(tables_reference, TableAccess::Read)
             .is_ok()
     }
 

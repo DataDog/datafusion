@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use crate::table::TableProvider;
 use datafusion_common::Result;
-use datafusion_expr::TableType;
+use datafusion_expr::{TableAccess, TableType};
 
 /// Represents a schema, comprising a number of named tables.
 ///
@@ -50,6 +50,25 @@ pub trait SchemaProvider: Any + Debug + Sync + Send {
         &self,
         name: &str,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError>;
+
+    /// Resolves a table for an operation before the planner uses its schema.
+    ///
+    /// The default calls [`Self::table`], preserving existing catalogs. A catalog
+    /// that enforces authorization should check `access` before returning the
+    /// provider. The catalog can capture caller identity and query context;
+    /// DataFusion does not prescribe a privilege model.
+    ///
+    /// Protected catalogs must also define a conservative policy for legacy
+    /// [`Self::table`] calls, such as requiring read access or rejecting them.
+    /// Overriding this method alone does not protect legacy callers, metadata
+    /// enumeration, externally supplied plans, or provider execution methods.
+    async fn table_with_access(
+        &self,
+        name: &str,
+        _access: TableAccess,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        self.table(name).await
+    }
 
     /// Retrieves the type of a specific table from the schema by name, if it exists, otherwise
     /// returns `None`.  Implementations for which this operation is cheap but [Self::table] is

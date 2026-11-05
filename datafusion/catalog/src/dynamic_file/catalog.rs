@@ -19,6 +19,7 @@
 
 use crate::{CatalogProvider, CatalogProviderList, SchemaProvider, TableProvider};
 use async_trait::async_trait;
+use datafusion_expr::TableAccess;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -139,6 +140,18 @@ impl SchemaProvider for DynamicFileSchemaProvider {
         if let Some(table) = self.inner.table(name).await? {
             return Ok(Some(table));
         };
+
+        self.factory.try_new(name).await
+    }
+
+    async fn table_with_access(
+        &self,
+        name: &str,
+        access: TableAccess,
+    ) -> datafusion_common::Result<Option<Arc<dyn TableProvider>>> {
+        if let Some(table) = self.inner.table_with_access(name, access).await? {
+            return Ok(Some(table));
+        }
 
         self.factory.try_new(name).await
     }
