@@ -2221,6 +2221,17 @@ FROM (
 ----
 true
 
+# Moving the struct below the top two rows would divide by zero on value = 1.
+query IB rowsort
+SELECT s['a'], s['b'] IS NOT NULL
+FROM (
+  SELECT named_struct('a', 10 / (value - 1), 'b', random()) AS s
+  FROM (SELECT value FROM generate_series(1, 5) ORDER BY value DESC LIMIT 2)
+);
+----
+2 true
+3 true
+
 #####################
 # Section: expensive expressions are not re-inlined by projection pushdown
 #
