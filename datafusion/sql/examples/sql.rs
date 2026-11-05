@@ -20,7 +20,7 @@ use std::{collections::HashMap, sync::Arc};
 use arrow::datatypes::{DataType, Field, Schema};
 
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::{Result, TableReference, plan_err};
+use datafusion_common::{Result, TableReference};
 use datafusion_expr::planner::ExprPlanner;
 use datafusion_expr::{
     AggregateUDF, ScalarUDF, TableAccess, TableSource,
@@ -132,10 +132,10 @@ impl ContextProvider for MyContextProvider {
         &self,
         name: TableReference,
         _access: TableAccess,
-    ) -> Result<Arc<dyn TableSource>> {
+    ) -> Result<Option<Arc<dyn TableSource>>> {
         match self.tables.get(name.table()) {
-            Some(table) => Ok(Arc::clone(table)),
-            _ => plan_err!("Table not found: {}", name.table()),
+            Some(table) => Ok(Some(Arc::clone(table))),
+            _ => Ok(None),
         }
     }
 

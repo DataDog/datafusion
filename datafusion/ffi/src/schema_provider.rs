@@ -434,6 +434,11 @@ mod tests {
                 .is_some()
         );
         for access in [
+            TableAccess::CreateTable { or_replace: true },
+            TableAccess::CreateView { or_replace: false },
+            TableAccess::DropTable,
+            TableAccess::DropView,
+            TableAccess::CreateIndex,
             TableAccess::Metadata,
             TableAccess::Insert(InsertOp::Append),
             TableAccess::Update,

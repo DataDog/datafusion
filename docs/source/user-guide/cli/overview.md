@@ -31,9 +31,10 @@ Here is an example of how to run a SQL query against a local file, `hits.parquet
 ```shell
 $ datafusion-cli
 DataFusion CLI v37.0.0
-> select count(distinct "URL") from 'hits.parquet';
+> CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION 'hits.parquet';
+> select count(distinct "URL") from hits;
 +----------------------------------+
-| COUNT(DISTINCT hits.parquet.URL) |
+| COUNT(DISTINCT hits.URL) |
 +----------------------------------+
 | 18342019                         |
 +----------------------------------+

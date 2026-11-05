@@ -25,7 +25,7 @@ use arrow::datatypes::*;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::datatype::DataTypeExt;
 use datafusion_common::file_options::file_type::FileType;
-use datafusion_common::{DFSchema, GetExt, Result, TableReference, plan_err};
+use datafusion_common::{DFSchema, GetExt, Result, TableReference};
 use datafusion_expr::planner::{ExprPlanner, PlannerResult, TypePlanner};
 use datafusion_expr::{
     AggregateUDF, Expr, HigherOrderUDF, ScalarUDF, TableAccess, TableSource, WindowUDF,
@@ -120,7 +120,7 @@ impl ContextProvider for MockContextProvider {
         &self,
         name: TableReference,
         _access: TableAccess,
-    ) -> Result<Arc<dyn TableSource>> {
+    ) -> Result<Option<Arc<dyn TableSource>>> {
         let schema = match name.table() {
             "test" => Ok(Schema::new(vec![
                 Field::new("t_date32", DataType::Date32, false),
@@ -282,11 +282,11 @@ impl ContextProvider for MockContextProvider {
                 DataType::UInt32,
                 false,
             )])),
-            _ => plan_err!("No table named: {} found", name.table()),
+            _ => return Ok(None),
         };
 
         match schema {
-            Ok(t) => Ok(Arc::new(EmptyTable::new(Arc::new(t)))),
+            Ok(t) => Ok(Some(Arc::new(EmptyTable::new(Arc::new(t))))),
             Err(e) => Err(e),
         }
     }

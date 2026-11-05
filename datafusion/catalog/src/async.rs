@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion_common::{HashMap, TableReference, error::Result, not_impl_err, plan_err};
+use datafusion_common::{HashMap, TableReference, error::Result, not_impl_err};
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::TableAccess;
 
@@ -34,18 +34,13 @@ struct ResolvedSchemaProvider {
 }
 
 #[derive(Debug)]
-struct ResolvedTableCache(HashMap<(String, TableAccess), Arc<dyn TableProvider>>);
+struct ResolvedTableCache(HashMap<(String, TableAccess), Option<Arc<dyn TableProvider>>>);
 
 impl ResolvedTableCache {
     fn new(
         tables: HashMap<(String, TableAccess), Option<Arc<dyn TableProvider>>>,
     ) -> Self {
-        Self(
-            tables
-                .into_iter()
-                .filter_map(|(key, table)| table.map(|table| (key, table)))
-                .collect(),
-        )
+        Self(tables)
     }
 }
 #[async_trait]
@@ -57,8 +52,8 @@ impl SchemaProvider for ResolvedSchemaProvider {
     fn table_names(&self) -> Vec<String> {
         self.cached_tables
             .0
-            .keys()
-            .map(|(name, _)| name.clone())
+            .iter()
+            .filter_map(|((name, _), table)| table.as_ref().map(|_| name.clone()))
             .collect::<datafusion_common::HashSet<_>>()
             .into_iter()
             .collect()
@@ -69,15 +64,15 @@ impl SchemaProvider for ResolvedSchemaProvider {
         name: &str,
         access: TableAccess,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
-        let tables = &self.cached_tables.0;
-        if let Some(table) = tables.get(&(name.to_string(), access)) {
-            Ok(Some(Arc::clone(table)))
-        } else if tables.keys().any(|(table, _)| table == name) {
-            // An unresolved operation must not trigger missing-table fallbacks.
-            plan_err!("Table '{name}' was not resolved for operation {access:?}")
-        } else {
-            Ok(None)
-        }
+        self.cached_tables
+            .0
+            .get(&(name.to_string(), access))
+            .cloned()
+            .ok_or_else(|| {
+                datafusion_common::plan_datafusion_err!(
+                    "Table '{name}' was not resolved for operation {access:?}"
+                )
+            })
     }
 
     fn register_table(
@@ -97,7 +92,10 @@ impl SchemaProvider for ResolvedSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.cached_tables.0.keys().any(|(table, _)| table == name)
+        self.cached_tables
+            .0
+            .iter()
+            .any(|((table, _), provider)| table == name && provider.is_some())
     }
 }
 
@@ -223,6 +221,7 @@ impl CatalogProviderList for ResolvedCatalogProviderList {
 pub trait AsyncSchemaProvider: Send + Sync {
     /// Resolve a table for an operation before its schema is used.
     /// Implementations must handle access explicitly; wrappers must forward it.
+    /// Authorize absent names before returning `Ok(None)`; denials are errors.
     async fn table(
         &self,
         name: &str,
@@ -231,7 +230,7 @@ pub trait AsyncSchemaProvider: Send + Sync {
 
     /// Resolve tables for the requested operations, retaining each operation in the cache.
     ///
-    /// A lookup for a cached table with an unresolved operation returns an error.
+    /// Authorized absence is cached; every unresolved name/operation pair is an error.
     /// The snapshot is scoped to one caller and query; it does not refresh authorization.
     async fn resolve(
         &self,
@@ -290,7 +289,7 @@ pub trait AsyncCatalogProvider: Send + Sync {
 
     /// Resolve tables for the requested operations, retaining each operation in the cache.
     ///
-    /// A lookup for a cached table with an unresolved operation returns an error.
+    /// Authorized absence is cached; every unresolved name/operation pair is an error.
     /// The snapshot is scoped to one caller and query; it does not refresh authorization.
     async fn resolve(
         &self,
@@ -358,7 +357,7 @@ pub trait AsyncCatalogProviderList: Send + Sync {
 
     /// Resolve tables for the requested operations, retaining each operation in the cache.
     ///
-    /// A lookup for a cached table with an unresolved operation returns an error.
+    /// Authorized absence is cached; every unresolved name/operation pair is an error.
     /// The snapshot is scoped to one caller and query; it does not refresh authorization.
     async fn resolve(
         &self,
@@ -450,10 +449,7 @@ mod tests {
     use datafusion_expr::{Expr, TableAccess, TableType, dml::InsertOp};
     use datafusion_physical_plan::ExecutionPlan;
 
-    use crate::{
-        CatalogProviderList, DynamicFileSchemaProvider, SchemaProvider, Session,
-        TableProvider, UrlTableFactory,
-    };
+    use crate::{CatalogProviderList, SchemaProvider, Session, TableProvider};
 
     use super::{AsyncCatalogProvider, AsyncCatalogProviderList, AsyncSchemaProvider};
 
@@ -634,67 +630,31 @@ mod tests {
                     format!("was not resolved for operation {access:?}")
                 );
             }
-            assert!(
-                cached
-                    .table("missing", TableAccess::Read)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(cached.table("missing", TableAccess::Read).await.is_err());
             assert_eq!(cached.table_names(), vec![MOCK_TABLE]);
             assert!(cached.table_exist(MOCK_TABLE));
         }
     }
 
-    #[derive(Debug, Default)]
-    struct RecordingUrlFactory {
-        calls: AtomicU32,
-    }
-
-    #[async_trait]
-    impl UrlTableFactory for RecordingUrlFactory {
-        async fn try_new(&self, _url: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(Arc::new(MockTableProvider {})))
-        }
-    }
-
     #[tokio::test]
-    async fn unresolved_operations_do_not_trigger_dynamic_file_fallback() {
-        let insert = TableAccess::Insert(InsertOp::Append);
-        let references = [(TableReference::bare(MOCK_TABLE), insert)];
+    async fn resolved_absence_is_distinct_from_an_unrequested_operation() {
+        let create = TableAccess::CreateTable { or_replace: false };
         for level in [
             ResolveLevel::Schema,
             ResolveLevel::Catalog,
             ResolveLevel::CatalogList,
         ] {
-            let provider = Arc::new(OperationAwareSchema {
-                allow_read: false,
-                lookups: Mutex::new(vec![]),
-            });
-            let cached = resolve_operations(provider, &references, level)
+            let provider = Arc::new(MockAsyncSchemaProvider::default());
+            let references = [(TableReference::bare("absent"), create)];
+            let cached = resolve_operations(provider.clone(), &references, level)
                 .await
                 .unwrap();
-            let factory = Arc::new(RecordingUrlFactory::default());
-            let wrapped = DynamicFileSchemaProvider::new(cached, factory.clone());
-
-            for access in [TableAccess::Read, TableAccess::Insert(InsertOp::Overwrite)] {
-                let error = wrapped.table(MOCK_TABLE, access).await.unwrap_err();
-                assert_contains!(
-                    error.to_string(),
-                    format!("was not resolved for operation {access:?}")
-                );
-            }
-            assert_eq!(factory.calls.load(Ordering::Relaxed), 0);
-
-            assert!(
-                wrapped
-                    .table("missing.csv", TableAccess::Read)
-                    .await
-                    .unwrap()
-                    .is_some()
-            );
-            assert_eq!(factory.calls.load(Ordering::Relaxed), 1);
+            assert!(cached.table("absent", create).await.unwrap().is_none());
+            assert!(cached.table("absent", TableAccess::Read).await.is_err());
+            assert!(cached.table("another", create).await.is_err());
+            assert!(!cached.table_exist("absent"));
+            assert!(cached.table_names().is_empty());
+            assert_eq!(provider.lookup_count.load(Ordering::Relaxed), 1);
         }
     }
 

@@ -32,7 +32,11 @@ use crate::dml::InsertOp;
 ///
 /// Resolution checks complement provider operation checks. They do not secure
 /// externally supplied plans, arbitrary providers, metadata enumeration, or
-/// distributed execution. Metadata access does not authorize DDL commands.
+/// distributed execution. Each operation includes the metadata needed to plan
+/// it; no operation implies a separate [`Self::Metadata`] or [`Self::Read`] grant.
+/// Catalog mutations must still enforce policy at execution, including races
+/// between lookup and mutation. File locations and non-table commands require
+/// application checks beyond this table intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TableAccess {
@@ -40,6 +44,24 @@ pub enum TableAccess {
     Read,
     /// Inspect table metadata without reading rows or authorizing a DDL command.
     Metadata,
+    /// Create a table, including an external table or SELECT INTO destination.
+    /// Authorize the name even when no table exists. Replacement is part of this
+    /// operation and does not cause a separate drop or metadata request.
+    CreateTable {
+        /// Replace an existing table if present.
+        or_replace: bool,
+    },
+    /// Create a view, optionally replacing an existing view.
+    CreateView {
+        /// Replace an existing view if present.
+        or_replace: bool,
+    },
+    /// Drop a table, including inspecting its type and existence.
+    DropTable,
+    /// Drop a view, including inspecting its type and existence.
+    DropView,
+    /// Create an index on a table.
+    CreateIndex,
     /// Insert into a table, retaining append, overwrite, and replace intent.
     Insert(InsertOp),
     /// Update rows in a table.

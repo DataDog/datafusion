@@ -27,7 +27,7 @@ use arrow::datatypes::{
 };
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::TransformedResult;
-use datafusion_common::{DFSchema, Result, ScalarValue, TableReference, plan_err};
+use datafusion_common::{DFSchema, Result, ScalarValue, TableReference};
 use datafusion_expr::interval_arithmetic::{Interval, NullableInterval};
 use datafusion_expr::{
     AggregateUDF, BinaryExpr, Expr, ExprSchemable, HigherOrderUDF, LogicalPlan, Operator,
@@ -182,7 +182,7 @@ impl ContextProvider for MyContextProvider {
         &self,
         name: TableReference,
         _access: TableAccess,
-    ) -> Result<Arc<dyn TableSource>> {
+    ) -> Result<Option<Arc<dyn TableSource>>> {
         let table_name = name.table();
         if table_name.starts_with("test") {
             let schema = Schema::new_with_metadata(
@@ -208,11 +208,11 @@ impl ContextProvider for MyContextProvider {
                 HashMap::new(),
             );
 
-            Ok(Arc::new(MyTableSource {
+            Ok(Some(Arc::new(MyTableSource {
                 schema: Arc::new(schema),
-            }))
+            })))
         } else {
-            plan_err!("table does not exist")
+            Ok(None)
         }
     }
 

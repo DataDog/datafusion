@@ -16,9 +16,12 @@
 # under the License.
 
 #
-# Note: This file runs with a SessionContext that has the `enable_url_table` flag set
+# Files must be explicitly registered before SQL can read them.
 #
 # dynamic select arrow file in the folder
+statement ok
+CREATE EXTERNAL TABLE "../core/tests/data/partitioned_table_arrow/part=123" STORED AS ARROW LOCATION '../core/tests/data/partitioned_table_arrow/part=123';
+
 query ITB
 SELECT * FROM '../core/tests/data/partitioned_table_arrow/part=123' ORDER BY f0;
 ----
@@ -66,6 +69,9 @@ PARTITIONED BY (partition_col);
 ----
 4
 
+statement ok
+CREATE EXTERNAL TABLE "test_files/scratch/dynamic_file/csv_partitions" STORED AS CSV PARTITIONED BY (partition_col INT) LOCATION 'test_files/scratch/dynamic_file/csv_partitions';
+
 query ITIT rowsort
 SELECT int_col, string_col, bigint_col, partition_col FROM 'test_files/scratch/dynamic_file/csv_partitions';
 ----
@@ -93,6 +99,9 @@ STORED AS JSON
 PARTITIONED BY (partition_col);
 ----
 4
+
+statement ok
+CREATE EXTERNAL TABLE "test_files/scratch/dynamic_file/json_partitions" STORED AS JSON PARTITIONED BY (partition_col INT) LOCATION 'test_files/scratch/dynamic_file/json_partitions';
 
 query ITIT rowsort
 SELECT int_col, string_col, bigint_col, partition_col FROM 'test_files/scratch/dynamic_file/json_partitions';
@@ -122,6 +131,9 @@ PARTITIONED BY (partition_col);
 ----
 4
 
+statement ok
+CREATE EXTERNAL TABLE "test_files/scratch/dynamic_file/arrow_partitions" STORED AS ARROW PARTITIONED BY (partition_col INT) LOCATION 'test_files/scratch/dynamic_file/arrow_partitions';
+
 query ITIT rowsort
 SELECT int_col, string_col, bigint_col, partition_col FROM 'test_files/scratch/dynamic_file/arrow_partitions';
 ----
@@ -149,6 +161,9 @@ STORED AS PARQUET
 PARTITIONED BY (partition_col);
 ----
 4
+
+statement ok
+CREATE EXTERNAL TABLE "test_files/scratch/dynamic_file/parquet_partitions" STORED AS PARQUET PARTITIONED BY (partition_col INT) LOCATION 'test_files/scratch/dynamic_file/parquet_partitions';
 
 query ITIT rowsort
 select * from 'test_files/scratch/dynamic_file/parquet_partitions';
@@ -178,6 +193,9 @@ PARTITIONED BY (partition_col, string_col);
 ----
 4
 
+statement ok
+CREATE EXTERNAL TABLE "test_files/scratch/dynamic_file/nested_partition" STORED AS PARQUET PARTITIONED BY (partition_col INT, string_col TEXT) LOCATION 'test_files/scratch/dynamic_file/nested_partition';
+
 query IITT rowsort
 select * from 'test_files/scratch/dynamic_file/nested_partition';
 ----
@@ -191,6 +209,9 @@ select * from 'test_files/scratch/dynamic_file/nested_partition';
 8 800 2 hhh
 
 # read avro file
+statement ok
+CREATE EXTERNAL TABLE "../../testing/data/avro/alltypes_plain.avro" STORED AS AVRO LOCATION '../../testing/data/avro/alltypes_plain.avro';
+
 query IT
 SELECT id, CAST(string_col AS varchar) FROM '../../testing/data/avro/alltypes_plain.avro'
 ----
@@ -204,6 +225,9 @@ SELECT id, CAST(string_col AS varchar) FROM '../../testing/data/avro/alltypes_pl
 1 1
 
 # dynamic query snappy avro file
+statement ok
+CREATE EXTERNAL TABLE "../../testing/data/avro/alltypes_plain.snappy.avro" STORED AS AVRO LOCATION '../../testing/data/avro/alltypes_plain.snappy.avro';
+
 query IT
 SELECT id, CAST(string_col AS varchar) FROM '../../testing/data/avro/alltypes_plain.snappy.avro'
 ----
@@ -217,6 +241,9 @@ SELECT id, CAST(string_col AS varchar) FROM '../../testing/data/avro/alltypes_pl
 1 1
 
 # query the csv file dynamically with the config of current session
+statement ok
+CREATE EXTERNAL TABLE "../core/tests/data/quote.csv" STORED AS CSV LOCATION '../core/tests/data/quote.csv';
+
 query TT
 select * from '../core/tests/data/quote.csv';
 ----
@@ -231,12 +258,18 @@ select * from '../core/tests/data/quote.csv';
 ~id8~ ~value8~
 ~id9~ ~value9~
 
+statement ok
+CREATE EXTERNAL TABLE "../core/tests/data/aggregate_simple.csv" STORED AS CSV LOCATION '../core/tests/data/aggregate_simple.csv';
+
 query TTT
 DESCRIBE '../core/tests/data/aggregate_simple.csv';
 ----
 c1 Float64 YES
 c2 Float64 YES
 c3 Boolean YES
+
+statement ok
+CREATE EXTERNAL TABLE "../core/tests/data/2.json" STORED AS JSON LOCATION '../core/tests/data/2.json';
 
 query IR rowsort
 SELECT a, b FROM '../core/tests/data/2.json'
@@ -253,6 +286,9 @@ SELECT a, b FROM '../core/tests/data/2.json'
 2 0.6
 5 -3.5
 7 -3.5
+
+statement ok
+CREATE EXTERNAL TABLE "../../parquet-testing/data/alltypes_plain.parquet" STORED AS PARQUET LOCATION '../../parquet-testing/data/alltypes_plain.parquet';
 
 query IT
 SELECT id, CAST(string_col AS varchar) FROM '../../parquet-testing/data/alltypes_plain.parquet';

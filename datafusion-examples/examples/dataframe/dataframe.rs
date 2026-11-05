@@ -144,12 +144,10 @@ async fn read_csv(ctx: &SessionContext) -> Result<()> {
     let csv_df = ctx.read_csv(file_path, csv_read_option).await?;
     csv_df.show().await?;
 
-    // You can also create DataFrames from the result of sql queries
-    // and using the `enable_url_table` refer to local files directly
-    let dyn_ctx = ctx.clone().enable_url_table();
-    let csv_df = dyn_ctx
-        .sql(&format!("SELECT rating, unixtime FROM '{file_path}'"))
+    // Register a file explicitly before referring to it in SQL.
+    ctx.register_csv("ratings", file_path, CsvReadOptions::default())
         .await?;
+    let csv_df = ctx.sql("SELECT rating, unixtime FROM ratings").await?;
     csv_df.show().await?;
 
     Ok(())

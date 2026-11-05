@@ -26,8 +26,8 @@ use async_trait::async_trait;
 use datafusion::dataframe::DataFrameWriteOptions;
 use datafusion::prelude::SessionContext;
 use datafusion_catalog::{
-    CatalogProvider, DynamicFileSchemaProvider, MemTable, MemoryCatalogProvider,
-    MemorySchemaProvider, SchemaProvider, Session, TableProvider, UrlTableFactory,
+    CatalogProvider, MemTable, MemoryCatalogProvider, MemorySchemaProvider,
+    SchemaProvider, Session, TableProvider,
 };
 use datafusion_common::test_util::batches_to_string;
 use datafusion_common::{Result, assert_contains, plan_err};
@@ -507,75 +507,6 @@ async fn existing_schema_implementations_keep_working() {
     );
 }
 
-#[derive(Debug, Default)]
-struct ObservedUrlFactory {
-    calls: AtomicUsize,
-}
-
-#[async_trait]
-impl UrlTableFactory for ObservedUrlFactory {
-    async fn try_new(&self, _url: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(Arc::new(ObservedTable::new())))
-    }
-}
-
-#[tokio::test]
-async fn dynamic_file_schema_forwards_access_and_only_falls_back_for_missing_tables() {
-    let schema = Arc::new(AuthorizedSchema::new());
-    let factory = Arc::new(ObservedUrlFactory::default());
-    let wrapped = DynamicFileSchemaProvider::new(
-        Arc::clone(&schema) as Arc<dyn SchemaProvider>,
-        Arc::clone(&factory) as Arc<dyn UrlTableFactory>,
-    );
-    let access = TableAccess::Insert(InsertOp::Append);
-    schema.grant("target", access);
-    assert!(wrapped.table("target", access).await.unwrap().is_some());
-    assert_eq!(factory.calls.load(Ordering::Relaxed), 0);
-
-    let err = wrapped
-        .table("target", TableAccess::Read)
-        .await
-        .unwrap_err();
-    assert_contains!(err.to_string(), "Access denied to target for Read");
-    assert_eq!(factory.calls.load(Ordering::Relaxed), 0);
-
-    schema.grant("file.csv", access);
-    assert!(wrapped.table("file.csv", access).await.unwrap().is_some());
-    assert_eq!(factory.calls.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        schema.accesses(),
-        HashSet::from([
-            ("target".to_owned(), access),
-            ("target".to_owned(), TableAccess::Read),
-            ("file.csv".to_owned(), access),
-        ])
-    );
-}
-
-#[tokio::test]
-async fn forwarding_wrapper_cannot_turn_read_permission_into_insert_permission() {
-    let schema = Arc::new(AuthorizedSchema::new());
-    schema.grant("target", TableAccess::Read);
-    let factory = Arc::new(ObservedUrlFactory::default());
-    let wrapped = Arc::new(DynamicFileSchemaProvider::new(
-        Arc::clone(&schema) as Arc<dyn SchemaProvider>,
-        Arc::clone(&factory) as Arc<dyn UrlTableFactory>,
-    ));
-    let ctx = context(wrapped);
-    let error = ctx.sql("INSERT INTO target VALUES (1)").await.unwrap_err();
-    assert_contains!(
-        error.to_string(),
-        "Access denied to target for Insert(Append)"
-    );
-    assert_eq!(schema.tables["target"].schema_calls(), 0);
-    assert_eq!(factory.calls.load(Ordering::Relaxed), 0);
-    assert_eq!(
-        schema.accesses(),
-        HashSet::from([("target".into(), TableAccess::Insert(InsertOp::Append))])
-    );
-}
-
 #[tokio::test]
 async fn metadata_permission_allows_describe_but_not_select() {
     let (ctx, schema) = authorized_context();
@@ -597,27 +528,181 @@ async fn metadata_permission_allows_describe_but_not_select() {
 }
 
 #[tokio::test]
-async fn denied_metadata_fails_before_schema_and_does_not_authorize_ddl() {
-    for sql in [
-        "DESCRIBE target",
-        "CREATE INDEX idx ON target(id)",
-        "CREATE TABLE IF NOT EXISTS target(id BIGINT)",
-        "CREATE OR REPLACE VIEW target AS SELECT 1 AS id",
-        "DROP TABLE target",
-        "DROP TABLE IF EXISTS target",
-        "CREATE EXTERNAL TABLE IF NOT EXISTS target STORED AS CSV LOCATION 'missing.csv'",
+async fn ddl_needs_its_own_intent_without_a_metadata_prerequisite() {
+    for (sql, access) in [
+        ("CREATE INDEX idx ON target(id)", TableAccess::CreateIndex),
+        (
+            "CREATE TABLE IF NOT EXISTS target(id BIGINT)",
+            TableAccess::CreateTable { or_replace: false },
+        ),
+        (
+            "CREATE OR REPLACE TABLE target AS SELECT 1 AS id",
+            TableAccess::CreateTable { or_replace: true },
+        ),
+        (
+            "CREATE OR REPLACE VIEW target AS SELECT 1 AS id",
+            TableAccess::CreateView { or_replace: true },
+        ),
+        ("DROP TABLE target", TableAccess::DropTable),
+        ("DROP TABLE IF EXISTS target", TableAccess::DropTable),
+        ("DROP VIEW IF EXISTS target", TableAccess::DropView),
+        (
+            "CREATE EXTERNAL TABLE IF NOT EXISTS target STORED AS CSV LOCATION 'missing.csv'",
+            TableAccess::CreateTable { or_replace: false },
+        ),
     ] {
         let (ctx, schema) = authorized_context();
-        schema.grant("target", TableAccess::Read);
+        schema.grant("target", TableAccess::Metadata);
         let error = ctx.sql(sql).await.unwrap_err();
-        assert_contains!(error.to_string(), "Access denied to target for Metadata");
+        assert_contains!(
+            error.to_string(),
+            format!("Access denied to target for {access:?}")
+        );
         assert_eq!(schema.tables["target"].schema_calls(), 0, "{sql}");
+
+        let (ctx, schema) = authorized_context();
+        schema.grant("target", access);
+        ctx.state().create_logical_plan(sql).await.unwrap();
+        assert_eq!(
+            schema.accesses(),
+            HashSet::from([("target".into(), access)]),
+            "{sql}"
+        );
+        // The default schema disallows mutations. Reaching that error is distinct
+        // from requiring an unrelated metadata grant during execution.
+        if let Err(error) = ctx.sql(sql).await {
+            assert!(
+                !error.to_string().contains("Access denied"),
+                "{sql}: {error}"
+            );
+        }
+        assert_eq!(
+            schema.accesses(),
+            HashSet::from([("target".into(), access)]),
+            "{sql}"
+        );
     }
-    // Metadata lookup succeeds, but the separate catalog mutation remains denied.
-    let (ctx, schema) = authorized_context();
-    schema.grant("target", TableAccess::Metadata);
-    let error = ctx.sql("DROP TABLE target").await.unwrap_err();
-    assert_contains!(error.to_string(), "does not support deregistering tables");
+}
+
+#[tokio::test]
+async fn direct_ddl_execution_checks_absent_names() {
+    for (sql, access) in [
+        (
+            "CREATE TABLE absent(id BIGINT)",
+            TableAccess::CreateTable { or_replace: false },
+        ),
+        (
+            "CREATE VIEW absent AS SELECT 1 AS id",
+            TableAccess::CreateView { or_replace: false },
+        ),
+        (
+            "CREATE EXTERNAL TABLE absent STORED AS CSV LOCATION 'missing.csv'",
+            TableAccess::CreateTable { or_replace: false },
+        ),
+        ("DROP TABLE IF EXISTS absent", TableAccess::DropTable),
+        ("DROP VIEW IF EXISTS absent", TableAccess::DropView),
+    ] {
+        let (ctx, schema) = authorized_context();
+        schema.grant("absent", access);
+        let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+        assert_eq!(
+            schema.accesses(),
+            HashSet::from([("absent".into(), access)])
+        );
+        schema.revoke("absent", access);
+        let error = ctx.execute_logical_plan(plan.clone()).await.unwrap_err();
+        assert_contains!(
+            error.to_string(),
+            format!("Access denied to absent for {access:?}")
+        );
+        schema.grant("absent", access);
+        if let Err(error) = ctx.execute_logical_plan(plan).await {
+            assert!(
+                !error.to_string().contains("Access denied"),
+                "{sql}: {error}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_file_names_do_not_open_files_or_register_stores() {
+    let ctx = SessionContext::new();
+    for name in [
+        "tests/data/example.csv",
+        "https://example.com/secret.csv",
+        "s3://private/secret.parquet",
+    ] {
+        assert!(ctx.table_provider(name, TableAccess::Read).await.is_err());
+        assert!(ctx.sql(&format!("SELECT * FROM '{name}'")).await.is_err());
+    }
+    assert!(
+        ctx.runtime_env()
+            .object_store(
+                datafusion::datasource::listing::ListingTableUrl::parse(
+                    "https://example.com/"
+                )
+                .unwrap()
+            )
+            .is_err()
+    );
+    assert!(
+        ctx.runtime_env()
+            .object_store(
+                datafusion::datasource::listing::ListingTableUrl::parse("s3://private/")
+                    .unwrap()
+            )
+            .is_err()
+    );
+    ctx.register_csv(
+        "explicit_file",
+        "tests/data/example.csv",
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !ctx.sql("SELECT * FROM explicit_file")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[derive(Debug)]
+struct ForwardingSchema(Arc<dyn SchemaProvider>);
+
+#[async_trait]
+impl SchemaProvider for ForwardingSchema {
+    fn table_names(&self) -> Vec<String> {
+        self.0.table_names()
+    }
+    fn table_exist(&self, name: &str) -> bool {
+        self.0.table_exist(name)
+    }
+    async fn table(
+        &self,
+        name: &str,
+        access: TableAccess,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        self.0.table(name, access).await
+    }
+}
+
+#[tokio::test]
+async fn forwarding_wrapper_preserves_mutation_intent() {
+    let schema = Arc::new(AuthorizedSchema::new());
+    schema.grant("target", TableAccess::Read);
+    let ctx = context(Arc::new(ForwardingSchema(schema.clone())));
+    let error = ctx.sql("INSERT INTO target VALUES (1)").await.unwrap_err();
+    assert_contains!(
+        error.to_string(),
+        "Access denied to target for Insert(Append)"
+    );
+    assert_eq!(schema.tables["target"].schema_calls(), 0);
 }
 
 #[tokio::test]
@@ -694,4 +779,115 @@ async fn show_and_information_schema_use_metadata_access() {
             .accesses()
             .contains(&("target".into(), TableAccess::Metadata))
     );
+}
+
+#[derive(Debug)]
+struct DdlOnlySchema {
+    inner: MemorySchemaProvider,
+    allowed: TableAccess,
+}
+
+#[async_trait]
+impl SchemaProvider for DdlOnlySchema {
+    fn table_names(&self) -> Vec<String> {
+        self.inner.table_names()
+    }
+    fn table_exist(&self, name: &str) -> bool {
+        self.inner.table_exist(name)
+    }
+    async fn table(
+        &self,
+        name: &str,
+        access: TableAccess,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        if access != self.allowed {
+            return plan_err!("unexpected prerequisite: {access:?}");
+        }
+        self.inner.table(name, access).await
+    }
+    fn register_table(
+        &self,
+        name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        self.inner.register_table(name, table)
+    }
+    fn deregister_table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        self.inner.deregister_table(name)
+    }
+}
+
+#[tokio::test]
+async fn ddl_execution_succeeds_with_only_the_requested_operation() {
+    for (sql, allowed, existing) in [
+        (
+            "CREATE TABLE target(id BIGINT)",
+            TableAccess::CreateTable { or_replace: false },
+            false,
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS target(id BIGINT)",
+            TableAccess::CreateTable { or_replace: false },
+            true,
+        ),
+        (
+            "CREATE OR REPLACE TABLE target AS SELECT 1 AS id",
+            TableAccess::CreateTable { or_replace: true },
+            true,
+        ),
+        (
+            "SELECT 1 AS id INTO target",
+            TableAccess::CreateTable { or_replace: false },
+            false,
+        ),
+        (
+            "CREATE VIEW target AS SELECT 1 AS id",
+            TableAccess::CreateView { or_replace: false },
+            false,
+        ),
+        (
+            "CREATE OR REPLACE VIEW target AS SELECT 1 AS id",
+            TableAccess::CreateView { or_replace: true },
+            true,
+        ),
+        (
+            "CREATE OR REPLACE EXTERNAL TABLE target STORED AS CSV LOCATION 'tests/data/example.csv'",
+            TableAccess::CreateTable { or_replace: true },
+            true,
+        ),
+        ("DROP TABLE target", TableAccess::DropTable, true),
+        ("DROP VIEW target", TableAccess::DropView, true),
+        ("DROP TABLE IF EXISTS target", TableAccess::DropTable, false),
+        ("DROP VIEW IF EXISTS target", TableAccess::DropView, false),
+    ] {
+        let schema = Arc::new(DdlOnlySchema {
+            inner: MemorySchemaProvider::new(),
+            allowed,
+        });
+        if existing {
+            let provider: Arc<dyn TableProvider> = if allowed == TableAccess::DropView {
+                Arc::new(datafusion::datasource::ViewTable::new(
+                    datafusion_expr::LogicalPlanBuilder::empty(false)
+                        .build()
+                        .unwrap(),
+                    None,
+                ))
+            } else {
+                Arc::new(ObservedTable::new())
+            };
+            schema.register_table("target".into(), provider).unwrap();
+        }
+        let ctx = context(schema.clone());
+        ctx.sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            schema.table_exist("target"),
+            !matches!(allowed, TableAccess::DropTable | TableAccess::DropView),
+            "{sql}"
+        );
+    }
 }

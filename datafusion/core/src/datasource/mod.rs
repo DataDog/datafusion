@@ -19,7 +19,6 @@
 //!
 //! [`ListingTable`]: crate::datasource::listing::ListingTable
 
-pub mod dynamic_file;
 pub mod file_format;
 pub mod listing;
 pub mod listing_table_factory;

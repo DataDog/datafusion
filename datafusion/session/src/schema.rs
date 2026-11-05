@@ -49,6 +49,9 @@ pub trait SchemaProvider: Any + Debug + Sync + Send {
     /// Implementations must explicitly handle the intent. Forwarding wrappers
     /// must preserve it; authorizing catalogs must check it before returning a
     /// provider. Identity and privilege mapping belong to the application.
+    /// Check absent names too: `Ok(None)` means an authorized missing object,
+    /// while denial is an error. DDL intents include their needed metadata and
+    /// must not implicitly require an additional metadata or read grant.
     /// Metadata access does not authorize DDL or metadata enumeration.
     /// Provider execution and externally supplied plans require separate checks.
     async fn table(

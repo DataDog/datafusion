@@ -530,6 +530,26 @@ mod tests {
     use datafusion_common::assert_contains;
     use url::Url;
 
+    #[tokio::test]
+    async fn missing_catalog_entries_do_not_register_object_stores() {
+        let ctx = SessionContext::new();
+        for location in [
+            "https://example.com/private.csv",
+            "s3://private/secret.parquet",
+        ] {
+            let statement = DFParser::parse_sql(&format!("SELECT * FROM '{location}'"))
+                .unwrap()
+                .pop_back()
+                .unwrap();
+            assert!(create_plan(&ctx, statement, false).await.is_err());
+            assert!(
+                ctx.runtime_env()
+                    .object_store(ListingTableUrl::parse(location).unwrap())
+                    .is_err()
+            );
+        }
+    }
+
     async fn create_external_table_test(location: &str, sql: &str) -> Result<()> {
         let ctx = SessionContext::new();
         let plan = ctx.state().create_logical_plan(sql).await?;

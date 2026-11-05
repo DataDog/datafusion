@@ -18,7 +18,7 @@
 //! See `main.rs` for how to run it.
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::{TableReference, plan_err};
+use datafusion::common::TableReference;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::logical_expr::TableAccess;
@@ -142,16 +142,16 @@ impl ContextProvider for MyContextProvider {
         &self,
         name: TableReference,
         _access: TableAccess,
-    ) -> Result<Arc<dyn TableSource>> {
+    ) -> Result<Option<Arc<dyn TableSource>>> {
         if name.table() == "person" {
-            Ok(Arc::new(MyTableSource {
+            Ok(Some(Arc::new(MyTableSource {
                 schema: Arc::new(Schema::new(vec![
                     Field::new("name", DataType::Utf8, false),
                     Field::new("age", DataType::UInt8, false),
                 ])),
-            }))
+            })))
         } else {
-            plan_err!("Table {} not found", name.table())
+            Ok(None)
         }
     }
 

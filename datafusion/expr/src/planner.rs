@@ -47,11 +47,14 @@ pub trait ContextProvider {
     /// Implementations must explicitly handle the intent. Forwarding wrappers
     /// must preserve it, and caches must distinguish both table and access.
     /// Identity and the mapping from operations to privileges are application-owned.
+    /// Check authorization even for absent names: `Ok(None)` means the lookup was
+    /// allowed but no table exists. Denials and unresolved cache entries are errors.
+    /// Creation uses this distinction to authorize a new destination.
     fn get_table_source(
         &self,
         name: TableReference,
         access: TableAccess,
-    ) -> Result<Arc<dyn TableSource>>;
+    ) -> Result<Option<Arc<dyn TableSource>>>;
 
     /// Return the type of a file based on its extension (e.g. `.parquet`)
     ///

@@ -76,13 +76,16 @@ impl ContextProvider for AccessContext {
         &self,
         name: TableReference,
         access: TableAccess,
-    ) -> Result<Arc<dyn TableSource>> {
+    ) -> Result<Option<Arc<dyn TableSource>>> {
         let key = (name.to_string(), access);
         self.requests.borrow_mut().push(key.clone());
         if !self.allowed.contains(&key) {
             return plan_err!("access denied: {name} {access:?}");
         }
-        Ok(Arc::clone(self.tables.get(name.table()).unwrap()) as Arc<dyn TableSource>)
+        Ok(self
+            .tables
+            .get(name.table())
+            .map(|table| Arc::clone(table) as Arc<dyn TableSource>))
     }
 
     fn get_function_meta(&self, _: &str) -> Option<Arc<ScalarUDF>> {
@@ -260,23 +263,103 @@ fn cte_alias_does_not_lookup_catalog() {
 
 #[test]
 fn metadata_lookup_does_not_require_row_reads() {
-    for sql in ["DESCRIBE target", "CREATE INDEX idx ON target(id)"] {
-        let context = AccessContext::with_access(&[("target", TableAccess::Metadata)]);
+    for (sql, access) in [
+        ("DESCRIBE target", TableAccess::Metadata),
+        ("CREATE INDEX idx ON target(id)", TableAccess::CreateIndex),
+    ] {
+        let context = AccessContext::with_access(&[("target", access)]);
         context.plan(sql).unwrap();
-        assert_eq!(
-            *context.requests.borrow(),
-            vec![("target".into(), TableAccess::Metadata)]
-        );
+        assert_eq!(*context.requests.borrow(), vec![("target".into(), access)]);
         let context = AccessContext::with_access(&[("target", TableAccess::Read)]);
         assert!(
             context
                 .plan(sql)
                 .unwrap_err()
                 .to_string()
-                .contains("access denied: target Metadata")
+                .contains(&format!("access denied: target {access:?}"))
         );
         assert_eq!(
             context.tables["target"].schema_calls.load(Ordering::SeqCst),
+            0
+        );
+    }
+}
+
+#[test]
+fn ddl_checks_the_command_even_when_the_target_is_absent() {
+    for (sql, access) in [
+        (
+            "CREATE TABLE absent(id BIGINT)",
+            TableAccess::CreateTable { or_replace: false },
+        ),
+        (
+            "CREATE OR REPLACE TABLE absent AS SELECT 1 AS id",
+            TableAccess::CreateTable { or_replace: true },
+        ),
+        (
+            "CREATE VIEW absent AS SELECT 1 AS id",
+            TableAccess::CreateView { or_replace: false },
+        ),
+        (
+            "CREATE OR REPLACE VIEW absent AS SELECT 1 AS id",
+            TableAccess::CreateView { or_replace: true },
+        ),
+        (
+            "CREATE EXTERNAL TABLE absent STORED AS CSV LOCATION 'missing.csv'",
+            TableAccess::CreateTable { or_replace: false },
+        ),
+        (
+            "SELECT 1 AS id INTO absent",
+            TableAccess::CreateTable { or_replace: false },
+        ),
+        ("DROP TABLE IF EXISTS absent", TableAccess::DropTable),
+        ("DROP VIEW IF EXISTS absent", TableAccess::DropView),
+    ] {
+        let context = AccessContext::with_access(&[("absent", access)]);
+        context.plan(sql).unwrap();
+        assert_eq!(
+            *context.requests.borrow(),
+            vec![("absent".into(), access)],
+            "{sql}"
+        );
+        let denied = AccessContext::with_access(&[("absent", TableAccess::Metadata)]);
+        assert!(
+            denied
+                .plan(sql)
+                .unwrap_err()
+                .to_string()
+                .contains("access denied"),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn ddl_sources_still_require_read() {
+    for (sql, access) in [
+        (
+            "CREATE TABLE absent AS SELECT * FROM source",
+            TableAccess::CreateTable { or_replace: false },
+        ),
+        (
+            "CREATE VIEW absent AS SELECT * FROM source",
+            TableAccess::CreateView { or_replace: false },
+        ),
+        (
+            "SELECT * INTO absent FROM source",
+            TableAccess::CreateTable { or_replace: false },
+        ),
+    ] {
+        let context = AccessContext::with_access(&[("absent", access)]);
+        assert!(
+            context
+                .plan(sql)
+                .unwrap_err()
+                .to_string()
+                .contains("access denied: source Read")
+        );
+        assert_eq!(
+            context.tables["source"].schema_calls.load(Ordering::SeqCst),
             0
         );
     }

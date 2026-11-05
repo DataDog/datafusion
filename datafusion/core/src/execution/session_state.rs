@@ -580,11 +580,14 @@ impl SessionState {
             let resolved = self.resolve_table_ref(reference);
             if let Entry::Vacant(v) = provider.tables.entry((resolved, access)) {
                 let (resolved, access) = v.key();
-                if let Ok(schema) = self.schema_for_ref(resolved.clone())
-                    && let Some(table) = schema.table(&resolved.table, *access).await?
-                {
-                    v.insert(provider_as_source(table));
-                }
+                let table = match self.schema_for_ref(resolved.clone()) {
+                    Ok(schema) => schema
+                        .table(&resolved.table, *access)
+                        .await?
+                        .map(provider_as_source),
+                    Err(_) => None,
+                };
+                v.insert(table);
             }
         }
 
@@ -1978,7 +1981,7 @@ impl From<SessionState> for SessionStateBuilder {
 #[cfg(feature = "sql")]
 struct SessionContextProvider<'a> {
     state: &'a SessionState,
-    tables: HashMap<(ResolvedTableReference, TableAccess), Arc<dyn TableSource>>,
+    tables: HashMap<(ResolvedTableReference, TableAccess), Option<Arc<dyn TableSource>>>,
 }
 
 #[cfg(feature = "sql")]
@@ -2003,12 +2006,16 @@ impl ContextProvider for SessionContextProvider<'_> {
         &self,
         name: TableReference,
         access: TableAccess,
-    ) -> datafusion_common::Result<Arc<dyn TableSource>> {
+    ) -> datafusion_common::Result<Option<Arc<dyn TableSource>>> {
         let name = self.state.resolve_table_ref(name);
         self.tables
             .get(&(name.clone(), access))
             .cloned()
-            .ok_or_else(|| plan_datafusion_err!("table '{name}' not found"))
+            .ok_or_else(|| {
+                plan_datafusion_err!(
+                    "table '{name}' was not resolved for operation {access:?}"
+                )
+            })
     }
 
     fn get_table_function_source(
@@ -2717,13 +2724,13 @@ mod tests {
             &self,
             name: TableReference,
             _access: TableAccess,
-        ) -> Result<Arc<dyn TableSource>> {
+        ) -> Result<Option<Arc<dyn TableSource>>> {
             let resolved_table_ref = ResolvedTableReference {
                 catalog: "default".to_string().into(),
                 schema: "public".to_string().into(),
                 table: name.table().to_string().into(),
             };
-            let source = self.tables.get(&resolved_table_ref).cloned().unwrap();
+            let source = self.tables.get(&resolved_table_ref).cloned();
             Ok(source)
         }
 

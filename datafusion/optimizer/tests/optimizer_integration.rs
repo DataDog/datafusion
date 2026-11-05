@@ -23,9 +23,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::{
-    DFSchemaRef, Result, ScalarValue, TableReference, ToDFSchema, plan_err,
-};
+use datafusion_common::{DFSchemaRef, Result, ScalarValue, TableReference, ToDFSchema};
 use datafusion_expr::expr::Cast;
 use datafusion_expr::logical_plan::builder::LogicalPlanBuilder;
 use datafusion_expr::planner::ExprPlanner;
@@ -837,12 +835,12 @@ impl ContextProvider for MyContextProvider {
         &self,
         name: TableReference,
         _access: TableAccess,
-    ) -> Result<Arc<dyn TableSource>> {
+    ) -> Result<Option<Arc<dyn TableSource>>> {
         let table_name = name.table();
         if let Some(table) = self.tables.get(table_name) {
-            Ok(table.clone())
+            Ok(Some(table.clone()))
         } else {
-            plan_err!("table does not exist")
+            Ok(None)
         }
     }
 

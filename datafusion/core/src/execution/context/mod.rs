@@ -23,7 +23,6 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use super::options::ReadOptions;
-use crate::datasource::dynamic_file::DynamicListTableFactory;
 use crate::execution::session_state::SessionStateBuilder;
 use crate::{
     catalog::listing_schema::ListingSchemaProvider,
@@ -61,9 +60,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_catalog::MemoryCatalogProvider;
 use datafusion_catalog::memory::MemorySchemaProvider;
-use datafusion_catalog::{
-    DynamicFileCatalog, TableFunction, TableFunctionImpl, UrlTableFactory,
-};
+use datafusion_catalog::{TableFunction, TableFunctionImpl};
 use datafusion_catalog_listing::SchemaSource;
 use datafusion_common::config::{ConfigField, ConfigOptions};
 use datafusion_common::metadata::ScalarAndMetadata;
@@ -99,7 +96,6 @@ use datafusion_optimizer::analyzer::type_coercion::TypeCoercion;
 use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_optimizer::{Analyzer, OptimizerContext};
 use datafusion_optimizer::{AnalyzerRule, OptimizerRule};
-use datafusion_session::SessionStore;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -372,69 +368,9 @@ impl SessionContext {
         }
     }
 
-    /// Enable querying local files as tables.
-    ///
-    /// This feature is security sensitive and should only be enabled for
-    /// systems that wish to permit direct access to the file system from SQL.
-    ///
-    /// When enabled, this feature permits direct access to arbitrary files via
-    /// SQL like
-    ///
-    /// ```sql
-    /// SELECT * from 'my_file.parquet'
-    /// ```
-    ///
-    /// See [DynamicFileCatalog] for more details
-    ///
-    /// ```
-    /// # use datafusion::prelude::*;
-    /// # use datafusion::{error::Result, assert_batches_eq};
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let ctx = SessionContext::new()
-    ///   .enable_url_table(); // permit local file access
-    /// let results = ctx
-    ///   .sql("SELECT a, MIN(b) FROM 'tests/data/example.csv' as example GROUP BY a LIMIT 100")
-    ///   .await?
-    ///   .collect()
-    ///   .await?;
-    /// assert_batches_eq!(
-    ///  &[
-    ///    "+---+----------------+",
-    ///    "| a | min(example.b) |",
-    ///    "+---+----------------+",
-    ///    "| 1 | 2              |",
-    ///    "+---+----------------+",
-    ///  ],
-    ///  &results
-    /// );
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn enable_url_table(self) -> Self {
-        let current_catalog_list = Arc::clone(self.state.read().catalog_list());
-        let factory = Arc::new(DynamicListTableFactory::new(SessionStore::new()));
-        let catalog_list = Arc::new(DynamicFileCatalog::new(
-            current_catalog_list,
-            Arc::clone(&factory) as Arc<dyn UrlTableFactory>,
-        ));
-
-        let session_id = self.session_id.clone();
-        let ctx: SessionContext = self
-            .into_state_builder()
-            .with_session_id(session_id)
-            .with_catalog_list(catalog_list)
-            .build()
-            .into();
-        // register new state with the factory
-        factory.session_store().with_state(ctx.state_weak_ref());
-        ctx
-    }
-
     /// Convert the current `SessionContext` into a [`SessionStateBuilder`]
     ///
-    /// This is useful to switch back to `SessionState` with custom settings such as
-    /// [`Self::enable_url_table`].
+    /// This is useful to switch back to `SessionState` with custom settings.
     ///
     /// Avoids cloning the SessionState if possible.
     ///
@@ -450,8 +386,8 @@ impl SessionContext {
     ///     .with_optimizer_rule(Arc::new(my_rule))
     ///     .build()
     ///     .into();
-    /// // Enable local file access and convert context back to a builder
-    /// let builder = context.enable_url_table().into_state_builder();
+    /// // Convert context back to a builder
+    /// let builder = context.into_state_builder();
     /// ```
     pub fn into_state_builder(self) -> SessionStateBuilder {
         let SessionContext {
@@ -815,7 +751,12 @@ impl SessionContext {
     ) -> Result<DataFrame> {
         let schema = self.state.read().schema_for_ref(cmd.name.clone())?;
         let exist = schema
-            .table(cmd.name.table(), TableAccess::Metadata)
+            .table(
+                cmd.name.table(),
+                TableAccess::CreateTable {
+                    or_replace: cmd.or_replace,
+                },
+            )
             .await?
             .is_some();
 
@@ -827,7 +768,13 @@ impl SessionContext {
             (true, false, true) => self.return_empty_dataframe(),
             (false, true, true) => {
                 let result = self
-                    .find_and_deregister(cmd.name.clone(), TableType::Base)
+                    .find_and_deregister(
+                        cmd.name.clone(),
+                        TableType::Base,
+                        TableAccess::CreateTable {
+                            or_replace: cmd.or_replace,
+                        },
+                    )
                     .await;
 
                 match result {
@@ -883,7 +830,7 @@ impl SessionContext {
 
         let schema_provider = self.state.read().schema_for_ref(name.clone())?;
         let table = schema_provider
-            .table(name.table(), TableAccess::Metadata)
+            .table(name.table(), TableAccess::CreateTable { or_replace })
             .await?;
         match (if_not_exists, or_replace, table) {
             (true, false, Some(_)) => self.return_empty_dataframe(),
@@ -948,7 +895,7 @@ impl SessionContext {
 
         let schema_provider = self.state.read().schema_for_ref(name.clone())?;
         let view = schema_provider
-            .table(name.table(), TableAccess::Metadata)
+            .table(name.table(), TableAccess::CreateView { or_replace })
             .await?;
 
         if temporary {
@@ -1058,7 +1005,7 @@ impl SessionContext {
             name, if_exists, ..
         } = cmd;
         let result = self
-            .find_and_deregister(name.clone(), TableType::Base)
+            .find_and_deregister(name.clone(), TableType::Base, TableAccess::DropTable)
             .await?;
         match (result, if_exists) {
             (true, _) => self.return_empty_dataframe(),
@@ -1072,7 +1019,7 @@ impl SessionContext {
             name, if_exists, ..
         } = cmd;
         let result = self
-            .find_and_deregister(name.clone(), TableType::View)
+            .find_and_deregister(name.clone(), TableType::View, TableAccess::DropView)
             .await?;
         match (result, if_exists) {
             (true, _) => self.return_empty_dataframe(),
@@ -1460,6 +1407,7 @@ impl SessionContext {
         &self,
         table_ref: impl Into<TableReference>,
         table_type: TableType,
+        access: TableAccess,
     ) -> Result<bool> {
         let table_ref = table_ref.into();
         let table = table_ref.table().to_owned();
@@ -1473,8 +1421,7 @@ impl SessionContext {
         };
 
         if let Some(schema) = maybe_schema
-            && let Some(table_provider) =
-                schema.table(&table, TableAccess::Metadata).await?
+            && let Some(table_provider) = schema.table(&table, access).await?
             && table_provider.table_type() == table_type
         {
             schema.deregister_table(&table)?;
@@ -2558,39 +2505,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dynamic_file_query() -> Result<()> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let path = path.join("tests/tpch-csv/customer.csv");
-        let url = format!("file://{}", path.display());
-        let cfg = SessionConfig::new();
-        let session_state = SessionStateBuilder::new()
-            .with_default_features()
-            .with_config(cfg)
-            .build();
-        let ctx = SessionContext::new_with_state(session_state).enable_url_table();
-        let result = plan_and_collect(
-            &ctx,
-            format!("select c_name from '{url}' limit 3;").as_str(),
-        )
-        .await?;
-
-        let actual = arrow::util::pretty::pretty_format_batches(&result)
-            .unwrap()
-            .to_string();
-        assert_snapshot!(actual, @r"
-        +--------------------+
-        | c_name             |
-        +--------------------+
-        | Customer#000000002 |
-        | Customer#000000003 |
-        | Customer#000000004 |
-        +--------------------+
-        ");
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn custom_query_planner() -> Result<()> {
         let runtime = Arc::new(RuntimeEnv::default());
         let session_state = SessionStateBuilder::new()
@@ -2829,17 +2743,6 @@ mod tests {
         "#);
         Ok(())
     }
-    #[test]
-    fn preserve_session_context_id() -> Result<()> {
-        let ctx = SessionContext::new();
-        // it does make sense to preserve session id in this case
-        // as  `enable_url_table()` can be seen as additional configuration
-        // option on ctx.
-        // some systems like datafusion ballista relies on stable session_id
-        assert_eq!(ctx.session_id(), ctx.enable_url_table().session_id());
-        Ok(())
-    }
-
     struct MyPhysicalPlanner {}
 
     #[async_trait]

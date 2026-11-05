@@ -119,7 +119,7 @@ impl Visitor for RelationVisitor {
         if let SetExpr::Select(select) = q.body.as_ref()
             && let Some(into) = &select.into
         {
-            self.mark_target(&into.name, TableAccess::Metadata);
+            self.mark_target(&into.name, TableAccess::CreateTable { or_replace: false });
             self.insert_relation(&into.name)?;
         }
         if let Some(with) = &q.with {
@@ -213,28 +213,41 @@ impl Visitor for RelationVisitor {
                 }
             }
             Statement::CreateIndex(index) => {
-                self.mark_target(&index.table_name, TableAccess::Metadata);
+                self.mark_target(&index.table_name, TableAccess::CreateIndex);
                 self.insert_relation(&index.table_name)?;
             }
             Statement::CreateTable(table) => {
-                self.mark_target(&table.name, TableAccess::Metadata);
+                self.mark_target(
+                    &table.name,
+                    TableAccess::CreateTable {
+                        or_replace: table.or_replace,
+                    },
+                );
                 self.insert_relation(&table.name)?;
             }
             Statement::CreateView(view) => {
-                self.mark_target(&view.name, TableAccess::Metadata);
+                self.mark_target(
+                    &view.name,
+                    TableAccess::CreateView {
+                        or_replace: view.or_replace,
+                    },
+                );
                 self.insert_relation(&view.name)?;
             }
-            Statement::AlterTable(table) => {
-                self.mark_target(&table.name, TableAccess::Metadata);
-                self.insert_relation(&table.name)?;
-            }
             Statement::Drop {
-                object_type: ObjectType::Table | ObjectType::View,
+                object_type: object_type @ (ObjectType::Table | ObjectType::View),
                 names,
                 ..
             } => {
                 for name in names {
-                    self.mark_target(name, TableAccess::Metadata);
+                    self.mark_target(
+                        name,
+                        if *object_type == ObjectType::Table {
+                            TableAccess::DropTable
+                        } else {
+                            TableAccess::DropView
+                        },
+                    );
                     self.insert_relation(name)?;
                 }
             }
@@ -313,7 +326,12 @@ fn visit_statement(statement: &DFStatement, visitor: &mut RelationVisitor) -> Re
             control_flow_to_result(s.as_ref().visit(visitor))?;
         }
         DFStatement::CreateExternalTable(table) => {
-            visitor.mark_target(&table.name, TableAccess::Metadata);
+            visitor.mark_target(
+                &table.name,
+                TableAccess::CreateTable {
+                    or_replace: table.or_replace,
+                },
+            );
             control_flow_to_result(visitor.insert_relation(&table.name))?;
         }
         DFStatement::CopyTo(CopyToStatement { source, .. }) => match source {
@@ -388,7 +406,7 @@ pub type TableReferencesWithAccess = Vec<(TableReference, TableAccess)>;
 /// Write targets use their specific operation, while query sources use [`TableAccess::Read`].
 /// A table used as both a target and a source appears once for each distinct operation.
 /// CTE aliases are excluded from table references and returned separately. Metadata and
-/// DDL target lookups use [`TableAccess::Metadata`]; this does not authorize the DDL command.
+/// DDL target lookups carry their own operation; they do not imply a separate read grant.
 ///
 /// Prefetch caches must retain the access alongside the table reference so that a provider
 /// authorized for one operation cannot satisfy a lookup for another operation.
@@ -503,21 +521,30 @@ mod tests {
     #[test]
     fn metadata_and_ddl_targets_are_distinct_from_query_sources() {
         use crate::parser::DFParser;
-        for sql in [
-            "DESCRIBE target",
-            "SHOW COLUMNS FROM target",
-            "SHOW CREATE TABLE target",
-            "CREATE INDEX idx ON target(id)",
-            "CREATE TABLE target AS SELECT * FROM source",
-            "CREATE VIEW target AS SELECT * FROM source",
-            "SELECT * INTO target FROM source",
-            "DROP TABLE target",
+        for (sql, access) in [
+            ("DESCRIBE target", TableAccess::Metadata),
+            ("SHOW COLUMNS FROM target", TableAccess::Metadata),
+            ("SHOW CREATE TABLE target", TableAccess::Metadata),
+            ("CREATE INDEX idx ON target(id)", TableAccess::CreateIndex),
+            (
+                "CREATE TABLE target AS SELECT * FROM source",
+                TableAccess::CreateTable { or_replace: false },
+            ),
+            (
+                "CREATE VIEW target AS SELECT * FROM source",
+                TableAccess::CreateView { or_replace: false },
+            ),
+            (
+                "SELECT * INTO target FROM source",
+                TableAccess::CreateTable { or_replace: false },
+            ),
+            ("DROP TABLE target", TableAccess::DropTable),
         ] {
             let statement = DFParser::parse_sql(sql).unwrap().pop_back().unwrap();
             let (tables, _) =
                 resolve_table_references_with_access(&statement, true).unwrap();
             assert!(
-                tables.contains(&(TableReference::bare("target"), TableAccess::Metadata)),
+                tables.contains(&(TableReference::bare("target"), access)),
                 "{sql}: {tables:?}"
             );
             assert!(

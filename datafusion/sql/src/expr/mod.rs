@@ -1483,10 +1483,10 @@ mod tests {
             &self,
             name: TableReference,
             _access: TableAccess,
-        ) -> Result<Arc<dyn TableSource>> {
+        ) -> Result<Option<Arc<dyn TableSource>>> {
             match self.tables.get(name.table()) {
-                Some(table) => Ok(Arc::clone(table)),
-                _ => plan_err!("Table not found: {}", name.table()),
+                Some(table) => Ok(Some(Arc::clone(table))),
+                _ => Ok(None),
             }
         }
 

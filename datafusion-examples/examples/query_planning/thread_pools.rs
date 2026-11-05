@@ -69,27 +69,27 @@ use url::Url;
 /// CPU bound tasks will often be simpler in larger applications, even though it
 /// makes this example slightly more complex.
 pub async fn thread_pools() -> Result<()> {
-    // The first two examples read local files. Enabling the URL table feature
-    // lets us treat filenames as tables in SQL.
-    let ctx = SessionContext::new().enable_url_table();
+    let ctx = SessionContext::new();
 
     // Convert the CSV input into a temporary Parquet directory for querying
     let dataset = ExampleDataset::Cars;
     let parquet_temp = write_csv_to_parquet(&ctx, &dataset.path()).await?;
 
-    let sql = format!("SELECT * FROM '{}'", parquet_temp.path_str()?);
+    ctx.register_parquet("cars", parquet_temp.path_str()?, Default::default())
+        .await?;
+    let sql = "SELECT * FROM cars";
 
     // Run a query on the current runtime. Calling `await` means the future
     // (in this case the `async` function and all spawned work in DataFusion
     // plans) on the current runtime.
-    same_runtime(&ctx, &sql).await?;
+    same_runtime(&ctx, sql).await?;
 
     // Run the same query but this time on a different runtime.
     //
     // Since we call `await` here, the `async` function itself runs on the
     // current runtime, but internally `different_runtime_basic` executes the
     // DataFusion plan on a different Runtime.
-    different_runtime_basic(ctx, sql).await?;
+    different_runtime_basic(ctx, sql.to_owned()).await?;
 
     // Run the same query on a different runtime, including remote IO.
     //

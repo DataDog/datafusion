@@ -324,25 +324,31 @@ before returning a provider or exposing its schema.
 
 `TableAccess` describes DataFusion operations; applications map them to privileges:
 
-| Table occurrence                                                     | Access                             |
-| -------------------------------------------------------------------- | ---------------------------------- |
-| Query source, including a subquery within a write                    | `Read`                             |
-| `DESCRIBE table`, `SHOW COLUMNS`, `SHOW CREATE`, DDL target metadata | `Metadata`                         |
-| `INSERT INTO` destination                                            | `Insert(InsertOp::Append)`         |
-| `INSERT OVERWRITE` destination                                       | `Insert(InsertOp::Overwrite)`      |
-| `REPLACE INTO` or `INSERT OR REPLACE` destination                    | `Insert(InsertOp::Replace)`        |
-| `UPDATE` destination                                                 | `Update`                           |
-| `DELETE` destination                                                 | `Delete`                           |
-| `TRUNCATE` destination                                               | `Truncate`                         |
-| `MERGE INTO` destination                                             | `Merge { insert, update, delete }` |
+| Table occurrence                                     | Access                             |
+| ---------------------------------------------------- | ---------------------------------- |
+| Query source, including a subquery within a write    | `Read`                             |
+| `DESCRIBE table`, `SHOW COLUMNS`, `SHOW CREATE`      | `Metadata`                         |
+| `CREATE TABLE`, external table, `SELECT INTO` target | `CreateTable { or_replace }`       |
+| `CREATE VIEW` target                                 | `CreateView { or_replace }`        |
+| `DROP TABLE` / `DROP VIEW` target                    | `DropTable` / `DropView`           |
+| `CREATE INDEX` target table                          | `CreateIndex`                      |
+| `INSERT INTO` destination                            | `Insert(InsertOp::Append)`         |
+| `INSERT OVERWRITE` destination                       | `Insert(InsertOp::Overwrite)`      |
+| `REPLACE INTO` or `INSERT OR REPLACE` destination    | `Insert(InsertOp::Replace)`        |
+| `UPDATE` destination                                 | `Update`                           |
+| `DELETE` destination                                 | `Delete`                           |
+| `TRUNCATE` destination                               | `Truncate`                         |
+| `MERGE INTO` destination                             | `Merge { insert, update, delete }` |
 
 Merge flags include every action present in the statement, regardless of which
 clauses will execute. Update, delete, and merge operations can inspect target
 rows without a separate target `Read` lookup. Applications must map these intents
 to all required privileges. Column-level permissions and row filtering require
 additional checks. Explicit sources and subqueries always request `Read`.
-`Metadata` allows inspection only; it does not authorize creation, replacement,
-deletion, or alteration of catalog objects. A `DESCRIBE` of a query plans that
+Each operation includes the metadata needed to plan it. For example, `DropTable`
+does not require an additional `Metadata` grant, and replacement does not cause a
+separate `DropTable` check. Applications decide whether their policy requires
+multiple privileges for one intent. `Metadata` itself only authorizes inspection. A `DESCRIBE` of a query plans that
 query normally and retains its read checks.
 
 ### Explicit intent at every lookup
@@ -354,6 +360,11 @@ or default intent. Existing implementations and callers must migrate.
 Forwarding wrappers must pass access unchanged to their inner provider. Catalogs
 that do not enforce authorization can explicitly ignore the parameter.
 Authorizing implementations should reject unknown intent variants.
+
+All three trait methods return `Result<Option<...>>`: `Some` is an authorized
+existing object, `None` is an authorized absent name, and `Err` includes denial.
+Check creation intent before returning `None`, including `IF NOT EXISTS`.
+Direct `SqlToRel` callers receive the same DDL checks as built-in session planning.
 
 Caller identity, query context, stable object identities, and the mapping from
 operations to privileges stay in the application.
@@ -377,8 +388,8 @@ helpers. They are optional for catalogs that check policy on each live lookup.
 
 These helpers build snapshots scoped to one caller and query. Every cache entry
 retains its authorized operation. `resolve` requires `(TableReference, TableAccess)`
-pairs; there is no name-only resolution path. Requesting a known table for an
-unresolved operation returns an error. Sharing the cache across identities or retaining it
+pairs; there is no name-only resolution path. Authorized absence is cached too.
+Requesting any name/operation pair not resolved in advance returns an error. Sharing the cache across identities or retaining it
 after permission changes can reuse stale authorization. Name and operation keys
 do not encode caller identity or policy versions.
 
@@ -392,17 +403,22 @@ authorize them live; `resolve` is not a metadata-enumeration API.
 
 ### Integration boundaries
 
-- Return an error for denied access. `Ok(None)` means missing and may trigger
-  dynamic-file or object-store fallback. Those factories do not receive access
-  intent; restrict or authorize them separately.
+- Return an error for denied access. `Ok(None)` means an authorized missing object.
+  Catalog lookup has no implicit file or object-store fallback. `enable_url_table`
+  and dynamic catalog wrappers are removed. Register files explicitly, use
+  `CREATE EXTERNAL TABLE`, or use the DataFrame file-reading APIs. Those explicit
+  APIs and file/table functions still require application policy for locations.
 - Information-schema column and view traversal, and the default `table_type`,
   request `Metadata`. Table/schema names, existence checks, custom `table_type`
   overrides, and other enumeration APIs still need their own visibility policy.
   Metadata denial can fail an enumeration; catalogs should expose only names
   visible to the caller where appropriate.
-- DDL lookup uses `Metadata`, but catalog registration/deregistration and other
-  command execution need independent authorization. Create/replace operations
-  propagate lookup errors rather than treating them as missing objects.
+- Table DDL requests its actual operation during planning; built-in create/drop
+  execution checks it again. Registration/deregistration APIs, schema/catalog
+  commands, and custom DDL execution still need their own checks. Keep mutation
+  authorization atomic with the mutation where necessary: a successful lookup is
+  not a capability, and objects or policy can change between lookup and execution.
+  `CreateIndex` is planned but its execution is application-owned.
 - The current FFI schema-provider ABI cannot carry intent. A foreign adapter
   supports `Read` and rejects other intents; it does not downgrade them to reads.
   A same-library round trip retains the original provider and its access handling.
