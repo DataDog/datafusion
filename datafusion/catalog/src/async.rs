@@ -760,6 +760,7 @@ mod tests {
             expected_lookup_count: u32,
             found_tables: &[&str],
             not_found_tables: &[&str],
+            unresolved_tables: &[&str],
         ) {
             let refs = refs
                 .into_iter()
@@ -784,6 +785,14 @@ mod tests {
                 assert!(table.is_some());
             }
 
+            for table_ref in unresolved_tables {
+                assert!(
+                    cached_provider
+                        .table(table_ref, TableAccess::Read)
+                        .await
+                        .is_err()
+                );
+            }
             for table_ref in not_found_tables {
                 assert!(
                     cached_provider
@@ -804,6 +813,7 @@ mod tests {
             2,
             &[MOCK_TABLE],
             &["not_exists"],
+            &[],
         )
         .await;
 
@@ -814,6 +824,7 @@ mod tests {
                 TableReference::full("foo", MOCK_SCHEMA, MOCK_TABLE),
             ],
             0,
+            &[],
             &[],
             &[MOCK_TABLE],
         )
@@ -830,6 +841,7 @@ mod tests {
             2,
             &[MOCK_TABLE],
             &["not_exists"],
+            &[],
         )
         .await;
     }
