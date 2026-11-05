@@ -815,7 +815,7 @@ impl SessionContext {
     ) -> Result<DataFrame> {
         let schema = self.state.read().schema_for_ref(cmd.name.clone())?;
         let exist = schema
-            .table_with_access(cmd.name.table(), TableAccess::Metadata)
+            .table(cmd.name.table(), TableAccess::Metadata)
             .await?
             .is_some();
 
@@ -883,7 +883,7 @@ impl SessionContext {
 
         let schema_provider = self.state.read().schema_for_ref(name.clone())?;
         let table = schema_provider
-            .table_with_access(name.table(), TableAccess::Metadata)
+            .table(name.table(), TableAccess::Metadata)
             .await?;
         match (if_not_exists, or_replace, table) {
             (true, false, Some(_)) => self.return_empty_dataframe(),
@@ -948,7 +948,7 @@ impl SessionContext {
 
         let schema_provider = self.state.read().schema_for_ref(name.clone())?;
         let view = schema_provider
-            .table_with_access(name.table(), TableAccess::Metadata)
+            .table(name.table(), TableAccess::Metadata)
             .await?;
 
         if temporary {
@@ -1473,9 +1473,8 @@ impl SessionContext {
         };
 
         if let Some(schema) = maybe_schema
-            && let Some(table_provider) = schema
-                .table_with_access(&table, TableAccess::Metadata)
-                .await?
+            && let Some(table_provider) =
+                schema.table(&table, TableAccess::Metadata).await?
             && table_provider.table_type() == table_type
         {
             schema.deregister_table(&table)?;
@@ -2008,7 +2007,9 @@ impl SessionContext {
     /// [`register_table`]: SessionContext::register_table
     pub async fn table(&self, table_ref: impl Into<TableReference>) -> Result<DataFrame> {
         let table_ref: TableReference = table_ref.into();
-        let provider = self.table_provider(table_ref.clone()).await?;
+        let provider = self
+            .table_provider(table_ref.clone(), TableAccess::Read)
+            .await?;
         let plan = LogicalPlanBuilder::scan(
             table_ref,
             provider_as_source(Arc::clone(&provider)),
@@ -2032,23 +2033,12 @@ impl SessionContext {
             .ok_or_else(|| plan_datafusion_err!("Table function '{name}' not found"))
     }
 
-    /// Return a [`TableProvider`] for reading the specified table.
-    ///
-    /// Use [`Self::table_provider_with_access`] to request another operation.
-    pub async fn table_provider(
-        &self,
-        table_ref: impl Into<TableReference>,
-    ) -> Result<Arc<dyn TableProvider>> {
-        self.table_provider_with_access(table_ref, TableAccess::Read)
-            .await
-    }
-
     /// Return a [`TableProvider`] for the specified table and operation.
     ///
     /// The schema provider may use `access` to authorize resolution before the
     /// returned provider's schema is used. This does not authorize other
     /// operations performed on the returned provider.
-    pub async fn table_provider_with_access(
+    pub async fn table_provider(
         &self,
         table_ref: impl Into<TableReference>,
         access: TableAccess,
@@ -2056,7 +2046,7 @@ impl SessionContext {
         let table_ref = table_ref.into();
         let table = table_ref.table().to_string();
         let schema = self.state.read().schema_for_ref(table_ref)?;
-        match schema.table_with_access(&table, access).await? {
+        match schema.table(&table, access).await? {
             Some(ref provider) => Ok(Arc::clone(provider)),
             _ => plan_err!("No table named '{table}'"),
         }

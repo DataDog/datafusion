@@ -204,10 +204,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             None => {
                                 let provider = self
                                     .context_provider
-                                    .get_table_source_with_access(
-                                        table_ref.clone(),
-                                        access,
-                                    )
+                                    .get_table_source(table_ref.clone(), access)
                                     .map_err(|e| {
                                         e.with_diagnostic(Diagnostic::new_error(
                                             format!("table '{table_ref}' not found"),

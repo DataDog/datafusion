@@ -93,12 +93,12 @@ impl SchemaProvider for FixedSchemaProvider {
         self.inner.table_names()
     }
 
-    async fn table_with_access(
+    async fn table(
         &self,
         name: &str,
         access: TableAccess,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.inner.table_with_access(name, access).await
+        self.inner.table(name, access).await
     }
 
     fn table_exist(&self, name: &str) -> bool {

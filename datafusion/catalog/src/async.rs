@@ -64,7 +64,7 @@ impl SchemaProvider for ResolvedSchemaProvider {
             .collect()
     }
 
-    async fn table_with_access(
+    async fn table(
         &self,
         name: &str,
         access: TableAccess,
@@ -123,10 +123,7 @@ impl ResolvedSchemaProviderBuilder {
     ) -> Result<()> {
         let key = (table_name.to_string(), access);
         if !self.cached_tables.contains_key(&key) {
-            let resolved_table = self
-                .async_provider
-                .table_with_access(table_name, access)
-                .await?;
+            let resolved_table = self.async_provider.table(table_name, access).await?;
             self.cached_tables.insert(key, resolved_table);
         }
         Ok(())
@@ -224,68 +221,59 @@ impl CatalogProviderList for ResolvedCatalogProviderList {
 /// [remote_catalog.rs]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/data_io/remote_catalog.rs
 #[async_trait]
 pub trait AsyncSchemaProvider: Send + Sync {
-    /// Resolves a table for a row read. Legacy callers require read access.
-    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.table_with_access(name, TableAccess::Read).await
-    }
-
     /// Resolve a table for an operation before its schema is used.
     /// Implementations must handle access explicitly; wrappers must forward it.
-    async fn table_with_access(
+    async fn table(
         &self,
         name: &str,
         access: TableAccess,
     ) -> Result<Option<Arc<dyn TableProvider>>>;
 
-    /// Creates a cached provider that can be used to execute a query containing given references
-    ///
-    /// This method will walk through the references and look them up once, creating a cache of table
-    /// providers.  This cache will be returned as a synchronous TableProvider that can be used to plan
-    /// and execute a query containing the given references.
-    ///
-    /// This convenience method resolves only row reads; its cache rejects writes. Use
-    /// [`Self::resolve_with_access`] to resolve other operations.
-    ///
-    /// This cache is intended to be short-lived for the execution of a single query.  There is no mechanism
-    /// for refresh or eviction of stale entries.
-    ///
-    /// See the [`AsyncSchemaProvider`] documentation for additional details
-    async fn resolve(
-        &self,
-        references: &[TableReference],
-        config: &SessionConfig,
-        catalog_name: &str,
-        schema_name: &str,
-    ) -> Result<Arc<dyn SchemaProvider>> {
-        resolve_schema(
-            self,
-            TableReferences::Legacy(references),
-            config,
-            catalog_name,
-            schema_name,
-        )
-        .await
-    }
-
     /// Resolve tables for the requested operations, retaining each operation in the cache.
     ///
     /// A lookup for a cached table with an unresolved operation returns an error.
-    /// Legacy table lookup on this cache requests [`TableAccess::Read`].
-    async fn resolve_with_access(
+    /// The snapshot is scoped to one caller and query; it does not refresh authorization.
+    async fn resolve(
         &self,
         references: &[(TableReference, TableAccess)],
         config: &SessionConfig,
         catalog_name: &str,
         schema_name: &str,
     ) -> Result<Arc<dyn SchemaProvider>> {
-        resolve_schema(
-            self,
-            TableReferences::WithAccess(references),
-            config,
-            catalog_name,
-            schema_name,
-        )
-        .await
+        let mut cached_tables =
+            HashMap::<(String, TableAccess), Option<Arc<dyn TableProvider>>>::new();
+
+        for (reference, access) in references {
+            let ref_catalog_name = reference
+                .catalog()
+                .unwrap_or(&config.options().catalog.default_catalog);
+
+            // Maybe this is a reference to some other catalog provided in another way
+            if ref_catalog_name != catalog_name {
+                continue;
+            }
+
+            let ref_schema_name = reference
+                .schema()
+                .unwrap_or(&config.options().catalog.default_schema);
+
+            if ref_schema_name != schema_name {
+                continue;
+            }
+
+            let key = (reference.table().to_string(), *access);
+            if !cached_tables.contains_key(&key) {
+                let resolved_table = self.table(reference.table(), *access).await?;
+                cached_tables.insert(key, resolved_table);
+            }
+        }
+
+        let cached_tables = ResolvedTableCache::new(cached_tables);
+
+        Ok(Arc::new(ResolvedSchemaProvider {
+            cached_tables,
+            owner_name: Some(catalog_name.to_string()),
+        }))
     }
 }
 
@@ -300,50 +288,61 @@ pub trait AsyncCatalogProvider: Send + Sync {
     /// Lookup a schema in the provider
     async fn schema(&self, name: &str) -> Result<Option<Arc<dyn AsyncSchemaProvider>>>;
 
-    /// Creates a cached provider that can be used to execute a query containing given references
-    ///
-    /// This method will walk through the references and look them up once, creating a cache of schema
-    /// providers (each with their own cache of table providers).  This cache will be returned as a
-    /// synchronous CatalogProvider that can be used to plan and execute a query containing the given
-    /// references.
-    ///
-    /// This convenience method resolves only row reads; its cache rejects writes. Use
-    /// [`Self::resolve_with_access`] to resolve other operations.
-    ///
-    /// This cache is intended to be short-lived for the execution of a single query.  There is no mechanism
-    /// for refresh or eviction of stale entries.
-    async fn resolve(
-        &self,
-        references: &[TableReference],
-        config: &SessionConfig,
-        catalog_name: &str,
-    ) -> Result<Arc<dyn CatalogProvider>> {
-        resolve_catalog(
-            self,
-            TableReferences::Legacy(references),
-            config,
-            catalog_name,
-        )
-        .await
-    }
-
     /// Resolve tables for the requested operations, retaining each operation in the cache.
     ///
     /// A lookup for a cached table with an unresolved operation returns an error.
-    /// Legacy table lookup on this cache requests [`TableAccess::Read`].
-    async fn resolve_with_access(
+    /// The snapshot is scoped to one caller and query; it does not refresh authorization.
+    async fn resolve(
         &self,
         references: &[(TableReference, TableAccess)],
         config: &SessionConfig,
         catalog_name: &str,
     ) -> Result<Arc<dyn CatalogProvider>> {
-        resolve_catalog(
-            self,
-            TableReferences::WithAccess(references),
-            config,
-            catalog_name,
-        )
-        .await
+        let mut cached_schemas =
+            HashMap::<String, Option<ResolvedSchemaProviderBuilder>>::new();
+
+        for (reference, access) in references {
+            let ref_catalog_name = reference
+                .catalog()
+                .unwrap_or(&config.options().catalog.default_catalog);
+
+            // Maybe this is a reference to some other catalog provided in another way
+            if ref_catalog_name != catalog_name {
+                continue;
+            }
+
+            let schema_name = reference
+                .schema()
+                .unwrap_or(&config.options().catalog.default_schema);
+
+            let schema = if let Some(schema) = cached_schemas.get_mut(schema_name) {
+                schema
+            } else {
+                let resolved_schema = self.schema(schema_name).await?;
+                let resolved_schema = resolved_schema.map(|resolved_schema| {
+                    ResolvedSchemaProviderBuilder::new(
+                        catalog_name.to_string(),
+                        resolved_schema,
+                    )
+                });
+                cached_schemas.insert(schema_name.to_string(), resolved_schema);
+                cached_schemas.get_mut(schema_name).unwrap()
+            };
+
+            // If we can't find the catalog don't bother checking the table
+            let Some(schema) = schema else { continue };
+
+            schema.resolve_table(reference.table(), *access).await?;
+        }
+
+        let cached_schemas = cached_schemas
+            .into_iter()
+            .filter_map(|(key, maybe_builder)| {
+                maybe_builder.map(|schema_builder| (key, schema_builder.finish()))
+            })
+            .collect::<HashMap<_, _>>();
+
+        Ok(Arc::new(ResolvedCatalogProvider { cached_schemas }))
     }
 }
 
@@ -357,226 +356,82 @@ pub trait AsyncCatalogProviderList: Send + Sync {
     /// Lookup a catalog in the provider
     async fn catalog(&self, name: &str) -> Result<Option<Arc<dyn AsyncCatalogProvider>>>;
 
-    /// Creates a cached provider that can be used to execute a query containing given references
-    ///
-    /// This method will walk through the references and look them up once, creating a cache of catalog
-    /// providers, schema providers, and table providers.  This cache will be returned as a
-    /// synchronous CatalogProvider that can be used to plan and execute a query containing the given
-    /// references.
-    ///
-    /// This convenience method resolves only row reads; its cache rejects writes. Use
-    /// [`Self::resolve_with_access`] to resolve other operations.
-    ///
-    /// This cache is intended to be short-lived for the execution of a single query.  There is no mechanism
-    /// for refresh or eviction of stale entries.
-    async fn resolve(
-        &self,
-        references: &[TableReference],
-        config: &SessionConfig,
-    ) -> Result<Arc<dyn CatalogProviderList>> {
-        resolve_catalog_list(self, TableReferences::Legacy(references), config).await
-    }
-
     /// Resolve tables for the requested operations, retaining each operation in the cache.
     ///
     /// A lookup for a cached table with an unresolved operation returns an error.
-    /// Legacy table lookup on this cache requests [`TableAccess::Read`].
-    async fn resolve_with_access(
+    /// The snapshot is scoped to one caller and query; it does not refresh authorization.
+    async fn resolve(
         &self,
         references: &[(TableReference, TableAccess)],
         config: &SessionConfig,
     ) -> Result<Arc<dyn CatalogProviderList>> {
-        resolve_catalog_list(self, TableReferences::WithAccess(references), config).await
-    }
-}
+        let mut cached_catalogs =
+            HashMap::<String, Option<ResolvedCatalogProviderBuilder>>::new();
 
-enum TableReferences<'a> {
-    Legacy(&'a [TableReference]),
-    WithAccess(&'a [(TableReference, TableAccess)]),
-}
+        for (reference, access) in references {
+            let catalog_name = reference
+                .catalog()
+                .unwrap_or(&config.options().catalog.default_catalog);
 
-impl TableReferences<'_> {
-    fn iter(&self) -> impl Iterator<Item = (&TableReference, TableAccess)> + Send {
-        let (legacy, with_access) = match self {
-            Self::Legacy(references) => (*references, &[][..]),
-            Self::WithAccess(references) => (&[][..], *references),
-        };
-        legacy
-            .iter()
-            .map(|reference| (reference, TableAccess::Read))
-            .chain(
-                with_access
-                    .iter()
-                    .map(|(reference, access)| (reference, *access)),
-            )
-    }
-}
+            // We will do three lookups here, one for the catalog, one for the schema, and one for the table
+            // We cache the result (both found results and not-found results) to speed up future lookups
+            //
+            // Note that a cache-miss is not an error at this point.  We allow for the possibility that
+            // other providers may supply the reference.
+            //
+            // If this is the only provider then a not-found error will be raised during planning when it can't
+            // find the reference in the cache.
 
-async fn resolve_schema<P: AsyncSchemaProvider + ?Sized>(
-    provider: &P,
-    references: TableReferences<'_>,
-    config: &SessionConfig,
-    catalog_name: &str,
-    schema_name: &str,
-) -> Result<Arc<dyn SchemaProvider>> {
-    let mut cached_tables =
-        HashMap::<(String, TableAccess), Option<Arc<dyn TableProvider>>>::new();
+            let catalog = if let Some(catalog) = cached_catalogs.get_mut(catalog_name) {
+                catalog
+            } else {
+                let resolved_catalog = self.catalog(catalog_name).await?;
+                let resolved_catalog =
+                    resolved_catalog.map(ResolvedCatalogProviderBuilder::new);
+                cached_catalogs.insert(catalog_name.to_string(), resolved_catalog);
+                cached_catalogs.get_mut(catalog_name).unwrap()
+            };
 
-    for (reference, access) in references.iter() {
-        let ref_catalog_name = reference
-            .catalog()
-            .unwrap_or(&config.options().catalog.default_catalog);
+            // If we can't find the catalog don't bother checking the schema / table
+            let Some(catalog) = catalog else { continue };
 
-        // Maybe this is a reference to some other catalog provided in another way
-        if ref_catalog_name != catalog_name {
-            continue;
+            let schema_name = reference
+                .schema()
+                .unwrap_or(&config.options().catalog.default_schema);
+
+            let schema = if let Some(schema) = catalog.cached_schemas.get_mut(schema_name)
+            {
+                schema
+            } else {
+                let resolved_schema = catalog.async_provider.schema(schema_name).await?;
+                let resolved_schema = resolved_schema.map(|async_schema| {
+                    ResolvedSchemaProviderBuilder::new(
+                        catalog_name.to_string(),
+                        async_schema,
+                    )
+                });
+                catalog
+                    .cached_schemas
+                    .insert(schema_name.to_string(), resolved_schema);
+                catalog.cached_schemas.get_mut(schema_name).unwrap()
+            };
+
+            // If we can't find the catalog don't bother checking the table
+            let Some(schema) = schema else { continue };
+
+            schema.resolve_table(reference.table(), *access).await?;
         }
 
-        let ref_schema_name = reference
-            .schema()
-            .unwrap_or(&config.options().catalog.default_schema);
+        // Build the cached catalog provider list
+        let cached_catalogs = cached_catalogs
+            .into_iter()
+            .filter_map(|(key, maybe_builder)| {
+                maybe_builder.map(|catalog_builder| (key, catalog_builder.finish()))
+            })
+            .collect::<HashMap<_, _>>();
 
-        if ref_schema_name != schema_name {
-            continue;
-        }
-
-        let key = (reference.table().to_string(), access);
-        if !cached_tables.contains_key(&key) {
-            let resolved_table = provider
-                .table_with_access(reference.table(), access)
-                .await?;
-            cached_tables.insert(key, resolved_table);
-        }
+        Ok(Arc::new(ResolvedCatalogProviderList { cached_catalogs }))
     }
-
-    let cached_tables = ResolvedTableCache::new(cached_tables);
-
-    Ok(Arc::new(ResolvedSchemaProvider {
-        cached_tables,
-        owner_name: Some(catalog_name.to_string()),
-    }))
-}
-
-async fn resolve_catalog<P: AsyncCatalogProvider + ?Sized>(
-    provider: &P,
-    references: TableReferences<'_>,
-    config: &SessionConfig,
-    catalog_name: &str,
-) -> Result<Arc<dyn CatalogProvider>> {
-    let mut cached_schemas =
-        HashMap::<String, Option<ResolvedSchemaProviderBuilder>>::new();
-
-    for (reference, access) in references.iter() {
-        let ref_catalog_name = reference
-            .catalog()
-            .unwrap_or(&config.options().catalog.default_catalog);
-
-        // Maybe this is a reference to some other catalog provided in another way
-        if ref_catalog_name != catalog_name {
-            continue;
-        }
-
-        let schema_name = reference
-            .schema()
-            .unwrap_or(&config.options().catalog.default_schema);
-
-        let schema = if let Some(schema) = cached_schemas.get_mut(schema_name) {
-            schema
-        } else {
-            let resolved_schema = provider.schema(schema_name).await?;
-            let resolved_schema = resolved_schema.map(|resolved_schema| {
-                ResolvedSchemaProviderBuilder::new(
-                    catalog_name.to_string(),
-                    resolved_schema,
-                )
-            });
-            cached_schemas.insert(schema_name.to_string(), resolved_schema);
-            cached_schemas.get_mut(schema_name).unwrap()
-        };
-
-        // If we can't find the catalog don't bother checking the table
-        let Some(schema) = schema else { continue };
-
-        schema.resolve_table(reference.table(), access).await?;
-    }
-
-    let cached_schemas = cached_schemas
-        .into_iter()
-        .filter_map(|(key, maybe_builder)| {
-            maybe_builder.map(|schema_builder| (key, schema_builder.finish()))
-        })
-        .collect::<HashMap<_, _>>();
-
-    Ok(Arc::new(ResolvedCatalogProvider { cached_schemas }))
-}
-
-async fn resolve_catalog_list<P: AsyncCatalogProviderList + ?Sized>(
-    provider: &P,
-    references: TableReferences<'_>,
-    config: &SessionConfig,
-) -> Result<Arc<dyn CatalogProviderList>> {
-    let mut cached_catalogs =
-        HashMap::<String, Option<ResolvedCatalogProviderBuilder>>::new();
-
-    for (reference, access) in references.iter() {
-        let catalog_name = reference
-            .catalog()
-            .unwrap_or(&config.options().catalog.default_catalog);
-
-        // We will do three lookups here, one for the catalog, one for the schema, and one for the table
-        // We cache the result (both found results and not-found results) to speed up future lookups
-        //
-        // Note that a cache-miss is not an error at this point.  We allow for the possibility that
-        // other providers may supply the reference.
-        //
-        // If this is the only provider then a not-found error will be raised during planning when it can't
-        // find the reference in the cache.
-
-        let catalog = if let Some(catalog) = cached_catalogs.get_mut(catalog_name) {
-            catalog
-        } else {
-            let resolved_catalog = provider.catalog(catalog_name).await?;
-            let resolved_catalog =
-                resolved_catalog.map(ResolvedCatalogProviderBuilder::new);
-            cached_catalogs.insert(catalog_name.to_string(), resolved_catalog);
-            cached_catalogs.get_mut(catalog_name).unwrap()
-        };
-
-        // If we can't find the catalog don't bother checking the schema / table
-        let Some(catalog) = catalog else { continue };
-
-        let schema_name = reference
-            .schema()
-            .unwrap_or(&config.options().catalog.default_schema);
-
-        let schema = if let Some(schema) = catalog.cached_schemas.get_mut(schema_name) {
-            schema
-        } else {
-            let resolved_schema = catalog.async_provider.schema(schema_name).await?;
-            let resolved_schema = resolved_schema.map(|async_schema| {
-                ResolvedSchemaProviderBuilder::new(catalog_name.to_string(), async_schema)
-            });
-            catalog
-                .cached_schemas
-                .insert(schema_name.to_string(), resolved_schema);
-            catalog.cached_schemas.get_mut(schema_name).unwrap()
-        };
-
-        // If we can't find the catalog don't bother checking the table
-        let Some(schema) = schema else { continue };
-
-        schema.resolve_table(reference.table(), access).await?;
-    }
-
-    // Build the cached catalog provider list
-    let cached_catalogs = cached_catalogs
-        .into_iter()
-        .filter_map(|(key, maybe_builder)| {
-            maybe_builder.map(|catalog_builder| (key, catalog_builder.finish()))
-        })
-        .collect::<HashMap<_, _>>();
-
-    Ok(Arc::new(ResolvedCatalogProviderList { cached_catalogs }))
 }
 
 #[cfg(test)]
@@ -641,7 +496,7 @@ mod tests {
 
     #[async_trait]
     impl AsyncSchemaProvider for MockAsyncSchemaProvider {
-        async fn table_with_access(
+        async fn table(
             &self,
             name: &str,
             _access: TableAccess,
@@ -662,7 +517,7 @@ mod tests {
 
     #[async_trait]
     impl AsyncSchemaProvider for OperationAwareSchema {
-        async fn table_with_access(
+        async fn table(
             &self,
             name: &str,
             access: TableAccess,
@@ -723,10 +578,10 @@ mod tests {
         match level {
             ResolveLevel::Schema => {
                 provider
-                    .resolve_with_access(references, &config, MOCK_CATALOG, MOCK_SCHEMA)
+                    .resolve(references, &config, MOCK_CATALOG, MOCK_SCHEMA)
                     .await
             }
-            ResolveLevel::Catalog => Ok(AsyncCatalogProvider::resolve_with_access(
+            ResolveLevel::Catalog => Ok(AsyncCatalogProvider::resolve(
                 &catalog,
                 references,
                 &config,
@@ -737,10 +592,8 @@ mod tests {
             .unwrap()),
             ResolveLevel::CatalogList => {
                 let catalogs: Arc<dyn CatalogProviderList> =
-                    AsyncCatalogProviderList::resolve_with_access(
-                        &catalog, references, &config,
-                    )
-                    .await?;
+                    AsyncCatalogProviderList::resolve(&catalog, references, &config)
+                        .await?;
                 Ok(catalogs
                     .catalog(MOCK_CATALOG)
                     .unwrap()
@@ -773,26 +626,21 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(*provider.lookups.lock().unwrap(), vec![insert]);
-            assert!(
-                cached
-                    .table_with_access(MOCK_TABLE, insert)
-                    .await
-                    .unwrap()
-                    .is_some()
-            );
+            assert!(cached.table(MOCK_TABLE, insert).await.unwrap().is_some());
             for access in [TableAccess::Read, TableAccess::Insert(InsertOp::Overwrite)] {
-                let error = cached
-                    .table_with_access(MOCK_TABLE, access)
-                    .await
-                    .unwrap_err();
+                let error = cached.table(MOCK_TABLE, access).await.unwrap_err();
                 assert_contains!(
                     error.to_string(),
                     format!("was not resolved for operation {access:?}")
                 );
             }
-            let error = cached.table(MOCK_TABLE).await.unwrap_err();
-            assert_contains!(error.to_string(), "was not resolved for operation Read");
-            assert!(cached.table("missing").await.unwrap().is_none());
+            assert!(
+                cached
+                    .table("missing", TableAccess::Read)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(cached.table_names(), vec![MOCK_TABLE]);
             assert!(cached.table_exist(MOCK_TABLE));
         }
@@ -831,20 +679,21 @@ mod tests {
             let wrapped = DynamicFileSchemaProvider::new(cached, factory.clone());
 
             for access in [TableAccess::Read, TableAccess::Insert(InsertOp::Overwrite)] {
-                let error = wrapped
-                    .table_with_access(MOCK_TABLE, access)
-                    .await
-                    .unwrap_err();
+                let error = wrapped.table(MOCK_TABLE, access).await.unwrap_err();
                 assert_contains!(
                     error.to_string(),
                     format!("was not resolved for operation {access:?}")
                 );
             }
-            let error = wrapped.table(MOCK_TABLE).await.unwrap_err();
-            assert_contains!(error.to_string(), "was not resolved for operation Read");
             assert_eq!(factory.calls.load(Ordering::Relaxed), 0);
 
-            assert!(wrapped.table("missing.csv").await.unwrap().is_some());
+            assert!(
+                wrapped
+                    .table("missing.csv", TableAccess::Read)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
             assert_eq!(factory.calls.load(Ordering::Relaxed), 1);
         }
     }
@@ -885,37 +734,25 @@ mod tests {
                 *allowed.lookups.lock().unwrap(),
                 vec![insert, TableAccess::Read]
             );
-            let write_provider = cached
-                .table_with_access(MOCK_TABLE, insert)
+            let write_provider = cached.table(MOCK_TABLE, insert).await.unwrap().unwrap();
+            let read_provider = cached
+                .table(MOCK_TABLE, TableAccess::Read)
                 .await
                 .unwrap()
                 .unwrap();
-            let read_provider = cached.table(MOCK_TABLE).await.unwrap().unwrap();
             assert!(!Arc::ptr_eq(&write_provider, &read_provider));
             assert_eq!(cached.table_names(), vec![MOCK_TABLE]);
         }
     }
 
     #[tokio::test]
-    async fn legacy_resolution_only_caches_reads() {
+    async fn resolved_read_does_not_authorize_insert() {
         let provider = MockAsyncSchemaProvider::default();
         let insert = TableAccess::Insert(InsertOp::Append);
         let config = test_config();
         let cached = provider
             .resolve(
-                &[TableReference::bare(MOCK_TABLE)],
-                &config,
-                MOCK_CATALOG,
-                MOCK_SCHEMA,
-            )
-            .await
-            .unwrap();
-        assert!(cached.table(MOCK_TABLE).await.unwrap().is_some());
-        assert!(cached.table_with_access(MOCK_TABLE, insert).await.is_err());
-
-        let cached = provider
-            .resolve_with_access(
-                &[(TableReference::bare(MOCK_TABLE), insert)],
+                &[(TableReference::bare(MOCK_TABLE), TableAccess::Read)],
                 &config,
                 MOCK_CATALOG,
                 MOCK_SCHEMA,
@@ -924,12 +761,27 @@ mod tests {
             .unwrap();
         assert!(
             cached
-                .table_with_access(MOCK_TABLE, insert)
+                .table(MOCK_TABLE, TableAccess::Read)
                 .await
                 .unwrap()
                 .is_some()
         );
-        let error = cached.table(MOCK_TABLE).await.unwrap_err();
+        assert!(cached.table(MOCK_TABLE, insert).await.is_err());
+
+        let cached = provider
+            .resolve(
+                &[(TableReference::bare(MOCK_TABLE), insert)],
+                &config,
+                MOCK_CATALOG,
+                MOCK_SCHEMA,
+            )
+            .await
+            .unwrap();
+        assert!(cached.table(MOCK_TABLE, insert).await.unwrap().is_some());
+        let error = cached
+            .table(MOCK_TABLE, TableAccess::Read)
+            .await
+            .unwrap_err();
         assert_contains!(error.to_string(), "was not resolved for operation Read");
         assert_eq!(provider.lookup_count.load(Ordering::Acquire), 2);
     }
@@ -949,6 +801,10 @@ mod tests {
             found_tables: &[&str],
             not_found_tables: &[&str],
         ) {
+            let refs = refs
+                .into_iter()
+                .map(|reference| (reference, TableAccess::Read))
+                .collect::<Vec<_>>();
             let async_provider = MockAsyncSchemaProvider::default();
             let cached_provider = async_provider
                 .resolve(&refs, &test_config(), MOCK_CATALOG, MOCK_SCHEMA)
@@ -961,12 +817,21 @@ mod tests {
             );
 
             for table_ref in found_tables {
-                let table = cached_provider.table(table_ref).await.unwrap();
+                let table = cached_provider
+                    .table(table_ref, TableAccess::Read)
+                    .await
+                    .unwrap();
                 assert!(table.is_some());
             }
 
             for table_ref in not_found_tables {
-                assert!(cached_provider.table(table_ref).await.unwrap().is_none());
+                assert!(
+                    cached_provider
+                        .table(table_ref, TableAccess::Read)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
             }
         }
 
@@ -1037,6 +902,10 @@ mod tests {
             found_schemas: &[&str],
             not_found_schemas: &[&str],
         ) {
+            let refs = refs
+                .into_iter()
+                .map(|reference| (reference, TableAccess::Read))
+                .collect::<Vec<_>>();
             let async_provider = MockAsyncCatalogProvider::default();
             let cached_provider = async_provider
                 .resolve(&refs, &test_config(), MOCK_CATALOG)
@@ -1122,6 +991,10 @@ mod tests {
             found_catalogs: &[&str],
             not_found_catalogs: &[&str],
         ) {
+            let refs = refs
+                .into_iter()
+                .map(|reference| (reference, TableAccess::Read))
+                .collect::<Vec<_>>();
             let async_provider = MockAsyncCatalogProviderList::default();
             let cached_provider =
                 async_provider.resolve(&refs, &test_config()).await.unwrap();
@@ -1177,7 +1050,7 @@ mod tests {
         ] {
             let async_provider = MockAsyncCatalogProviderList::default();
             let cached_provider = async_provider
-                .resolve(std::slice::from_ref(table_ref), &test_config())
+                .resolve(&[(table_ref.clone(), TableAccess::Read)], &test_config())
                 .await
                 .unwrap();
 
@@ -1187,7 +1060,13 @@ mod tests {
             let schema = catalog
                 .schema(table_ref.schema().unwrap_or(MOCK_SCHEMA))
                 .unwrap();
-            assert!(schema.table(table_ref.table()).await.unwrap().is_some());
+            assert!(
+                schema
+                    .table(table_ref.table(), TableAccess::Read)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
         }
     }
 }

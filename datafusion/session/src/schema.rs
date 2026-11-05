@@ -44,11 +44,6 @@ pub trait SchemaProvider: Any + Debug + Sync + Send {
     /// Retrieves the list of available table names in this schema.
     fn table_names(&self) -> Vec<String>;
 
-    /// Resolves a table for a row read. Legacy callers require read access.
-    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.table_with_access(name, TableAccess::Read).await
-    }
-
     /// Resolves a table for an operation before the planner uses its schema.
     ///
     /// Implementations must explicitly handle the intent. Forwarding wrappers
@@ -56,7 +51,7 @@ pub trait SchemaProvider: Any + Debug + Sync + Send {
     /// provider. Identity and privilege mapping belong to the application.
     /// Metadata access does not authorize DDL or metadata enumeration.
     /// Provider execution and externally supplied plans require separate checks.
-    async fn table_with_access(
+    async fn table(
         &self,
         name: &str,
         access: TableAccess,
@@ -70,7 +65,7 @@ pub trait SchemaProvider: Any + Debug + Sync + Send {
     /// The default requests [`TableAccess::Metadata`]. Overrides must enforce
     /// their own metadata visibility policy.
     async fn table_type(&self, name: &str) -> Result<Option<TableType>> {
-        self.table_with_access(name, TableAccess::Metadata)
+        self.table(name, TableAccess::Metadata)
             .await
             .map(|o| o.map(|t| t.table_type()))
     }

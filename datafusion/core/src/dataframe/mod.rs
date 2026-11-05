@@ -2011,7 +2011,7 @@ impl DataFrame {
         let table_ref: TableReference = table_name.into();
         let table_schema = self.session_state.schema_for_ref(table_ref.clone())?;
         let target = match table_schema
-            .table_with_access(
+            .table(
                 table_ref.table(),
                 TableAccess::Insert(write_options.insert_op),
             )

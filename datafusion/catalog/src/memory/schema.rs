@@ -54,7 +54,7 @@ impl SchemaProvider for MemorySchemaProvider {
             .collect()
     }
 
-    async fn table_with_access(
+    async fn table(
         &self,
         name: &str,
         _access: TableAccess,

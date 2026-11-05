@@ -163,12 +163,12 @@ impl SchemaProvider for DynamicObjectStoreSchemaProvider {
         self.inner.register_table(name, table)
     }
 
-    async fn table_with_access(
+    async fn table(
         &self,
         name: &str,
         access: TableAccess,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
-        if let Some(inner_table) = self.inner.table_with_access(name, access).await? {
+        if let Some(inner_table) = self.inner.table(name, access).await? {
             return Ok(Some(inner_table));
         }
 
@@ -220,7 +220,7 @@ impl SchemaProvider for DynamicObjectStoreSchemaProvider {
                 state.runtime_env().register_object_store(url, store);
             }
         }
-        self.inner.table_with_access(name, access).await
+        self.inner.table(name, access).await
     }
 
     fn deregister_table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
@@ -262,7 +262,7 @@ mod tests {
         fn table_exist(&self, _: &str) -> bool {
             false
         }
-        async fn table_with_access(
+        async fn table(
             &self,
             _: &str,
             access: TableAccess,
@@ -279,7 +279,7 @@ mod tests {
         let wrapper =
             DynamicObjectStoreSchemaProvider::new(Arc::new(ReadOnlySchema), Weak::new());
         let error = wrapper
-            .table_with_access(
+            .table(
                 "target",
                 TableAccess::Insert(datafusion::logical_expr::dml::InsertOp::Append),
             )
@@ -327,7 +327,7 @@ mod tests {
         let schema = ctx.catalog("datafusion").unwrap().schema("public").unwrap();
         let location = "http://example.com/file.csv";
         let error = schema
-            .table_with_access(
+            .table(
                 location,
                 TableAccess::Insert(datafusion::logical_expr::dml::InsertOp::Append),
             )
@@ -344,7 +344,13 @@ mod tests {
                 .is_err()
         );
         assert_eq!(factory.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert!(schema.table(location).await.unwrap().is_none());
+        assert!(
+            schema
+                .table(location, TableAccess::Read)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(factory.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
@@ -396,7 +402,7 @@ mod tests {
         let (ctx, schema) = setup_context();
 
         // That's a non registered table so expecting None here
-        let table = schema.table(&location).await?;
+        let table = schema.table(&location, TableAccess::Read).await?;
         assert!(table.is_none());
 
         // It should still create an object store for the location in the SessionState
@@ -433,7 +439,7 @@ mod tests {
 
         let (ctx, schema) = setup_context();
 
-        let table = schema.table(&location).await?;
+        let table = schema.table(&location, TableAccess::Read).await?;
         assert!(table.is_none());
 
         let store = ctx
@@ -455,7 +461,7 @@ mod tests {
 
         let (ctx, schema) = setup_context();
 
-        let table = schema.table(&location).await?;
+        let table = schema.table(&location, TableAccess::Read).await?;
         assert!(table.is_none());
 
         let store = ctx
@@ -475,7 +481,7 @@ mod tests {
         let location = "ts://file.parquet";
         let (_ctx, schema) = setup_context();
 
-        assert!(schema.table(location).await.is_err());
+        assert!(schema.table(location, TableAccess::Read).await.is_err());
     }
 
     #[cfg(not(target_os = "windows"))]

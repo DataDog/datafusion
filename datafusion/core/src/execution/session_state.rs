@@ -581,8 +581,7 @@ impl SessionState {
             if let Entry::Vacant(v) = provider.tables.entry((resolved, access)) {
                 let (resolved, access) = v.key();
                 if let Ok(schema) = self.schema_for_ref(resolved.clone())
-                    && let Some(table) =
-                        schema.table_with_access(&resolved.table, *access).await?
+                    && let Some(table) = schema.table(&resolved.table, *access).await?
                 {
                     v.insert(provider_as_source(table));
                 }
@@ -2003,13 +2002,6 @@ impl ContextProvider for SessionContextProvider<'_> {
     fn get_table_source(
         &self,
         name: TableReference,
-    ) -> datafusion_common::Result<Arc<dyn TableSource>> {
-        self.get_table_source_with_access(name, TableAccess::Read)
-    }
-
-    fn get_table_source_with_access(
-        &self,
-        name: TableReference,
         access: TableAccess,
     ) -> datafusion_common::Result<Arc<dyn TableSource>> {
         let name = self.state.resolve_table_ref(name);
@@ -2721,7 +2713,7 @@ mod tests {
     }
 
     impl ContextProvider for MyContextProvider {
-        fn get_table_source_with_access(
+        fn get_table_source(
             &self,
             name: TableReference,
             _access: TableAccess,

@@ -1479,7 +1479,7 @@ mod tests {
     }
 
     impl ContextProvider for TestContextProvider {
-        fn get_table_source_with_access(
+        fn get_table_source(
             &self,
             name: TableReference,
             _access: TableAccess,

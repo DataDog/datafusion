@@ -133,12 +133,12 @@ impl SchemaProvider for DynamicFileSchemaProvider {
         self.inner.table_names()
     }
 
-    async fn table_with_access(
+    async fn table(
         &self,
         name: &str,
         access: TableAccess,
     ) -> datafusion_common::Result<Option<Arc<dyn TableProvider>>> {
-        if let Some(table) = self.inner.table_with_access(name, access).await? {
+        if let Some(table) = self.inner.table(name, access).await? {
             return Ok(Some(table));
         }
 

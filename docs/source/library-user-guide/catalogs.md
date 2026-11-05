@@ -81,7 +81,7 @@ impl SchemaProvider for MemorySchemaProvider {
             .collect()
     }
 
-    async fn table_with_access(&self, name: &str, _access: datafusion::logical_expr::TableAccess) -> Result<Option<Arc<dyn TableProvider>>> {
+    async fn table(&self, name: &str, _access: datafusion::logical_expr::TableAccess) -> Result<Option<Arc<dyn TableProvider>>> {
         Ok(self.tables.get(name).map(|table| table.value().clone()))
     }
 
@@ -134,7 +134,7 @@ Without getting into a `CatalogProvider` implementation, we can create a `Memory
 #             .collect()
 #     }
 #
-#     async fn table_with_access(&self, name: &str, _access: datafusion::logical_expr::TableAccess) -> Result<Option<Arc<dyn TableProvider>>> {
+#     async fn table(&self, name: &str, _access: datafusion::logical_expr::TableAccess) -> Result<Option<Arc<dyn TableProvider>>> {
 #         Ok(self.tables.get(name).map(|table| table.value().clone()))
 #     }
 #
@@ -185,7 +185,7 @@ let table_provider = {
 
 schema_provider.register_table("users".to_string(), table_provider);
 
-let table = schema_provider.table("users");
+let table = schema_provider.table("users", datafusion::logical_expr::TableAccess::Read);
 ```
 
 ### Asynchronous `SchemaProvider`
@@ -207,7 +207,7 @@ The trait is roughly the same except for the `table` method, and the addition of
 
 #[async_trait]
 impl SchemaProvider for Schema {
-    async fn table_with_access(&self, name: &str, _access: datafusion::logical_expr::TableAccess) -> Result<Option<Arc<dyn TableProvider>>> {
+    async fn table(&self, name: &str, _access: datafusion::logical_expr::TableAccess) -> Result<Option<Arc<dyn TableProvider>>> {
 #       todo!();
     }
 
@@ -319,7 +319,7 @@ To recap, you need to:
 Authorizing catalogs need to distinguish access types to make fine-grained
 permission decisions. A caller may be allowed to insert into a table without
 being allowed to select from it. The planner still needs the destination schema.
-`SchemaProvider::table_with_access` lets the catalog check the intended operation
+`SchemaProvider::table` lets the catalog check the intended operation
 before returning a provider or exposing its schema.
 
 `TableAccess` describes DataFusion operations; applications map them to privileges:
@@ -345,16 +345,15 @@ additional checks. Explicit sources and subqueries always request `Read`.
 deletion, or alteration of catalog objects. A `DESCRIBE` of a query plans that
 query normally and retains its read checks.
 
-### Required implementations and legacy callers
+### Explicit intent at every lookup
 
-`SchemaProvider::table_with_access`, `AsyncSchemaProvider::table_with_access`, and
-`ContextProvider::get_table_source_with_access` are required methods. This is a
-breaking API change: rename legacy implementations and explicitly handle access.
-Forwarding wrappers must pass it unchanged to their inner provider. Catalogs that
-do not enforce authorization can explicitly ignore the parameter. There is no
-default that silently drops intent. Authorizing implementations should reject
-unknown intent variants. Legacy `table` and `get_table_source` methods
-delegate to the required methods with `Read`; avoid overriding those defaults.
+`SchemaProvider::table(name, access)`, `AsyncSchemaProvider::table(name, access)`,
+and `ContextProvider::get_table_source(name, access)` require an explicit
+`TableAccess`. There is one lookup method per trait, with no name-only overload
+or default intent. Existing implementations and callers must migrate.
+Forwarding wrappers must pass access unchanged to their inner provider. Catalogs
+that do not enforce authorization can explicitly ignore the parameter.
+Authorizing implementations should reject unknown intent variants.
 
 Caller identity, query context, stable object identities, and the mapping from
 operations to privileges stay in the application.
@@ -366,20 +365,20 @@ insert access and the source requests read access. A self-insert checks both.
 Built-in session planning caches providers by resolved table name and access, so
 a cached insert provider cannot satisfy a read lookup. CTE aliases use their
 planned relations; tables inside their definitions resolve normally.
-`SessionContext::table` and `table_provider` request `Read`;
-`table_provider_with_access` allows an explicit operation, and
+`SessionContext::table` constructs a read DataFrame and requests `Read`.
+`SessionContext::table_provider(name, access)` requires an explicit operation;
 `DataFrame::write_table` forwards its insert mode.
 
 Remote catalogs can use `resolve_table_references_with_access` together with
 `AsyncSchemaProvider`, `AsyncCatalogProvider`, or `AsyncCatalogProviderList`'s
-`resolve_with_access`. The remote-catalog example demonstrates this path.
+`resolve`. The remote-catalog example demonstrates this path.
 Built-in session planning performs its own prefetch and does not call these
 helpers. They are optional for catalogs that check policy on each live lookup.
 
 These helpers build snapshots scoped to one caller and query. Every cache entry
-retains its authorized operation. Legacy `resolve` resolves only `Read` and its
-cache rejects subsequent writes. Requesting a known table for an unresolved
-operation returns an error. Sharing the cache across identities or retaining it
+retains its authorized operation. `resolve` requires `(TableReference, TableAccess)`
+pairs; there is no name-only resolution path. Requesting a known table for an
+unresolved operation returns an error. Sharing the cache across identities or retaining it
 after permission changes can reuse stale authorization. Name and operation keys
 do not encode caller identity or policy versions.
 
@@ -389,7 +388,7 @@ self-insert can cause two remote lookups, one per intent; implementations can
 share the metadata fetch while preserving both permission checks. Metadata
 queries may enumerate more tables than occur explicitly in SQL. A remote snapshot
 must resolve those metadata operations separately or provide a catalog that can
-authorize them live; `resolve_with_access` is not a metadata-enumeration API.
+authorize them live; `resolve` is not a metadata-enumeration API.
 
 ### Integration boundaries
 

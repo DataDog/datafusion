@@ -135,7 +135,7 @@ impl SchemaProvider for AuthorizedSchema {
         self.tables.keys().cloned().collect()
     }
 
-    async fn table_with_access(
+    async fn table(
         &self,
         name: &str,
         access: TableAccess,
@@ -451,11 +451,11 @@ async fn write_target_subqueries_need_independent_read_access() {
 }
 
 #[tokio::test]
-async fn legacy_lookup_remains_conservative_for_protected_catalogs() {
+async fn read_lookup_requires_read_permission() {
     let (ctx, schema) = authorized_context();
     schema.grant("target", TableAccess::Insert(InsertOp::Append));
 
-    let err = schema.table("target").await.unwrap_err();
+    let err = schema.table("target", TableAccess::Read).await.unwrap_err();
     assert_contains!(err.to_string(), "Access denied to target for Read");
     let err = ctx.table("target").await.unwrap_err();
     assert_contains!(err.to_string(), "Access denied to target for Read");
@@ -483,20 +483,8 @@ async fn existing_schema_implementations_keep_working() {
             delete: true,
         },
     ] {
-        assert!(
-            schema
-                .table_with_access("target", access)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            schema
-                .table_with_access("missing", access)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(schema.table("target", access).await.unwrap().is_some());
+        assert!(schema.table("missing", access).await.unwrap().is_none());
     }
 
     let ctx = context(schema);
@@ -542,30 +530,18 @@ async fn dynamic_file_schema_forwards_access_and_only_falls_back_for_missing_tab
     );
     let access = TableAccess::Insert(InsertOp::Append);
     schema.grant("target", access);
-    assert!(
-        wrapped
-            .table_with_access("target", access)
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(wrapped.table("target", access).await.unwrap().is_some());
     assert_eq!(factory.calls.load(Ordering::Relaxed), 0);
 
     let err = wrapped
-        .table_with_access("target", TableAccess::Read)
+        .table("target", TableAccess::Read)
         .await
         .unwrap_err();
     assert_contains!(err.to_string(), "Access denied to target for Read");
     assert_eq!(factory.calls.load(Ordering::Relaxed), 0);
 
     schema.grant("file.csv", access);
-    assert!(
-        wrapped
-            .table_with_access("file.csv", access)
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(wrapped.table("file.csv", access).await.unwrap().is_some());
     assert_eq!(factory.calls.load(Ordering::Relaxed), 1);
     assert_eq!(
         schema.accesses(),

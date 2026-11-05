@@ -128,7 +128,7 @@ fn create_table_source(fields: Vec<Field>) -> Arc<dyn TableSource> {
 }
 
 impl ContextProvider for MyContextProvider {
-    fn get_table_source_with_access(
+    fn get_table_source(
         &self,
         name: TableReference,
         _access: TableAccess,

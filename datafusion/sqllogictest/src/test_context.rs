@@ -254,7 +254,7 @@ impl SchemaProvider for StrictOrdersSchema {
         vec!["orders".to_string()]
     }
 
-    async fn table_with_access(
+    async fn table(
         &self,
         name: &str,
         _access: TableAccess,

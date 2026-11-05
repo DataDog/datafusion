@@ -133,11 +133,17 @@ unsafe extern "C" fn table_fn_wrapper(
         let provider = Arc::clone(provider.inner());
 
         async move {
-            let table = sresult_return!(provider.table(name.as_str()).await)
-                .map(|t| {
-                    FFI_TableProvider::new_with_ffi_codec(t, true, runtime, logical_codec)
-                })
-                .into();
+            let table =
+                sresult_return!(provider.table(name.as_str(), TableAccess::Read).await)
+                    .map(|t| {
+                        FFI_TableProvider::new_with_ffi_codec(
+                            t,
+                            true,
+                            runtime,
+                            logical_codec,
+                        )
+                    })
+                    .into();
 
             FFI_Result::Ok(table)
         }
@@ -326,7 +332,7 @@ impl SchemaProvider for ForeignSchemaProvider {
         }
     }
 
-    async fn table_with_access(
+    async fn table(
         &self,
         name: &str,
         access: TableAccess,
@@ -412,7 +418,7 @@ mod tests {
         let local: Arc<dyn SchemaProvider> = (&ffi).into();
         assert!(
             local
-                .table_with_access("target", TableAccess::Metadata)
+                .table("target", TableAccess::Metadata)
                 .await
                 .unwrap()
                 .is_some()
@@ -420,7 +426,13 @@ mod tests {
         ffi.library_marker_id = crate::mock_foreign_marker_id;
         let foreign: Arc<dyn SchemaProvider> = (&ffi).into();
         assert!(foreign.downcast_ref::<ForeignSchemaProvider>().is_some());
-        assert!(foreign.table("target").await.unwrap().is_some());
+        assert!(
+            foreign
+                .table("target", TableAccess::Read)
+                .await
+                .unwrap()
+                .is_some()
+        );
         for access in [
             TableAccess::Metadata,
             TableAccess::Insert(InsertOp::Append),
@@ -433,10 +445,7 @@ mod tests {
                 delete: true,
             },
         ] {
-            let error = foreign
-                .table_with_access("target", access)
-                .await
-                .unwrap_err();
+            let error = foreign.table("target", access).await.unwrap_err();
             assert!(error.to_string().contains("FFI ABI only supports Read"));
         }
     }
@@ -487,7 +496,7 @@ mod tests {
 
         // Retrieve non-existent table
         let returned_schema = foreign_schema_provider
-            .table("prior_table")
+            .table("prior_table", TableAccess::Read)
             .await
             .expect("Unable to query table");
         assert!(returned_schema.is_none());
@@ -495,7 +504,7 @@ mod tests {
 
         // Retrieve valid table
         let returned_schema = foreign_schema_provider
-            .table("second_table")
+            .table("second_table", TableAccess::Read)
             .await
             .expect("Unable to query table");
         assert!(returned_schema.is_some());

@@ -72,11 +72,7 @@ impl TableSource for TrackedSource {
 }
 
 impl ContextProvider for AccessContext {
-    fn get_table_source(&self, _: TableReference) -> Result<Arc<dyn TableSource>> {
-        panic!("the SQL planner must use operation-aware lookup")
-    }
-
-    fn get_table_source_with_access(
+    fn get_table_source(
         &self,
         name: TableReference,
         access: TableAccess,

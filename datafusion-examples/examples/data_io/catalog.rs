@@ -184,7 +184,7 @@ impl SchemaProvider for DirSchema {
         tables.keys().cloned().collect::<Vec<_>>()
     }
 
-    async fn table_with_access(
+    async fn table(
         &self,
         name: &str,
         _access: TableAccess,

@@ -179,9 +179,8 @@ impl InformationSchemaConfig {
                     // schema name may not exist in the catalog, so we need to check
                     if let Some(schema) = catalog.schema(&schema_name) {
                         for table_name in schema.table_names() {
-                            if let Some(table) = schema
-                                .table_with_access(&table_name, TableAccess::Metadata)
-                                .await?
+                            if let Some(table) =
+                                schema.table(&table_name, TableAccess::Metadata).await?
                             {
                                 builder.add_view(
                                     &catalog_name,
@@ -212,9 +211,8 @@ impl InformationSchemaConfig {
                     // schema name may not exist in the catalog, so we need to check
                     if let Some(schema) = catalog.schema(&schema_name) {
                         for table_name in schema.table_names() {
-                            if let Some(table) = schema
-                                .table_with_access(&table_name, TableAccess::Metadata)
-                                .await?
+                            if let Some(table) =
+                                schema.table(&table_name, TableAccess::Metadata).await?
                             {
                                 for (field_position, field) in
                                     table.schema().fields().iter().enumerate()
@@ -589,7 +587,7 @@ impl SchemaProvider for InformationSchemaProvider {
             .collect()
     }
 
-    async fn table_with_access(
+    async fn table(
         &self,
         name: &str,
         _access: TableAccess,
@@ -1600,7 +1598,7 @@ mod tests {
 
         // InformationSchemaConfig::make_tables used this before `table_type`
         // existed but should not, as it may be expensive.
-        async fn table_with_access(
+        async fn table(
             &self,
             _: &str,
             _access: TableAccess,
