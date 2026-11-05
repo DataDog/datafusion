@@ -813,7 +813,11 @@ impl SessionContext {
         &self,
         cmd: &CreateExternalTable,
     ) -> Result<DataFrame> {
-        let exist = self.table_exist(cmd.name.clone())?;
+        let schema = self.state.read().schema_for_ref(cmd.name.clone())?;
+        let exist = schema
+            .table_with_access(cmd.name.table(), TableAccess::Metadata)
+            .await?
+            .is_some();
 
         if cmd.temporary {
             return not_impl_err!("Temporary tables not supported");
@@ -877,10 +881,13 @@ impl SessionContext {
             return not_impl_err!("Temporary tables not supported");
         }
 
-        let table = self.table(name.clone()).await;
+        let schema_provider = self.state.read().schema_for_ref(name.clone())?;
+        let table = schema_provider
+            .table_with_access(name.table(), TableAccess::Metadata)
+            .await?;
         match (if_not_exists, or_replace, table) {
-            (true, false, Ok(_)) => self.return_empty_dataframe(),
-            (false, true, Ok(_)) => {
+            (true, false, Some(_)) => self.return_empty_dataframe(),
+            (false, true, Some(_)) => {
                 Self::ensure_unique_column_names(input.schema())?;
                 self.deregister_table(name.clone())?;
                 let schema = Arc::clone(input.schema().inner());
@@ -897,10 +904,10 @@ impl SessionContext {
                 self.register_table(name.clone(), table)?;
                 self.return_empty_dataframe()
             }
-            (true, true, Ok(_)) => {
+            (true, true, Some(_)) => {
                 exec_err!("'IF NOT EXISTS' cannot coexist with 'REPLACE'")
             }
-            (_, _, Err(_)) => {
+            (_, _, None) => {
                 Self::ensure_unique_column_names(input.schema())?;
                 let schema = Arc::clone(input.schema().inner());
                 let physical = DataFrame::new(self.state(), input);
@@ -916,7 +923,7 @@ impl SessionContext {
                 self.register_table(name, table)?;
                 self.return_empty_dataframe()
             }
-            (false, false, Ok(_)) => exec_err!("Table '{name}' already exists"),
+            (false, false, Some(_)) => exec_err!("Table '{name}' already exists"),
         }
     }
 
@@ -939,14 +946,17 @@ impl SessionContext {
             temporary,
         } = cmd;
 
-        let view = self.table(name.clone()).await;
+        let schema_provider = self.state.read().schema_for_ref(name.clone())?;
+        let view = schema_provider
+            .table_with_access(name.table(), TableAccess::Metadata)
+            .await?;
 
         if temporary {
             return not_impl_err!("Temporary views not supported");
         }
 
         match (or_replace, view) {
-            (true, Ok(_)) => {
+            (true, Some(_)) => {
                 let input = Self::apply_type_coercion(Arc::unwrap_or_clone(input))?;
                 Self::ensure_unique_column_names(input.schema())?;
                 self.deregister_table(name.clone())?;
@@ -954,14 +964,14 @@ impl SessionContext {
                 self.register_table(name, table)?;
                 self.return_empty_dataframe()
             }
-            (_, Err(_)) => {
+            (_, None) => {
                 let input = Self::apply_type_coercion(Arc::unwrap_or_clone(input))?;
                 Self::ensure_unique_column_names(input.schema())?;
                 let table = Arc::new(ViewTable::new(input, definition));
                 self.register_table(name, table)?;
                 self.return_empty_dataframe()
             }
-            (false, Ok(_)) => exec_err!("Table '{name}' already exists"),
+            (false, Some(_)) => exec_err!("Table '{name}' already exists"),
         }
     }
 
@@ -1049,9 +1059,9 @@ impl SessionContext {
         } = cmd;
         let result = self
             .find_and_deregister(name.clone(), TableType::Base)
-            .await;
+            .await?;
         match (result, if_exists) {
-            (Ok(true), _) => self.return_empty_dataframe(),
+            (true, _) => self.return_empty_dataframe(),
             (_, true) => self.return_empty_dataframe(),
             (_, _) => exec_err!("Table '{name}' doesn't exist."),
         }
@@ -1063,9 +1073,9 @@ impl SessionContext {
         } = cmd;
         let result = self
             .find_and_deregister(name.clone(), TableType::View)
-            .await;
+            .await?;
         match (result, if_exists) {
-            (Ok(true), _) => self.return_empty_dataframe(),
+            (true, _) => self.return_empty_dataframe(),
             (_, true) => self.return_empty_dataframe(),
             (_, _) => exec_err!("View '{name}' doesn't exist."),
         }
@@ -1463,7 +1473,9 @@ impl SessionContext {
         };
 
         if let Some(schema) = maybe_schema
-            && let Some(table_provider) = schema.table(&table).await?
+            && let Some(table_provider) = schema
+                .table_with_access(&table, TableAccess::Metadata)
+                .await?
             && table_provider.table_type() == table_type
         {
             schema.deregister_table(&table)?;

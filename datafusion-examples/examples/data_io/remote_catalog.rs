@@ -40,6 +40,7 @@ use datafusion::common::Result;
 use datafusion::common::{assert_batches_eq, internal_datafusion_err, plan_err};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::logical_expr::TableAccess;
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -82,12 +83,12 @@ pub async fn remote_catalog() -> Result<()> {
     // Find all `TableReferences` in the parsed queries. These correspond to the
     // tables referred to by the query (in this case
     // `remote_schema.remote_table`)
-    let references = state.resolve_table_references(&statement)?;
+    let references = state.resolve_table_references_with_access(&statement)?;
 
     // Now we can asynchronously resolve the table references to get a cached catalog
     // that we can use for our query
     let resolved_catalog = remote_catalog_adapter
-        .resolve(&references, state.config(), "datafusion", "remote_schema")
+        .resolve_with_access(&references, state.config(), "datafusion", "remote_schema")
         .await?;
 
     // This resolved catalog only makes sense for this query and so we create a clone
@@ -187,7 +188,11 @@ struct RemoteCatalogDatafusionAdapter(Arc<RemoteCatalogInterface>);
 
 #[async_trait]
 impl AsyncSchemaProvider for RemoteCatalogDatafusionAdapter {
-    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+    async fn table_with_access(
+        &self,
+        name: &str,
+        _access: TableAccess,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
         // Fetch information about the table from the remote catalog
         //
         // Note that a real remote catalog interface could return more

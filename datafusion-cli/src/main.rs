@@ -30,7 +30,7 @@ use datafusion::execution::memory_pool::{
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::ExplainFormat;
 use datafusion::prelude::SessionContext;
-use datafusion_cli::catalog::DynamicObjectStoreCatalog;
+use datafusion_cli::catalog::register_dynamic_catalog;
 use datafusion_cli::functions::{
     ListFilesCacheFunc, MetadataCacheFunc, ParquetMetadataFunc, StatisticsCacheFunc,
 };
@@ -243,15 +243,9 @@ async fn main_inner() -> Result<()> {
 
     let runtime_env = rt_builder.build_arc()?;
 
-    // enable dynamic file query
-    let ctx = SessionContext::new_with_config_rt(session_config, runtime_env)
-        .enable_url_table();
+    let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
     ctx.refresh_catalogs().await?;
-    // install dynamic catalog provider that can register required object stores
-    ctx.register_catalog_list(Arc::new(DynamicObjectStoreCatalog::new(
-        ctx.state().catalog_list().clone(),
-        ctx.state_weak_ref(),
-    )));
+    register_dynamic_catalog(&ctx);
     // register `parquet_metadata` table function to get metadata from parquet files
     ctx.register_udtf("parquet_metadata", Arc::new(ParquetMetadataFunc {}));
 

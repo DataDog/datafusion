@@ -42,24 +42,21 @@ use sqlparser::ast::{Expr as SQLExpr, Ident, ObjectName, TableAlias, TableFactor
 ///
 /// [`TableProvider`]: https://docs.rs/datafusion/latest/datafusion/catalog/trait.TableProvider.html
 pub trait ContextProvider {
-    /// Returns a table by reference, if it exists
-    fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>>;
+    /// Resolves a table for a row read. Legacy callers require read access.
+    fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
+        self.get_table_source_with_access(name, TableAccess::Read)
+    }
 
     /// Resolves a table for an operation before the SQL planner uses its schema.
     ///
-    /// The default preserves existing implementations by calling
-    /// [`Self::get_table_source`]. Authorization-aware implementations should
-    /// check the requested access before returning a source, and keep any cache
-    /// scoped to both the table and access. Legacy lookups must also have a
-    /// conservative policy, such as requiring read access or rejecting them.
+    /// Implementations must explicitly handle the intent. Forwarding wrappers
+    /// must preserve it, and caches must distinguish both table and access.
     /// Identity and the mapping from operations to privileges are application-owned.
     fn get_table_source_with_access(
         &self,
         name: TableReference,
-        _access: TableAccess,
-    ) -> Result<Arc<dyn TableSource>> {
-        self.get_table_source(name)
-    }
+        access: TableAccess,
+    ) -> Result<Arc<dyn TableSource>>;
 
     /// Return the type of a file based on its extension (e.g. `.parquet`)
     ///

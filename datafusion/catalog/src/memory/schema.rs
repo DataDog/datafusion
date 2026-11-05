@@ -21,6 +21,7 @@ use crate::{SchemaProvider, TableProvider};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use datafusion_common::{DataFusionError, exec_err};
+use datafusion_expr::TableAccess;
 use std::sync::Arc;
 
 /// Simple in-memory implementation of a schema.
@@ -53,9 +54,10 @@ impl SchemaProvider for MemorySchemaProvider {
             .collect()
     }
 
-    async fn table(
+    async fn table_with_access(
         &self,
         name: &str,
+        _access: TableAccess,
     ) -> datafusion_common::Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
         Ok(self.tables.get(name).map(|table| Arc::clone(table.value())))
     }

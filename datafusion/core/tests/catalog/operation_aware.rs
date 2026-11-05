@@ -135,10 +135,6 @@ impl SchemaProvider for AuthorizedSchema {
         self.tables.keys().cloned().collect()
     }
 
-    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.table_with_access(name, TableAccess::Read).await
-    }
-
     async fn table_with_access(
         &self,
         name: &str,
@@ -366,7 +362,11 @@ async fn write_operations_preserve_target_intent() {
         ("TRUNCATE TABLE target", TableAccess::Truncate),
         (
             "MERGE INTO target AS t USING source AS s ON t.id = s.id WHEN MATCHED THEN DELETE",
-            TableAccess::Merge,
+            TableAccess::Merge {
+                insert: false,
+                update: false,
+                delete: true,
+            },
         ),
     ] {
         let (ctx, schema) = authorized_context();
@@ -384,7 +384,7 @@ async fn write_operations_preserve_target_intent() {
                 .contains(&("target".to_owned(), TableAccess::Read)),
             "{sql}"
         );
-        if access == TableAccess::Merge {
+        if matches!(access, TableAccess::Merge { .. }) {
             assert!(
                 schema
                     .accesses()
@@ -425,7 +425,11 @@ async fn write_target_subqueries_need_independent_read_access() {
         ),
         (
             "MERGE INTO target AS t USING public.target AS s ON t.id = s.id WHEN MATCHED THEN DELETE",
-            TableAccess::Merge,
+            TableAccess::Merge {
+                insert: false,
+                update: false,
+                delete: true,
+            },
         ),
     ] {
         let (ctx, schema) = authorized_context();
@@ -473,7 +477,11 @@ async fn existing_schema_implementations_keep_working() {
         TableAccess::Update,
         TableAccess::Delete,
         TableAccess::Truncate,
-        TableAccess::Merge,
+        TableAccess::Merge {
+            insert: false,
+            update: false,
+            delete: true,
+        },
     ] {
         assert!(
             schema
@@ -566,5 +574,148 @@ async fn dynamic_file_schema_forwards_access_and_only_falls_back_for_missing_tab
             ("target".to_owned(), TableAccess::Read),
             ("file.csv".to_owned(), access),
         ])
+    );
+}
+
+#[tokio::test]
+async fn forwarding_wrapper_cannot_turn_read_permission_into_insert_permission() {
+    let schema = Arc::new(AuthorizedSchema::new());
+    schema.grant("target", TableAccess::Read);
+    let factory = Arc::new(ObservedUrlFactory::default());
+    let wrapped = Arc::new(DynamicFileSchemaProvider::new(
+        Arc::clone(&schema) as Arc<dyn SchemaProvider>,
+        Arc::clone(&factory) as Arc<dyn UrlTableFactory>,
+    ));
+    let ctx = context(wrapped);
+    let error = ctx.sql("INSERT INTO target VALUES (1)").await.unwrap_err();
+    assert_contains!(
+        error.to_string(),
+        "Access denied to target for Insert(Append)"
+    );
+    assert_eq!(schema.tables["target"].schema_calls(), 0);
+    assert_eq!(factory.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        schema.accesses(),
+        HashSet::from([("target".into(), TableAccess::Insert(InsertOp::Append))])
+    );
+}
+
+#[tokio::test]
+async fn metadata_permission_allows_describe_but_not_select() {
+    let (ctx, schema) = authorized_context();
+    schema.grant("target", TableAccess::Metadata);
+    ctx.sql("DESCRIBE target")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        schema.accesses(),
+        HashSet::from([("target".into(), TableAccess::Metadata)])
+    );
+    let calls = schema.tables["target"].schema_calls();
+    let error = ctx.sql("SELECT * FROM target").await.unwrap_err();
+    assert_contains!(error.to_string(), "Access denied to target for Read");
+    assert_eq!(schema.tables["target"].schema_calls(), calls);
+}
+
+#[tokio::test]
+async fn denied_metadata_fails_before_schema_and_does_not_authorize_ddl() {
+    for sql in [
+        "DESCRIBE target",
+        "CREATE INDEX idx ON target(id)",
+        "CREATE TABLE IF NOT EXISTS target(id BIGINT)",
+        "CREATE OR REPLACE VIEW target AS SELECT 1 AS id",
+        "DROP TABLE target",
+        "DROP TABLE IF EXISTS target",
+        "CREATE EXTERNAL TABLE IF NOT EXISTS target STORED AS CSV LOCATION 'missing.csv'",
+    ] {
+        let (ctx, schema) = authorized_context();
+        schema.grant("target", TableAccess::Read);
+        let error = ctx.sql(sql).await.unwrap_err();
+        assert_contains!(error.to_string(), "Access denied to target for Metadata");
+        assert_eq!(schema.tables["target"].schema_calls(), 0, "{sql}");
+    }
+    // Metadata lookup succeeds, but the separate catalog mutation remains denied.
+    let (ctx, schema) = authorized_context();
+    schema.grant("target", TableAccess::Metadata);
+    let error = ctx.sql("DROP TABLE target").await.unwrap_err();
+    assert_contains!(error.to_string(), "does not support deregistering tables");
+}
+
+#[tokio::test]
+async fn merge_prefetch_and_planning_preserve_every_clause_action() {
+    for mask in 1..8 {
+        let access = TableAccess::Merge {
+            insert: mask & 1 != 0,
+            update: mask & 2 != 0,
+            delete: mask & 4 != 0,
+        };
+        let mut sql =
+            "MERGE INTO target AS t USING source AS s ON t.id = s.id".to_owned();
+        if mask & 2 != 0 {
+            sql.push_str(" WHEN MATCHED AND s.id = 1 THEN UPDATE SET id = s.id");
+        }
+        if mask & 4 != 0 {
+            sql.push_str(" WHEN MATCHED THEN DELETE");
+        }
+        if mask & 1 != 0 {
+            sql.push_str(" WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)");
+        }
+        let (ctx, schema) = authorized_context();
+        schema.grant("source", TableAccess::Read);
+        let error = ctx.state().create_logical_plan(&sql).await.unwrap_err();
+        assert_contains!(
+            error.to_string(),
+            format!("Access denied to target for {access:?}")
+        );
+        assert_eq!(schema.tables["target"].schema_calls(), 0);
+        schema.grant("target", access);
+        ctx.state().create_logical_plan(&sql).await.unwrap();
+        assert_eq!(
+            schema.accesses(),
+            HashSet::from([
+                ("target".into(), access),
+                ("source".into(), TableAccess::Read)
+            ])
+        );
+    }
+}
+
+#[tokio::test]
+async fn show_and_information_schema_use_metadata_access() {
+    let schema = Arc::new(AuthorizedSchema::new());
+    let ctx = SessionContext::new_with_config(
+        datafusion::execution::context::SessionConfig::new()
+            .with_information_schema(true),
+    );
+    ctx.catalog("datafusion")
+        .unwrap()
+        .register_schema("public", Arc::clone(&schema) as Arc<dyn SchemaProvider>)
+        .unwrap();
+    for table in ["target", "source"] {
+        schema.grant(table, TableAccess::Metadata);
+    }
+    for sql in [
+        "SHOW COLUMNS FROM target",
+        "SHOW CREATE TABLE target",
+        "SELECT * FROM information_schema.columns",
+        "SELECT * FROM information_schema.views",
+        "SELECT * FROM information_schema.tables",
+    ] {
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        assert!(
+            schema
+                .accesses()
+                .iter()
+                .all(|(_, access)| *access == TableAccess::Metadata),
+            "{sql}"
+        );
+    }
+    assert!(
+        schema
+            .accesses()
+            .contains(&("target".into(), TableAccess::Metadata))
     );
 }

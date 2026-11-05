@@ -1577,7 +1577,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let table = self.object_name_to_table_reference(table_name)?;
                 let table_schema = self
                     .context_provider
-                    .get_table_source_with_access(table.clone(), TableAccess::Read)?
+                    .get_table_source_with_access(table.clone(), TableAccess::Metadata)?
                     .schema()
                     .to_dfschema_ref()?;
                 let using: Option<String> =
@@ -1654,7 +1654,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
         let table_source = self
             .context_provider
-            .get_table_source_with_access(table_ref, TableAccess::Read)?;
+            .get_table_source_with_access(table_ref, TableAccess::Metadata)?;
 
         let schema = table_source.schema();
 
@@ -2501,9 +2501,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             _ => plan_err!("Cannot MERGE INTO non-table relation!")?,
         };
         let target_table_ref = self.object_name_to_table_reference(target_table_name)?;
-        let target_table_source = self
-            .context_provider
-            .get_table_source_with_access(target_table_ref.clone(), TableAccess::Merge)?;
+        let target_table_source = self.context_provider.get_table_source_with_access(
+            target_table_ref.clone(),
+            crate::resolve::merge_table_access(&clauses),
+        )?;
         // Use alias as schema qualifier so `t.col` resolves when user writes
         // `MERGE INTO target AS t`. Fall back to the table reference itself.
         let target_qualifier = target_alias
@@ -3021,7 +3022,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let table_ref = self.object_name_to_table_reference(sql_table_name)?;
         let _ = self
             .context_provider
-            .get_table_source_with_access(table_ref, TableAccess::Read)?;
+            .get_table_source_with_access(table_ref, TableAccess::Metadata)?;
 
         // Treat both FULL and EXTENDED as the same
         let select_list = if full || extended {
@@ -3176,7 +3177,7 @@ FROM (
         let table_ref = self.object_name_to_table_reference(sql_table_name)?;
         let _ = self
             .context_provider
-            .get_table_source_with_access(table_ref, TableAccess::Read)?;
+            .get_table_source_with_access(table_ref, TableAccess::Metadata)?;
 
         let query = format!(
             "SELECT table_catalog, table_schema, table_name, definition FROM information_schema.views WHERE {where_clause}"

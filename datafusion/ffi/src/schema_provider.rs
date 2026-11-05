@@ -22,6 +22,7 @@ use async_ffi::{FfiFuture, FutureExt};
 use async_trait::async_trait;
 use datafusion_catalog::{SchemaProvider, TableProvider};
 use datafusion_common::error::{DataFusionError, Result};
+use datafusion_expr::TableAccess;
 use datafusion_proto::logical_plan::{
     DefaultLogicalExtensionCodec, LogicalExtensionCodec,
 };
@@ -325,10 +326,18 @@ impl SchemaProvider for ForeignSchemaProvider {
         }
     }
 
-    async fn table(
+    async fn table_with_access(
         &self,
         name: &str,
+        access: TableAccess,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
+        // The legacy FFI ABI carries no access intent. Never downgrade a request
+        // that the foreign provider cannot authorize to a read lookup.
+        if access != TableAccess::Read {
+            return datafusion_common::not_impl_err!(
+                "Foreign schema provider cannot resolve operation {access:?}; the FFI ABI only supports Read"
+            );
+        }
         unsafe {
             let table: Option<FFI_TableProvider> =
                 df_result!((self.0.table)(&self.0, name.into()).await)?.into();
@@ -389,6 +398,47 @@ mod tests {
 
     fn empty_table() -> Arc<dyn TableProvider> {
         Arc::new(EmptyTable::new(Arc::new(Schema::empty())))
+    }
+
+    #[tokio::test]
+    async fn foreign_schema_rejects_operations_missing_from_legacy_abi() {
+        use datafusion_expr::{TableAccess, dml::InsertOp};
+        let schema = Arc::new(MemorySchemaProvider::new());
+        schema
+            .register_table("target".into(), empty_table())
+            .unwrap();
+        let (_ctx, task_ctx_provider) = crate::util::tests::test_session_and_ctx();
+        let mut ffi = FFI_SchemaProvider::new(schema, None, task_ctx_provider, None);
+        let local: Arc<dyn SchemaProvider> = (&ffi).into();
+        assert!(
+            local
+                .table_with_access("target", TableAccess::Metadata)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        ffi.library_marker_id = crate::mock_foreign_marker_id;
+        let foreign: Arc<dyn SchemaProvider> = (&ffi).into();
+        assert!(foreign.downcast_ref::<ForeignSchemaProvider>().is_some());
+        assert!(foreign.table("target").await.unwrap().is_some());
+        for access in [
+            TableAccess::Metadata,
+            TableAccess::Insert(InsertOp::Append),
+            TableAccess::Update,
+            TableAccess::Delete,
+            TableAccess::Truncate,
+            TableAccess::Merge {
+                insert: true,
+                update: true,
+                delete: true,
+            },
+        ] {
+            let error = foreign
+                .table_with_access("target", access)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("FFI ABI only supports Read"));
+        }
     }
 
     #[tokio::test]

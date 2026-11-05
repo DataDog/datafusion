@@ -19,7 +19,7 @@
 //! representing collections of named tables.
 
 use async_trait::async_trait;
-use datafusion_common::{DataFusionError, exec_err};
+use datafusion_common::exec_err;
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -44,38 +44,35 @@ pub trait SchemaProvider: Any + Debug + Sync + Send {
     /// Retrieves the list of available table names in this schema.
     fn table_names(&self) -> Vec<String>;
 
-    /// Retrieves a specific table from the schema by name, if it exists,
-    /// otherwise returns `None`.
-    async fn table(
-        &self,
-        name: &str,
-    ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError>;
+    /// Resolves a table for a row read. Legacy callers require read access.
+    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        self.table_with_access(name, TableAccess::Read).await
+    }
 
     /// Resolves a table for an operation before the planner uses its schema.
     ///
-    /// The default calls [`Self::table`], preserving existing catalogs. A catalog
-    /// that enforces authorization should check `access` before returning the
-    /// provider. The catalog can capture caller identity and query context;
-    /// DataFusion does not prescribe a privilege model.
-    ///
-    /// Protected catalogs must also define a conservative policy for legacy
-    /// [`Self::table`] calls, such as requiring read access or rejecting them.
-    /// Overriding this method alone does not protect legacy callers, metadata
-    /// enumeration, externally supplied plans, or provider execution methods.
+    /// Implementations must explicitly handle the intent. Forwarding wrappers
+    /// must preserve it; authorizing catalogs must check it before returning a
+    /// provider. Identity and privilege mapping belong to the application.
+    /// Metadata access does not authorize DDL or metadata enumeration.
+    /// Provider execution and externally supplied plans require separate checks.
     async fn table_with_access(
         &self,
         name: &str,
-        _access: TableAccess,
-    ) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.table(name).await
-    }
+        access: TableAccess,
+    ) -> Result<Option<Arc<dyn TableProvider>>>;
 
     /// Retrieves the type of a specific table from the schema by name, if it exists, otherwise
     /// returns `None`.  Implementations for which this operation is cheap but [Self::table] is
     /// expensive can override this to improve operations that only need the type, e.g.
     /// `SELECT * FROM information_schema.tables`.
+    ///
+    /// The default requests [`TableAccess::Metadata`]. Overrides must enforce
+    /// their own metadata visibility policy.
     async fn table_type(&self, name: &str) -> Result<Option<TableType>> {
-        self.table(name).await.map(|o| o.map(|t| t.table_type()))
+        self.table_with_access(name, TableAccess::Metadata)
+            .await
+            .map(|o| o.map(|t| t.table_type()))
     }
 
     /// If supported by the implementation, adds a new table named `name` to

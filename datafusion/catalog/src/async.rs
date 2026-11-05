@@ -34,24 +34,18 @@ struct ResolvedSchemaProvider {
 }
 
 #[derive(Debug)]
-enum ResolvedTableCache {
-    Legacy(HashMap<String, Arc<dyn TableProvider>>),
-    WithAccess(HashMap<(String, TableAccess), Arc<dyn TableProvider>>),
-}
+struct ResolvedTableCache(HashMap<(String, TableAccess), Arc<dyn TableProvider>>);
 
 impl ResolvedTableCache {
     fn new(
         tables: HashMap<(String, TableAccess), Option<Arc<dyn TableProvider>>>,
-        access_aware: bool,
     ) -> Self {
-        let tables = tables
-            .into_iter()
-            .filter_map(|(key, table)| table.map(|table| (key, table)));
-        if access_aware {
-            Self::WithAccess(tables.collect())
-        } else {
-            Self::Legacy(tables.map(|((name, _), table)| (name, table)).collect())
-        }
+        Self(
+            tables
+                .into_iter()
+                .filter_map(|(key, table)| table.map(|table| (key, table)))
+                .collect(),
+        )
     }
 }
 #[async_trait]
@@ -61,19 +55,13 @@ impl SchemaProvider for ResolvedSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        match &self.cached_tables {
-            ResolvedTableCache::Legacy(tables) => tables.keys().cloned().collect(),
-            ResolvedTableCache::WithAccess(tables) => tables
-                .keys()
-                .map(|(name, _)| name.clone())
-                .collect::<datafusion_common::HashSet<_>>()
-                .into_iter()
-                .collect(),
-        }
-    }
-
-    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.table_with_access(name, TableAccess::Read).await
+        self.cached_tables
+            .0
+            .keys()
+            .map(|(name, _)| name.clone())
+            .collect::<datafusion_common::HashSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     async fn table_with_access(
@@ -81,21 +69,15 @@ impl SchemaProvider for ResolvedSchemaProvider {
         name: &str,
         access: TableAccess,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
-        Ok(match &self.cached_tables {
-            ResolvedTableCache::Legacy(tables) => tables.get(name).cloned(),
-            ResolvedTableCache::WithAccess(tables) => {
-                if let Some(table) = tables.get(&(name.to_string(), access)) {
-                    Some(Arc::clone(table))
-                } else if tables.keys().any(|(table, _)| table == name) {
-                    // An unresolved operation must not trigger missing-table fallbacks.
-                    return plan_err!(
-                        "Table '{name}' was not resolved for operation {access:?}"
-                    );
-                } else {
-                    None
-                }
-            }
-        })
+        let tables = &self.cached_tables.0;
+        if let Some(table) = tables.get(&(name.to_string(), access)) {
+            Ok(Some(Arc::clone(table)))
+        } else if tables.keys().any(|(table, _)| table == name) {
+            // An unresolved operation must not trigger missing-table fallbacks.
+            plan_err!("Table '{name}' was not resolved for operation {access:?}")
+        } else {
+            Ok(None)
+        }
     }
 
     fn register_table(
@@ -115,12 +97,7 @@ impl SchemaProvider for ResolvedSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        match &self.cached_tables {
-            ResolvedTableCache::Legacy(tables) => tables.contains_key(name),
-            ResolvedTableCache::WithAccess(tables) => {
-                tables.keys().any(|(table, _)| table == name)
-            }
-        }
+        self.cached_tables.0.keys().any(|(table, _)| table == name)
     }
 }
 
@@ -129,19 +106,13 @@ struct ResolvedSchemaProviderBuilder {
     owner_name: String,
     async_provider: Arc<dyn AsyncSchemaProvider>,
     cached_tables: HashMap<(String, TableAccess), Option<Arc<dyn TableProvider>>>,
-    access_aware: bool,
 }
 impl ResolvedSchemaProviderBuilder {
-    fn new(
-        owner_name: String,
-        async_provider: Arc<dyn AsyncSchemaProvider>,
-        access_aware: bool,
-    ) -> Self {
+    fn new(owner_name: String, async_provider: Arc<dyn AsyncSchemaProvider>) -> Self {
         Self {
             owner_name,
             async_provider,
             cached_tables: HashMap::new(),
-            access_aware,
         }
     }
 
@@ -152,21 +123,17 @@ impl ResolvedSchemaProviderBuilder {
     ) -> Result<()> {
         let key = (table_name.to_string(), access);
         if !self.cached_tables.contains_key(&key) {
-            let resolved_table = if self.access_aware {
-                self.async_provider
-                    .table_with_access(table_name, access)
-                    .await?
-            } else {
-                self.async_provider.table(table_name).await?
-            };
+            let resolved_table = self
+                .async_provider
+                .table_with_access(table_name, access)
+                .await?;
             self.cached_tables.insert(key, resolved_table);
         }
         Ok(())
     }
 
     fn finish(self) -> Arc<dyn SchemaProvider> {
-        let cached_tables =
-            ResolvedTableCache::new(self.cached_tables, self.access_aware);
+        let cached_tables = ResolvedTableCache::new(self.cached_tables);
         Arc::new(ResolvedSchemaProvider {
             owner_name: Some(self.owner_name),
             cached_tables,
@@ -257,20 +224,18 @@ impl CatalogProviderList for ResolvedCatalogProviderList {
 /// [remote_catalog.rs]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/data_io/remote_catalog.rs
 #[async_trait]
 pub trait AsyncSchemaProvider: Send + Sync {
-    /// Lookup a table in the schema provider
-    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>>;
+    /// Resolves a table for a row read. Legacy callers require read access.
+    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        self.table_with_access(name, TableAccess::Read).await
+    }
 
     /// Resolve a table for an operation before its schema is used.
-    ///
-    /// The default delegates to [`Self::table`]. Authorization-aware providers
-    /// should override this method and make legacy lookups conservative.
+    /// Implementations must handle access explicitly; wrappers must forward it.
     async fn table_with_access(
         &self,
         name: &str,
-        _access: TableAccess,
-    ) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.table(name).await
-    }
+        access: TableAccess,
+    ) -> Result<Option<Arc<dyn TableProvider>>>;
 
     /// Creates a cached provider that can be used to execute a query containing given references
     ///
@@ -278,8 +243,8 @@ pub trait AsyncSchemaProvider: Send + Sync {
     /// providers.  This cache will be returned as a synchronous TableProvider that can be used to plan
     /// and execute a query containing the given references.
     ///
-    /// This legacy cache does not distinguish operations. Use
-    /// [`Self::resolve_with_access`] for operation-aware authorization.
+    /// This convenience method resolves only row reads; its cache rejects writes. Use
+    /// [`Self::resolve_with_access`] to resolve other operations.
     ///
     /// This cache is intended to be short-lived for the execution of a single query.  There is no mechanism
     /// for refresh or eviction of stale entries.
@@ -342,8 +307,8 @@ pub trait AsyncCatalogProvider: Send + Sync {
     /// synchronous CatalogProvider that can be used to plan and execute a query containing the given
     /// references.
     ///
-    /// This legacy cache does not distinguish operations. Use
-    /// [`Self::resolve_with_access`] for operation-aware authorization.
+    /// This convenience method resolves only row reads; its cache rejects writes. Use
+    /// [`Self::resolve_with_access`] to resolve other operations.
     ///
     /// This cache is intended to be short-lived for the execution of a single query.  There is no mechanism
     /// for refresh or eviction of stale entries.
@@ -399,8 +364,8 @@ pub trait AsyncCatalogProviderList: Send + Sync {
     /// synchronous CatalogProvider that can be used to plan and execute a query containing the given
     /// references.
     ///
-    /// This legacy cache does not distinguish operations. Use
-    /// [`Self::resolve_with_access`] for operation-aware authorization.
+    /// This convenience method resolves only row reads; its cache rejects writes. Use
+    /// [`Self::resolve_with_access`] to resolve other operations.
     ///
     /// This cache is intended to be short-lived for the execution of a single query.  There is no mechanism
     /// for refresh or eviction of stale entries.
@@ -431,10 +396,6 @@ enum TableReferences<'a> {
 }
 
 impl TableReferences<'_> {
-    fn access_aware(&self) -> bool {
-        matches!(self, Self::WithAccess(_))
-    }
-
     fn iter(&self) -> impl Iterator<Item = (&TableReference, TableAccess)> + Send {
         let (legacy, with_access) = match self {
             Self::Legacy(references) => (*references, &[][..]),
@@ -481,18 +442,14 @@ async fn resolve_schema<P: AsyncSchemaProvider + ?Sized>(
 
         let key = (reference.table().to_string(), access);
         if !cached_tables.contains_key(&key) {
-            let resolved_table = if references.access_aware() {
-                provider
-                    .table_with_access(reference.table(), access)
-                    .await?
-            } else {
-                provider.table(reference.table()).await?
-            };
+            let resolved_table = provider
+                .table_with_access(reference.table(), access)
+                .await?;
             cached_tables.insert(key, resolved_table);
         }
     }
 
-    let cached_tables = ResolvedTableCache::new(cached_tables, references.access_aware());
+    let cached_tables = ResolvedTableCache::new(cached_tables);
 
     Ok(Arc::new(ResolvedSchemaProvider {
         cached_tables,
@@ -531,7 +488,6 @@ async fn resolve_catalog<P: AsyncCatalogProvider + ?Sized>(
                 ResolvedSchemaProviderBuilder::new(
                     catalog_name.to_string(),
                     resolved_schema,
-                    references.access_aware(),
                 )
             });
             cached_schemas.insert(schema_name.to_string(), resolved_schema);
@@ -598,11 +554,7 @@ async fn resolve_catalog_list<P: AsyncCatalogProviderList + ?Sized>(
         } else {
             let resolved_schema = catalog.async_provider.schema(schema_name).await?;
             let resolved_schema = resolved_schema.map(|async_schema| {
-                ResolvedSchemaProviderBuilder::new(
-                    catalog_name.to_string(),
-                    async_schema,
-                    references.access_aware(),
-                )
+                ResolvedSchemaProviderBuilder::new(catalog_name.to_string(), async_schema)
             });
             catalog
                 .cached_schemas
@@ -689,7 +641,11 @@ mod tests {
 
     #[async_trait]
     impl AsyncSchemaProvider for MockAsyncSchemaProvider {
-        async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        async fn table_with_access(
+            &self,
+            name: &str,
+            _access: TableAccess,
+        ) -> Result<Option<Arc<dyn TableProvider>>> {
             self.lookup_count.fetch_add(1, Ordering::Release);
             if name == MOCK_TABLE {
                 Ok(Some(Arc::new(MockTableProvider {})))
@@ -706,10 +662,6 @@ mod tests {
 
     #[async_trait]
     impl AsyncSchemaProvider for OperationAwareSchema {
-        async fn table(&self, _name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-            exec_err!("legacy lookup denied")
-        }
-
         async fn table_with_access(
             &self,
             name: &str,
@@ -945,7 +897,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_async_providers_remain_compatible() {
+    async fn legacy_resolution_only_caches_reads() {
         let provider = MockAsyncSchemaProvider::default();
         let insert = TableAccess::Insert(InsertOp::Append);
         let config = test_config();
@@ -959,13 +911,7 @@ mod tests {
             .await
             .unwrap();
         assert!(cached.table(MOCK_TABLE).await.unwrap().is_some());
-        assert!(
-            cached
-                .table_with_access(MOCK_TABLE, insert)
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(cached.table_with_access(MOCK_TABLE, insert).await.is_err());
 
         let cached = provider
             .resolve_with_access(

@@ -220,14 +220,28 @@ fn update_self_subquery_needs_separate_read_access() {
 #[test]
 fn merge_target_and_source_use_distinct_operations() {
     let context = AccessContext::with_access(&[
-        ("target", TableAccess::Merge),
+        (
+            "target",
+            TableAccess::Merge {
+                insert: false,
+                update: false,
+                delete: true,
+            },
+        ),
         ("source", TableAccess::Read),
     ]);
     context.plan("MERGE INTO target USING source ON target.id = source.id WHEN MATCHED THEN DELETE").unwrap();
     assert_eq!(
         context.requests.into_inner(),
         vec![
-            ("target".to_string(), TableAccess::Merge),
+            (
+                "target".to_string(),
+                TableAccess::Merge {
+                    insert: false,
+                    update: false,
+                    delete: true
+                }
+            ),
             ("source".to_string(), TableAccess::Read),
         ]
     );
@@ -246,4 +260,28 @@ fn cte_alias_does_not_lookup_catalog() {
         .plan("WITH source AS (SELECT 1 AS id) SELECT * FROM source")
         .unwrap();
     assert!(context.requests.borrow().is_empty());
+}
+
+#[test]
+fn metadata_lookup_does_not_require_row_reads() {
+    for sql in ["DESCRIBE target", "CREATE INDEX idx ON target(id)"] {
+        let context = AccessContext::with_access(&[("target", TableAccess::Metadata)]);
+        context.plan(sql).unwrap();
+        assert_eq!(
+            *context.requests.borrow(),
+            vec![("target".into(), TableAccess::Metadata)]
+        );
+        let context = AccessContext::with_access(&[("target", TableAccess::Read)]);
+        assert!(
+            context
+                .plan(sql)
+                .unwrap_err()
+                .to_string()
+                .contains("access denied: target Metadata")
+        );
+        assert_eq!(
+            context.tables["target"].schema_calls.load(Ordering::SeqCst),
+            0
+        );
+    }
 }

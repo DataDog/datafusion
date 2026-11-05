@@ -35,6 +35,7 @@ use datafusion_catalog::{
     MemoryCatalogProviderList, MemorySchemaProvider, SchemaProvider, TableProvider,
 };
 use datafusion_common::{Result, exec_err};
+use datafusion_expr::TableAccess;
 
 use crate::catalog_provider::FFI_CatalogProvider;
 use crate::catalog_provider_list::FFI_CatalogProviderList;
@@ -92,8 +93,12 @@ impl SchemaProvider for FixedSchemaProvider {
         self.inner.table_names()
     }
 
-    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.inner.table(name).await
+    async fn table_with_access(
+        &self,
+        name: &str,
+        access: TableAccess,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        self.inner.table_with_access(name, access).await
     }
 
     fn table_exist(&self, name: &str) -> bool {

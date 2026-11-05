@@ -52,7 +52,7 @@ const INFORMATION_SCHEMA_TABLES: &[&str] = &[
 // This avoids a second normalization/conversion pass after visiting the AST.
 struct RelationVisitor {
     relations: BTreeMap<TableReference, Vec<TableAccess>>,
-    write_targets: HashMap<*const ObjectName, TableAccess>,
+    access_targets: HashMap<*const ObjectName, TableAccess>,
     all_ctes: BTreeSet<TableReference>,
     ctes_in_scope: Vec<TableReference>,
     enable_ident_normalization: bool,
@@ -62,7 +62,7 @@ impl RelationVisitor {
     fn new(enable_ident_normalization: bool) -> Self {
         Self {
             relations: BTreeMap::new(),
-            write_targets: HashMap::new(),
+            access_targets: HashMap::new(),
             all_ctes: BTreeSet::new(),
             ctes_in_scope: vec![],
             enable_ident_normalization,
@@ -72,7 +72,7 @@ impl RelationVisitor {
     /// Record the reference to `relation`, if it's not a CTE reference.
     fn insert_relation(&mut self, relation: &ObjectName) -> ControlFlow<DataFusionError> {
         let access = self
-            .write_targets
+            .access_targets
             .get(&std::ptr::from_ref(relation))
             .copied()
             .unwrap_or(TableAccess::Read);
@@ -94,16 +94,16 @@ impl RelationVisitor {
         }
     }
 
-    fn mark_write_target(&mut self, relation: &ObjectName, access: TableAccess) {
+    fn mark_target(&mut self, relation: &ObjectName, access: TableAccess) {
         // Match AST occurrences, not names: INSERT INTO t SELECT * FROM t needs
         // separate insert and read lookups. These pointers are never dereferenced.
-        self.write_targets
+        self.access_targets
             .insert(std::ptr::from_ref(relation), access);
     }
 
-    fn mark_write_table(&mut self, table: &TableFactor, access: TableAccess) {
+    fn mark_table(&mut self, table: &TableFactor, access: TableAccess) {
         if let TableFactor::Table { name, .. } = table {
-            self.mark_write_target(name, access);
+            self.mark_target(name, access);
         }
     }
 }
@@ -116,6 +116,12 @@ impl Visitor for RelationVisitor {
     }
 
     fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<Self::Break> {
+        if let SetExpr::Select(select) = q.body.as_ref()
+            && let Some(into) = &select.into
+        {
+            self.mark_target(&into.name, TableAccess::Metadata);
+            self.insert_relation(&into.name)?;
+        }
         if let Some(with) = &q.with {
             for cte in &with.cte_tables {
                 // The non-recursive CTE name is not in scope when evaluating the CTE itself, so this is valid:
@@ -168,25 +174,68 @@ impl Visitor for RelationVisitor {
                             );
                         }
                     };
-                    self.mark_write_target(name, TableAccess::Insert(operation));
+                    self.mark_target(name, TableAccess::Insert(operation));
                 }
             }
             Statement::Update(update) => {
-                self.mark_write_table(&update.table.relation, TableAccess::Update);
+                self.mark_table(&update.table.relation, TableAccess::Update);
             }
             Statement::Delete(delete) => {
                 let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) =
                     &delete.from;
                 for table in from {
-                    self.mark_write_table(&table.relation, TableAccess::Delete);
+                    self.mark_table(&table.relation, TableAccess::Delete);
                 }
             }
             Statement::Merge(merge) => {
-                self.mark_write_table(&merge.table, TableAccess::Merge);
+                self.mark_table(&merge.table, merge_table_access(&merge.clauses));
             }
             Statement::Truncate(truncate) => {
                 for table in &truncate.table_names {
-                    self.mark_write_target(&table.name, TableAccess::Truncate);
+                    self.mark_target(&table.name, TableAccess::Truncate);
+                }
+            }
+            Statement::ExplainTable { table_name, .. } => {
+                self.mark_target(table_name, TableAccess::Metadata);
+                self.insert_relation(table_name)?;
+            }
+            Statement::ShowCreate { obj_name, .. } => {
+                self.mark_target(obj_name, TableAccess::Metadata);
+            }
+            Statement::ShowColumns { show_options, .. } => {
+                if let Some(name) = show_options
+                    .show_in
+                    .as_ref()
+                    .and_then(|show_in| show_in.parent_name.as_ref())
+                {
+                    self.mark_target(name, TableAccess::Metadata);
+                    self.insert_relation(name)?;
+                }
+            }
+            Statement::CreateIndex(index) => {
+                self.mark_target(&index.table_name, TableAccess::Metadata);
+                self.insert_relation(&index.table_name)?;
+            }
+            Statement::CreateTable(table) => {
+                self.mark_target(&table.name, TableAccess::Metadata);
+                self.insert_relation(&table.name)?;
+            }
+            Statement::CreateView(view) => {
+                self.mark_target(&view.name, TableAccess::Metadata);
+                self.insert_relation(&view.name)?;
+            }
+            Statement::AlterTable(table) => {
+                self.mark_target(&table.name, TableAccess::Metadata);
+                self.insert_relation(&table.name)?;
+            }
+            Statement::Drop {
+                object_type: ObjectType::Table | ObjectType::View,
+                names,
+                ..
+            } => {
+                for name in names {
+                    self.mark_target(name, TableAccess::Metadata);
+                    self.insert_relation(name)?;
                 }
             }
             _ => {}
@@ -234,6 +283,23 @@ impl Visitor for RelationVisitor {
     }
 }
 
+/// Determine all possible target mutations before resolving the target schema.
+pub(crate) fn merge_table_access(clauses: &[MergeClause]) -> TableAccess {
+    let (mut insert, mut update, mut delete) = (false, false, false);
+    for clause in clauses {
+        match clause.action {
+            MergeAction::Insert(_) => insert = true,
+            MergeAction::Update(_) => update = true,
+            MergeAction::Delete { .. } => delete = true,
+        }
+    }
+    TableAccess::Merge {
+        insert,
+        update,
+        delete,
+    }
+}
+
 fn control_flow_to_result(flow: ControlFlow<DataFusionError>) -> Result<()> {
     match flow {
         ControlFlow::Continue(()) => Ok(()),
@@ -247,6 +313,7 @@ fn visit_statement(statement: &DFStatement, visitor: &mut RelationVisitor) -> Re
             control_flow_to_result(s.as_ref().visit(visitor))?;
         }
         DFStatement::CreateExternalTable(table) => {
+            visitor.mark_target(&table.name, TableAccess::Metadata);
             control_flow_to_result(visitor.insert_relation(&table.name))?;
         }
         DFStatement::CopyTo(CopyToStatement { source, .. }) => match source {
@@ -321,7 +388,7 @@ pub type TableReferencesWithAccess = Vec<(TableReference, TableAccess)>;
 /// Write targets use their specific operation, while query sources use [`TableAccess::Read`].
 /// A table used as both a target and a source appears once for each distinct operation.
 /// CTE aliases are excluded from table references and returned separately. Metadata and
-/// DDL lookups conservatively use [`TableAccess::Read`]; this is not a DDL authorization API.
+/// DDL target lookups use [`TableAccess::Metadata`]; this does not authorize the DDL command.
 ///
 /// Prefetch caches must retain the access alongside the table reference so that a provider
 /// authorized for one operation cannot satisfy a lookup for another operation.
@@ -395,7 +462,17 @@ mod tests {
             ("TRUNCATE TABLE t", vec![("t", Truncate)]),
             (
                 "MERGE INTO t USING t AS s ON t.id = s.id WHEN MATCHED THEN DELETE",
-                vec![("t", Merge), ("t", Read)],
+                vec![
+                    (
+                        "t",
+                        Merge {
+                            insert: false,
+                            update: false,
+                            delete: true,
+                        },
+                    ),
+                    ("t", Read),
+                ],
             ),
             (
                 "EXPLAIN INSERT INTO dst SELECT * FROM src",
@@ -420,6 +497,39 @@ mod tests {
                 .map(|(name, access)| (name.to_string(), *access))
                 .collect();
             assert_eq!(tables, expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn metadata_and_ddl_targets_are_distinct_from_query_sources() {
+        use crate::parser::DFParser;
+        for sql in [
+            "DESCRIBE target",
+            "SHOW COLUMNS FROM target",
+            "SHOW CREATE TABLE target",
+            "CREATE INDEX idx ON target(id)",
+            "CREATE TABLE target AS SELECT * FROM source",
+            "CREATE VIEW target AS SELECT * FROM source",
+            "SELECT * INTO target FROM source",
+            "DROP TABLE target",
+        ] {
+            let statement = DFParser::parse_sql(sql).unwrap().pop_back().unwrap();
+            let (tables, _) =
+                resolve_table_references_with_access(&statement, true).unwrap();
+            assert!(
+                tables.contains(&(TableReference::bare("target"), TableAccess::Metadata)),
+                "{sql}: {tables:?}"
+            );
+            assert!(
+                !tables.contains(&(TableReference::bare("target"), TableAccess::Read)),
+                "{sql}"
+            );
+            if sql.contains("FROM source") {
+                assert!(
+                    tables.contains(&(TableReference::bare("source"), TableAccess::Read)),
+                    "{sql}"
+                );
+            }
         }
     }
 

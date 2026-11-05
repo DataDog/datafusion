@@ -1446,6 +1446,7 @@ mod tests {
 
     use datafusion_common::TableReference;
     use datafusion_common::config::ConfigOptions;
+    use datafusion_expr::TableAccess;
     use datafusion_expr::logical_plan::builder::LogicalTableSource;
     use datafusion_expr::{
         AggregateUDF, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF,
@@ -1478,7 +1479,11 @@ mod tests {
     }
 
     impl ContextProvider for TestContextProvider {
-        fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
+        fn get_table_source_with_access(
+            &self,
+            name: TableReference,
+            _access: TableAccess,
+        ) -> Result<Arc<dyn TableSource>> {
             match self.tables.get(name.table()) {
                 Some(table) => Ok(Arc::clone(table)),
                 _ => plan_err!("Table not found: {}", name.table()),

@@ -43,7 +43,7 @@ use datafusion::logical_expr::async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl};
 use datafusion::logical_expr::planner::TypePlanner;
 use datafusion::logical_expr::{
     ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    Volatility, create_udf,
+    TableAccess, Volatility, create_udf,
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::*;
@@ -254,9 +254,10 @@ impl SchemaProvider for StrictOrdersSchema {
         vec!["orders".to_string()]
     }
 
-    async fn table(
+    async fn table_with_access(
         &self,
         name: &str,
+        _access: TableAccess,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
         match name {
             "orders" => Ok(Some(Arc::clone(&self.orders))),

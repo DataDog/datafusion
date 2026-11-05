@@ -19,7 +19,12 @@ use std::sync::{Arc, Weak};
 
 use crate::object_storage::{AwsOptions, GcpOptions, get_object_store};
 
-use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider};
+use datafusion::catalog::{
+    CatalogProvider, CatalogProviderList, DynamicFileCatalog, SchemaProvider,
+    UrlTableFactory,
+};
+use datafusion::datasource::dynamic_file::DynamicListTableFactory;
+use datafusion::prelude::SessionContext;
 
 use datafusion::common::plan_datafusion_err;
 use datafusion::datasource::TableProvider;
@@ -27,10 +32,31 @@ use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::logical_expr::TableAccess;
 
 use async_trait::async_trait;
 use dirs::home_dir;
 use parking_lot::RwLock;
+
+/// Enable file queries with object-store registration after catalog lookup.
+pub fn register_dynamic_catalog(ctx: &SessionContext) {
+    let factory = Arc::new(DynamicListTableFactory::default());
+    factory.session_store().with_state(ctx.state_weak_ref());
+    register_dynamic_catalog_with_factory(ctx, factory);
+}
+
+fn register_dynamic_catalog_with_factory(
+    ctx: &SessionContext,
+    factory: Arc<dyn UrlTableFactory>,
+) {
+    let catalog = Arc::new(DynamicObjectStoreCatalog::new(
+        Arc::clone(ctx.state().catalog_list()),
+        ctx.state_weak_ref(),
+    ));
+    // File inference needs a registered store. Catalog errors must propagate
+    // before either fallback, rather than triggering object-store registration.
+    ctx.register_catalog_list(Arc::new(DynamicFileCatalog::new(catalog, factory)));
+}
 
 /// Wraps another catalog, automatically register require object stores for the file locations
 #[derive(Debug)]
@@ -137,11 +163,12 @@ impl SchemaProvider for DynamicObjectStoreSchemaProvider {
         self.inner.register_table(name, table)
     }
 
-    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        let inner_table = self.inner.table(name).await;
-        if inner_table.is_ok()
-            && let Some(inner_table) = inner_table?
-        {
+    async fn table_with_access(
+        &self,
+        name: &str,
+        access: TableAccess,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        if let Some(inner_table) = self.inner.table_with_access(name, access).await? {
             return Ok(Some(inner_table));
         }
 
@@ -193,7 +220,7 @@ impl SchemaProvider for DynamicObjectStoreSchemaProvider {
                 state.runtime_env().register_object_store(url, store);
             }
         }
-        self.inner.table(name).await
+        self.inner.table_with_access(name, access).await
     }
 
     fn deregister_table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
@@ -223,6 +250,121 @@ mod tests {
 
     use datafusion::catalog::SchemaProvider;
     use datafusion::prelude::SessionContext;
+
+    #[derive(Debug)]
+    struct ReadOnlySchema;
+
+    #[async_trait]
+    impl SchemaProvider for ReadOnlySchema {
+        fn table_names(&self) -> Vec<String> {
+            vec![]
+        }
+        fn table_exist(&self, _: &str) -> bool {
+            false
+        }
+        async fn table_with_access(
+            &self,
+            _: &str,
+            access: TableAccess,
+        ) -> Result<Option<Arc<dyn TableProvider>>> {
+            if access != TableAccess::Read {
+                return datafusion::common::plan_err!("operation denied: {access:?}");
+            }
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_insert_does_not_enter_object_store_fallback() {
+        let wrapper =
+            DynamicObjectStoreSchemaProvider::new(Arc::new(ReadOnlySchema), Weak::new());
+        let error = wrapper
+            .table_with_access(
+                "target",
+                TableAccess::Insert(datafusion::logical_expr::dml::InsertOp::Append),
+            )
+            .await
+            .unwrap_err();
+        // The dead session reference would produce "locking error" if fallback ran.
+        assert!(
+            error
+                .to_string()
+                .contains("operation denied: Insert(Append)")
+        );
+    }
+
+    #[derive(Debug)]
+    struct StoreCheckingFactory {
+        runtime: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl UrlTableFactory for StoreCheckingFactory {
+        async fn try_new(&self, url: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+            self.runtime.object_store(ListingTableUrl::parse(url)?)?;
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_catalog_registers_store_before_file_inference() {
+        let ctx = SessionContext::new();
+        ctx.catalog("datafusion")
+            .unwrap()
+            .register_schema("public", Arc::new(ReadOnlySchema))
+            .unwrap();
+        let factory = Arc::new(StoreCheckingFactory {
+            runtime: ctx.runtime_env(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        register_dynamic_catalog_with_factory(
+            &ctx,
+            Arc::clone(&factory) as Arc<dyn UrlTableFactory>,
+        );
+        let schema = ctx.catalog("datafusion").unwrap().schema("public").unwrap();
+        let location = "http://example.com/file.csv";
+        let error = schema
+            .table_with_access(
+                location,
+                TableAccess::Insert(datafusion::logical_expr::dml::InsertOp::Append),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("operation denied: Insert(Append)")
+        );
+        assert!(
+            ctx.runtime_env()
+                .object_store(ListingTableUrl::parse(location).unwrap())
+                .is_err()
+        );
+        assert_eq!(factory.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(schema.table(location).await.unwrap().is_none());
+        assert_eq!(factory.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn dynamic_catalog_reads_a_local_csv() {
+        let path = format!(
+            "{}/csv/aggregate_test_100.csv",
+            datafusion::common::test_util::arrow_test_data()
+        );
+        let ctx = SessionContext::new();
+        register_dynamic_catalog(&ctx);
+        let batches = ctx
+            .table(path.as_str())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert!(batches.iter().any(|batch| batch.num_rows() > 0));
+    }
 
     fn setup_context() -> (SessionContext, Arc<dyn SchemaProvider>) {
         let ctx = SessionContext::new();

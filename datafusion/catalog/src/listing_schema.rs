@@ -17,6 +17,7 @@
 
 //! [`ListingSchemaProvider`]: [`SchemaProvider`] that scans ObjectStores for tables automatically
 
+use datafusion_expr::TableAccess;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -154,9 +155,10 @@ impl SchemaProvider for ListingSchemaProvider {
             .collect()
     }
 
-    async fn table(
+    async fn table_with_access(
         &self,
         name: &str,
+        _access: TableAccess,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
         Ok(self
             .tables

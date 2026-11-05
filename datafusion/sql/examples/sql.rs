@@ -23,7 +23,8 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Result, TableReference, plan_err};
 use datafusion_expr::planner::ExprPlanner;
 use datafusion_expr::{
-    AggregateUDF, ScalarUDF, TableSource, logical_plan::builder::LogicalTableSource,
+    AggregateUDF, ScalarUDF, TableAccess, TableSource,
+    logical_plan::builder::LogicalTableSource,
 };
 use datafusion_expr::{HigherOrderUDF, WindowUDF};
 use datafusion_functions::core::planner::CoreFunctionPlanner;
@@ -127,7 +128,11 @@ fn create_table_source(fields: Vec<Field>) -> Arc<dyn TableSource> {
 }
 
 impl ContextProvider for MyContextProvider {
-    fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
+    fn get_table_source_with_access(
+        &self,
+        name: TableReference,
+        _access: TableAccess,
+    ) -> Result<Arc<dyn TableSource>> {
         match self.tables.get(name.table()) {
             Some(table) => Ok(Arc::clone(table)),
             _ => plan_err!("Table not found: {}", name.table()),

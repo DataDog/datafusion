@@ -2417,7 +2417,7 @@ mod tests {
     use datafusion_common::{DFSchema, ResolvedTableReference, Result, TableReference};
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::Expr;
-    use datafusion_expr::HigherOrderUDF;
+    use datafusion_expr::{HigherOrderUDF, TableAccess};
     use datafusion_optimizer::Optimizer;
     use datafusion_optimizer::optimizer::OptimizerRule;
     use datafusion_physical_plan::display::DisplayableExecutionPlan;
@@ -2721,7 +2721,11 @@ mod tests {
     }
 
     impl ContextProvider for MyContextProvider {
-        fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
+        fn get_table_source_with_access(
+            &self,
+            name: TableReference,
+            _access: TableAccess,
+        ) -> Result<Arc<dyn TableSource>> {
             let resolved_table_ref = ResolvedTableReference {
                 catalog: "default".to_string().into(),
                 schema: "public".to_string().into(),

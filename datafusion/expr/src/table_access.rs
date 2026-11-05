@@ -26,15 +26,20 @@ use crate::dml::InsertOp;
 /// catalog or planner context. For example, an application may permit an insert
 /// without granting permission to read the destination.
 ///
+/// Mutations may inspect target rows without a separate [`Self::Read`] lookup.
+/// Applications must require all privileges their policy associates with that
+/// operation; column permissions and row filtering need additional enforcement.
+///
 /// Resolution checks complement provider operation checks. They do not secure
 /// externally supplied plans, arbitrary providers, metadata enumeration, or
-/// distributed execution. DDL and metadata lookups that do not have a dedicated
-/// variant conservatively use [`Self::Read`].
+/// distributed execution. Metadata access does not authorize DDL commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TableAccess {
     /// Read a table, including a source relation within a write statement.
     Read,
+    /// Inspect table metadata without reading rows or authorizing a DDL command.
+    Metadata,
     /// Insert into a table, retaining append, overwrite, and replace intent.
     Insert(InsertOp),
     /// Update rows in a table.
@@ -47,5 +52,13 @@ pub enum TableAccess {
     ///
     /// Unlike [`crate::logical_plan::WriteOp::MergeInto`], this intent does not
     /// contain expressions that require the target schema to have been resolved.
-    Merge,
+    /// Flags include every clause action, whether or not that clause executes.
+    Merge {
+        /// The statement contains an insert clause.
+        insert: bool,
+        /// The statement contains an update clause.
+        update: bool,
+        /// The statement contains a delete clause.
+        delete: bool,
+    },
 }
