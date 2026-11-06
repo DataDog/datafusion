@@ -66,7 +66,7 @@ use datafusion_expr::{
     AggregateUDF, Explain, Expr, HigherOrderUDF, LogicalPlan, ScalarUDF, WindowUDF,
 };
 #[cfg(feature = "sql")]
-use datafusion_expr::{TableAccess, TableSource};
+use datafusion_expr::{TableIntent, TableSource};
 use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_optimizer::{
     Analyzer, AnalyzerRule, Optimizer, OptimizerConfig, OptimizerRule,
@@ -527,6 +527,9 @@ impl SessionState {
 
     /// Resolve all table references in the SQL statement. Does not include CTE references.
     ///
+    /// This collects dependencies without operation intent. Use
+    /// [`Self::resolve_table_references_with_intent`] to prepare catalog lookups.
+    ///
     /// See [`datafusion_sql::resolve::resolve_table_references`] for more information.
     ///
     /// [`datafusion_sql::resolve::resolve_table_references`]: datafusion_sql::resolve::resolve_table_references
@@ -549,14 +552,14 @@ impl SessionState {
     /// CTE references are excluded. A table used for both reading and writing is
     /// returned separately for each operation.
     #[cfg(feature = "sql")]
-    pub fn resolve_table_references_with_access(
+    pub fn resolve_table_references_with_intent(
         &self,
         statement: &Statement,
-    ) -> datafusion_common::Result<Vec<(TableReference, TableAccess)>> {
+    ) -> datafusion_common::Result<Vec<(TableReference, TableIntent)>> {
         let enable_ident_normalization =
             self.config.options().sql_parser.enable_ident_normalization;
         let (table_refs, _) =
-            datafusion_sql::resolve::resolve_table_references_with_access(
+            datafusion_sql::resolve::resolve_table_references_with_intent(
                 statement,
                 enable_ident_normalization,
             )?;
@@ -569,20 +572,20 @@ impl SessionState {
         &self,
         statement: Statement,
     ) -> datafusion_common::Result<LogicalPlan> {
-        let references = self.resolve_table_references_with_access(&statement)?;
+        let references = self.resolve_table_references_with_intent(&statement)?;
 
         let mut provider = SessionContextProvider {
             state: self,
             tables: HashMap::with_capacity(references.len()),
         };
 
-        for (reference, access) in references {
+        for (reference, intent) in references {
             let resolved = self.resolve_table_ref(reference);
-            if let Entry::Vacant(v) = provider.tables.entry((resolved, access)) {
-                let (resolved, access) = v.key();
+            if let Entry::Vacant(v) = provider.tables.entry((resolved, intent)) {
+                let (resolved, intent) = v.key();
                 let table = match self.schema_for_ref(resolved.clone()) {
                     Ok(schema) => schema
-                        .table(&resolved.table, *access)
+                        .table(&resolved.table, *intent)
                         .await?
                         .map(provider_as_source),
                     Err(_) => None,
@@ -1981,7 +1984,7 @@ impl From<SessionState> for SessionStateBuilder {
 #[cfg(feature = "sql")]
 struct SessionContextProvider<'a> {
     state: &'a SessionState,
-    tables: HashMap<(ResolvedTableReference, TableAccess), Option<Arc<dyn TableSource>>>,
+    tables: HashMap<(ResolvedTableReference, TableIntent), Option<Arc<dyn TableSource>>>,
 }
 
 #[cfg(feature = "sql")]
@@ -2005,15 +2008,15 @@ impl ContextProvider for SessionContextProvider<'_> {
     fn get_table_source(
         &self,
         name: TableReference,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> datafusion_common::Result<Option<Arc<dyn TableSource>>> {
         let name = self.state.resolve_table_ref(name);
         self.tables
-            .get(&(name.clone(), access))
+            .get(&(name.clone(), intent))
             .cloned()
             .ok_or_else(|| {
                 plan_datafusion_err!(
-                    "table '{name}' was not resolved for operation {access:?}"
+                    "table '{name}' was not resolved for operation {intent:?}"
                 )
             })
     }
@@ -2416,7 +2419,7 @@ mod tests {
     use datafusion_common::{DFSchema, ResolvedTableReference, Result, TableReference};
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::Expr;
-    use datafusion_expr::{HigherOrderUDF, TableAccess};
+    use datafusion_expr::{HigherOrderUDF, TableIntent};
     use datafusion_optimizer::Optimizer;
     use datafusion_optimizer::optimizer::OptimizerRule;
     use datafusion_physical_plan::display::DisplayableExecutionPlan;
@@ -2723,7 +2726,7 @@ mod tests {
         fn get_table_source(
             &self,
             name: TableReference,
-            _access: TableAccess,
+            _intent: TableIntent,
         ) -> Result<Option<Arc<dyn TableSource>>> {
             let resolved_table_ref = ResolvedTableReference {
                 catalog: "default".to_string().into(),

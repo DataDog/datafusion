@@ -139,7 +139,7 @@ mod tests {
     use datafusion_expr::dml::InsertOp;
     use datafusion_expr::{
         BinaryExpr, LogicalPlanBuilder, Operator, Partitioning as LogicalPartitioning,
-        RangePartitioning as LogicalRangePartitioning, TableAccess,
+        RangePartitioning as LogicalRangePartitioning, TableIntent,
     };
     use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_expr::expressions::{Column, binary};
@@ -884,7 +884,7 @@ mod tests {
         // Convert the source table into a provider so that it can be used in a query
         let source = provider_as_source(source_table);
         let target = session_ctx
-            .table_provider("t", TableAccess::Insert(InsertOp::Append))
+            .table_provider("t", TableIntent::Insert(InsertOp::Append))
             .await?;
         let target = Arc::new(DefaultTableSource::new(target));
         // Create a table scan logical plan to read from the source table

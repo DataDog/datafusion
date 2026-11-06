@@ -31,7 +31,7 @@ use datafusion_catalog::{
 };
 use datafusion_common::test_util::batches_to_string;
 use datafusion_common::{Result, assert_contains, plan_err};
-use datafusion_expr::{Expr, TableAccess, TableType, dml::InsertOp};
+use datafusion_expr::{Expr, TableIntent, TableType, dml::InsertOp};
 use datafusion_physical_plan::ExecutionPlan;
 
 #[derive(Debug)]
@@ -94,8 +94,8 @@ impl TableProvider for ObservedTable {
 #[derive(Debug)]
 struct AuthorizedSchema {
     tables: HashMap<String, Arc<ObservedTable>>,
-    allowed: Mutex<HashSet<(String, TableAccess)>>,
-    calls: Mutex<Vec<(String, TableAccess)>>,
+    allowed: Mutex<HashSet<(String, TableIntent)>>,
+    calls: Mutex<Vec<(String, TableIntent)>>,
 }
 
 impl AuthorizedSchema {
@@ -110,21 +110,21 @@ impl AuthorizedSchema {
         }
     }
 
-    fn grant(&self, name: &str, access: TableAccess) {
+    fn grant(&self, name: &str, intent: TableIntent) {
         self.allowed
             .lock()
             .unwrap()
-            .insert((name.to_owned(), access));
+            .insert((name.to_owned(), intent));
     }
 
-    fn revoke(&self, name: &str, access: TableAccess) {
+    fn revoke(&self, name: &str, intent: TableIntent) {
         self.allowed
             .lock()
             .unwrap()
-            .remove(&(name.to_owned(), access));
+            .remove(&(name.to_owned(), intent));
     }
 
-    fn accesses(&self) -> HashSet<(String, TableAccess)> {
+    fn intents(&self) -> HashSet<(String, TableIntent)> {
         self.calls.lock().unwrap().iter().cloned().collect()
     }
 }
@@ -138,16 +138,16 @@ impl SchemaProvider for AuthorizedSchema {
     async fn table(
         &self,
         name: &str,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.calls.lock().unwrap().push((name.to_owned(), access));
+        self.calls.lock().unwrap().push((name.to_owned(), intent));
         if !self
             .allowed
             .lock()
             .unwrap()
-            .contains(&(name.to_owned(), access))
+            .contains(&(name.to_owned(), intent))
         {
-            return plan_err!("Access denied to {name} for {access:?}");
+            return plan_err!("Access denied to {name} for {intent:?}");
         }
         Ok(self
             .tables
@@ -177,8 +177,8 @@ fn authorized_context() -> (SessionContext, Arc<AuthorizedSchema>) {
 #[tokio::test]
 async fn write_only_insert_executes() {
     let (ctx, schema) = authorized_context();
-    schema.grant("target", TableAccess::Insert(InsertOp::Append));
-    schema.grant("source", TableAccess::Read);
+    schema.grant("target", TableIntent::Insert(InsertOp::Append));
+    schema.grant("source", TableIntent::Read);
 
     for sql in [
         "INSERT INTO target VALUES (1)",
@@ -191,10 +191,10 @@ async fn write_only_insert_executes() {
         );
     }
     assert_eq!(
-        schema.accesses(),
+        schema.intents(),
         HashSet::from([
-            ("target".to_owned(), TableAccess::Insert(InsertOp::Append)),
-            ("source".to_owned(), TableAccess::Read),
+            ("target".to_owned(), TableIntent::Insert(InsertOp::Append)),
+            ("source".to_owned(), TableIntent::Read),
         ])
     );
 }
@@ -202,8 +202,8 @@ async fn write_only_insert_executes() {
 #[tokio::test]
 async fn dataframe_write_table_preserves_insert_intent() {
     let (ctx, schema) = authorized_context();
-    schema.grant("target", TableAccess::Insert(InsertOp::Append));
-    schema.grant("source", TableAccess::Read);
+    schema.grant("target", TableIntent::Insert(InsertOp::Append));
+    schema.grant("source", TableIntent::Read);
 
     let batches = ctx
         .table("source")
@@ -217,10 +217,10 @@ async fn dataframe_write_table_preserves_insert_intent() {
         "+-------+\n| count |\n+-------+\n| 1     |\n+-------+"
     );
     assert_eq!(
-        schema.accesses(),
+        schema.intents(),
         HashSet::from([
-            ("target".to_owned(), TableAccess::Insert(InsertOp::Append)),
-            ("source".to_owned(), TableAccess::Read),
+            ("target".to_owned(), TableIntent::Insert(InsertOp::Append)),
+            ("source".to_owned(), TableIntent::Read),
         ])
     );
 
@@ -255,7 +255,7 @@ async fn unauthorized_source_fails_before_schema() {
         "INSERT INTO target SELECT (SELECT id FROM source)",
     ] {
         let (ctx, schema) = authorized_context();
-        schema.grant("target", TableAccess::Insert(InsertOp::Append));
+        schema.grant("target", TableIntent::Insert(InsertOp::Append));
 
         let err = ctx.sql(sql).await.unwrap_err();
         assert_contains!(err.to_string(), "Access denied to source for Read");
@@ -266,7 +266,7 @@ async fn unauthorized_source_fails_before_schema() {
 #[tokio::test]
 async fn unauthorized_target_fails_before_schema() {
     let (ctx, schema) = authorized_context();
-    schema.grant("source", TableAccess::Read);
+    schema.grant("source", TableIntent::Read);
 
     let err = ctx
         .sql("INSERT INTO target SELECT id FROM source")
@@ -290,22 +290,22 @@ async fn self_insert_requires_read_and_insert_for_all_name_forms() {
         "INSERT INTO target WITH input AS (SELECT id FROM target) SELECT id FROM input",
     ] {
         let (ctx, schema) = authorized_context();
-        schema.grant("target", TableAccess::Insert(InsertOp::Append));
+        schema.grant("target", TableIntent::Insert(InsertOp::Append));
         let err = ctx.sql(sql).await.unwrap_err();
         assert_contains!(err.to_string(), "Access denied to target for Read");
 
-        schema.grant("target", TableAccess::Read);
+        schema.grant("target", TableIntent::Read);
         ctx.sql(sql).await.unwrap();
         assert_eq!(
-            schema.accesses(),
+            schema.intents(),
             HashSet::from([
-                ("target".to_owned(), TableAccess::Insert(InsertOp::Append)),
-                ("target".to_owned(), TableAccess::Read),
+                ("target".to_owned(), TableIntent::Insert(InsertOp::Append)),
+                ("target".to_owned(), TableIntent::Read),
             ]),
             "{sql}"
         );
 
-        schema.revoke("target", TableAccess::Insert(InsertOp::Append));
+        schema.revoke("target", TableIntent::Insert(InsertOp::Append));
         let err = ctx.sql(sql).await.unwrap_err();
         assert_contains!(
             err.to_string(),
@@ -317,7 +317,7 @@ async fn self_insert_requires_read_and_insert_for_all_name_forms() {
 #[tokio::test]
 async fn later_queries_do_not_reuse_previous_authorization() {
     let (ctx, schema) = authorized_context();
-    schema.grant("target", TableAccess::Insert(InsertOp::Append));
+    schema.grant("target", TableIntent::Insert(InsertOp::Append));
     ctx.sql("INSERT INTO target VALUES (1)").await.unwrap();
     let before_read = schema.tables["target"].schema_calls();
 
@@ -325,9 +325,9 @@ async fn later_queries_do_not_reuse_previous_authorization() {
     assert_contains!(err.to_string(), "Access denied to target for Read");
     assert_eq!(schema.tables["target"].schema_calls(), before_read);
 
-    schema.grant("target", TableAccess::Read);
+    schema.grant("target", TableIntent::Read);
     ctx.sql("SELECT * FROM target").await.unwrap();
-    schema.revoke("target", TableAccess::Read);
+    schema.revoke("target", TableIntent::Read);
     let before_revoked_read = schema.tables["target"].schema_calls();
 
     let err = ctx.sql("SELECT * FROM target").await.unwrap_err();
@@ -337,32 +337,32 @@ async fn later_queries_do_not_reuse_previous_authorization() {
 
 #[tokio::test]
 async fn write_operations_preserve_target_intent() {
-    for (sql, access) in [
+    for (sql, intent) in [
         (
             "INSERT INTO target VALUES (1)",
-            TableAccess::Insert(InsertOp::Append),
+            TableIntent::Insert(InsertOp::Append),
         ),
         (
             "INSERT OVERWRITE target VALUES (1)",
-            TableAccess::Insert(InsertOp::Overwrite),
+            TableIntent::Insert(InsertOp::Overwrite),
         ),
         (
             "REPLACE INTO target VALUES (1)",
-            TableAccess::Insert(InsertOp::Replace),
+            TableIntent::Insert(InsertOp::Replace),
         ),
         (
             "INSERT OR REPLACE INTO target VALUES (1)",
-            TableAccess::Insert(InsertOp::Replace),
+            TableIntent::Insert(InsertOp::Replace),
         ),
         (
             "UPDATE target SET id = id + 1 WHERE id = 42",
-            TableAccess::Update,
+            TableIntent::Update,
         ),
-        ("DELETE FROM target WHERE id = 42", TableAccess::Delete),
-        ("TRUNCATE TABLE target", TableAccess::Truncate),
+        ("DELETE FROM target WHERE id = 42", TableIntent::Delete),
+        ("TRUNCATE TABLE target", TableIntent::Truncate),
         (
             "MERGE INTO target AS t USING source AS s ON t.id = s.id WHEN MATCHED THEN DELETE",
-            TableAccess::Merge {
+            TableIntent::Merge {
                 insert: false,
                 update: false,
                 delete: true,
@@ -370,25 +370,25 @@ async fn write_operations_preserve_target_intent() {
         ),
     ] {
         let (ctx, schema) = authorized_context();
-        schema.grant("target", access);
-        schema.grant("source", TableAccess::Read);
+        schema.grant("target", intent);
+        schema.grant("source", TableIntent::Read);
 
         ctx.state().create_logical_plan(sql).await.unwrap();
         assert!(
-            schema.accesses().contains(&("target".to_owned(), access)),
+            schema.intents().contains(&("target".to_owned(), intent)),
             "{sql}"
         );
         assert!(
             !schema
-                .accesses()
-                .contains(&("target".to_owned(), TableAccess::Read)),
+                .intents()
+                .contains(&("target".to_owned(), TableIntent::Read)),
             "{sql}"
         );
-        if matches!(access, TableAccess::Merge { .. }) {
+        if matches!(intent, TableIntent::Merge { .. }) {
             assert!(
                 schema
-                    .accesses()
-                    .contains(&("source".to_owned(), TableAccess::Read))
+                    .intents()
+                    .contains(&("source".to_owned(), TableIntent::Read))
             );
         }
     }
@@ -397,7 +397,7 @@ async fn write_operations_preserve_target_intent() {
 #[tokio::test]
 async fn append_permission_does_not_authorize_overwrite_or_replace() {
     let (ctx, schema) = authorized_context();
-    schema.grant("target", TableAccess::Insert(InsertOp::Append));
+    schema.grant("target", TableIntent::Insert(InsertOp::Append));
     for (sql, operation) in [
         ("INSERT OVERWRITE target VALUES (1)", "Overwrite"),
         ("REPLACE INTO target VALUES (1)", "Replace"),
@@ -414,18 +414,18 @@ async fn append_permission_does_not_authorize_overwrite_or_replace() {
 
 #[tokio::test]
 async fn write_target_subqueries_need_independent_read_access() {
-    for (sql, access) in [
+    for (sql, intent) in [
         (
             "UPDATE target SET id = (SELECT max(id) FROM target)",
-            TableAccess::Update,
+            TableIntent::Update,
         ),
         (
             "DELETE FROM target WHERE id IN (SELECT id FROM target)",
-            TableAccess::Delete,
+            TableIntent::Delete,
         ),
         (
             "MERGE INTO target AS t USING public.target AS s ON t.id = s.id WHEN MATCHED THEN DELETE",
-            TableAccess::Merge {
+            TableIntent::Merge {
                 insert: false,
                 update: false,
                 delete: true,
@@ -433,17 +433,17 @@ async fn write_target_subqueries_need_independent_read_access() {
         ),
     ] {
         let (ctx, schema) = authorized_context();
-        schema.grant("target", access);
+        schema.grant("target", intent);
         let err = ctx.sql(sql).await.unwrap_err();
         assert_contains!(err.to_string(), "Access denied to target for Read");
 
-        schema.grant("target", TableAccess::Read);
+        schema.grant("target", TableIntent::Read);
         ctx.state().create_logical_plan(sql).await.unwrap();
         assert_eq!(
-            schema.accesses(),
+            schema.intents(),
             HashSet::from([
-                ("target".to_owned(), access),
-                ("target".to_owned(), TableAccess::Read),
+                ("target".to_owned(), intent),
+                ("target".to_owned(), TableIntent::Read),
             ]),
             "{sql}"
         );
@@ -453,9 +453,9 @@ async fn write_target_subqueries_need_independent_read_access() {
 #[tokio::test]
 async fn read_lookup_requires_read_permission() {
     let (ctx, schema) = authorized_context();
-    schema.grant("target", TableAccess::Insert(InsertOp::Append));
+    schema.grant("target", TableIntent::Insert(InsertOp::Append));
 
-    let err = schema.table("target", TableAccess::Read).await.unwrap_err();
+    let err = schema.table("target", TableIntent::Read).await.unwrap_err();
     assert_contains!(err.to_string(), "Access denied to target for Read");
     let err = ctx.table("target").await.unwrap_err();
     assert_contains!(err.to_string(), "Access denied to target for Read");
@@ -469,22 +469,22 @@ async fn existing_schema_implementations_keep_working() {
         .register_table("target".to_owned(), Arc::new(ObservedTable::new()))
         .unwrap();
 
-    for access in [
-        TableAccess::Read,
-        TableAccess::Insert(InsertOp::Append),
-        TableAccess::Insert(InsertOp::Overwrite),
-        TableAccess::Insert(InsertOp::Replace),
-        TableAccess::Update,
-        TableAccess::Delete,
-        TableAccess::Truncate,
-        TableAccess::Merge {
+    for intent in [
+        TableIntent::Read,
+        TableIntent::Insert(InsertOp::Append),
+        TableIntent::Insert(InsertOp::Overwrite),
+        TableIntent::Insert(InsertOp::Replace),
+        TableIntent::Update,
+        TableIntent::Delete,
+        TableIntent::Truncate,
+        TableIntent::Merge {
             insert: false,
             update: false,
             delete: true,
         },
     ] {
-        assert!(schema.table("target", access).await.unwrap().is_some());
-        assert!(schema.table("missing", access).await.unwrap().is_none());
+        assert!(schema.table("target", intent).await.unwrap().is_some());
+        assert!(schema.table("missing", intent).await.unwrap().is_none());
     }
 
     let ctx = context(schema);
@@ -508,9 +508,9 @@ async fn existing_schema_implementations_keep_working() {
 }
 
 #[tokio::test]
-async fn metadata_permission_allows_describe_but_not_select() {
+async fn describe_permission_does_not_allow_select() {
     let (ctx, schema) = authorized_context();
-    schema.grant("target", TableAccess::Metadata);
+    schema.grant("target", TableIntent::Describe);
     ctx.sql("DESCRIBE target")
         .await
         .unwrap()
@@ -518,8 +518,8 @@ async fn metadata_permission_allows_describe_but_not_select() {
         .await
         .unwrap();
     assert_eq!(
-        schema.accesses(),
-        HashSet::from([("target".into(), TableAccess::Metadata)])
+        schema.intents(),
+        HashSet::from([("target".into(), TableIntent::Describe)])
     );
     let calls = schema.tables["target"].schema_calls();
     let error = ctx.sql("SELECT * FROM target").await.unwrap_err();
@@ -528,44 +528,44 @@ async fn metadata_permission_allows_describe_but_not_select() {
 }
 
 #[tokio::test]
-async fn ddl_needs_its_own_intent_without_a_metadata_prerequisite() {
-    for (sql, access) in [
-        ("CREATE INDEX idx ON target(id)", TableAccess::CreateIndex),
+async fn ddl_needs_its_own_intent_without_a_describe_prerequisite() {
+    for (sql, intent) in [
+        ("CREATE INDEX idx ON target(id)", TableIntent::CreateIndex),
         (
             "CREATE TABLE IF NOT EXISTS target(id BIGINT)",
-            TableAccess::CreateTable { or_replace: false },
+            TableIntent::CreateTable { or_replace: false },
         ),
         (
             "CREATE OR REPLACE TABLE target AS SELECT 1 AS id",
-            TableAccess::CreateTable { or_replace: true },
+            TableIntent::CreateTable { or_replace: true },
         ),
         (
             "CREATE OR REPLACE VIEW target AS SELECT 1 AS id",
-            TableAccess::CreateView { or_replace: true },
+            TableIntent::CreateView { or_replace: true },
         ),
-        ("DROP TABLE target", TableAccess::DropTable),
-        ("DROP TABLE IF EXISTS target", TableAccess::DropTable),
-        ("DROP VIEW IF EXISTS target", TableAccess::DropView),
+        ("DROP TABLE target", TableIntent::DropTable),
+        ("DROP TABLE IF EXISTS target", TableIntent::DropTable),
+        ("DROP VIEW IF EXISTS target", TableIntent::DropView),
         (
             "CREATE EXTERNAL TABLE IF NOT EXISTS target STORED AS CSV LOCATION 'missing.csv'",
-            TableAccess::CreateTable { or_replace: false },
+            TableIntent::CreateTable { or_replace: false },
         ),
     ] {
         let (ctx, schema) = authorized_context();
-        schema.grant("target", TableAccess::Metadata);
+        schema.grant("target", TableIntent::Describe);
         let error = ctx.sql(sql).await.unwrap_err();
         assert_contains!(
             error.to_string(),
-            format!("Access denied to target for {access:?}")
+            format!("Access denied to target for {intent:?}")
         );
         assert_eq!(schema.tables["target"].schema_calls(), 0, "{sql}");
 
         let (ctx, schema) = authorized_context();
-        schema.grant("target", access);
+        schema.grant("target", intent);
         ctx.state().create_logical_plan(sql).await.unwrap();
         assert_eq!(
-            schema.accesses(),
-            HashSet::from([("target".into(), access)]),
+            schema.intents(),
+            HashSet::from([("target".into(), intent)]),
             "{sql}"
         );
         // The default schema disallows mutations. Reaching that error is distinct
@@ -577,8 +577,8 @@ async fn ddl_needs_its_own_intent_without_a_metadata_prerequisite() {
             );
         }
         assert_eq!(
-            schema.accesses(),
-            HashSet::from([("target".into(), access)]),
+            schema.intents(),
+            HashSet::from([("target".into(), intent)]),
             "{sql}"
         );
     }
@@ -586,36 +586,33 @@ async fn ddl_needs_its_own_intent_without_a_metadata_prerequisite() {
 
 #[tokio::test]
 async fn direct_ddl_execution_checks_absent_names() {
-    for (sql, access) in [
+    for (sql, intent) in [
         (
             "CREATE TABLE absent(id BIGINT)",
-            TableAccess::CreateTable { or_replace: false },
+            TableIntent::CreateTable { or_replace: false },
         ),
         (
             "CREATE VIEW absent AS SELECT 1 AS id",
-            TableAccess::CreateView { or_replace: false },
+            TableIntent::CreateView { or_replace: false },
         ),
         (
             "CREATE EXTERNAL TABLE absent STORED AS CSV LOCATION 'missing.csv'",
-            TableAccess::CreateTable { or_replace: false },
+            TableIntent::CreateTable { or_replace: false },
         ),
-        ("DROP TABLE IF EXISTS absent", TableAccess::DropTable),
-        ("DROP VIEW IF EXISTS absent", TableAccess::DropView),
+        ("DROP TABLE IF EXISTS absent", TableIntent::DropTable),
+        ("DROP VIEW IF EXISTS absent", TableIntent::DropView),
     ] {
         let (ctx, schema) = authorized_context();
-        schema.grant("absent", access);
+        schema.grant("absent", intent);
         let plan = ctx.state().create_logical_plan(sql).await.unwrap();
-        assert_eq!(
-            schema.accesses(),
-            HashSet::from([("absent".into(), access)])
-        );
-        schema.revoke("absent", access);
+        assert_eq!(schema.intents(), HashSet::from([("absent".into(), intent)]));
+        schema.revoke("absent", intent);
         let error = ctx.execute_logical_plan(plan.clone()).await.unwrap_err();
         assert_contains!(
             error.to_string(),
-            format!("Access denied to absent for {access:?}")
+            format!("Access denied to absent for {intent:?}")
         );
-        schema.grant("absent", access);
+        schema.grant("absent", intent);
         if let Err(error) = ctx.execute_logical_plan(plan).await {
             assert!(
                 !error.to_string().contains("Access denied"),
@@ -633,7 +630,7 @@ async fn missing_file_names_do_not_open_files_or_register_stores() {
         "https://example.com/secret.csv",
         "s3://private/secret.parquet",
     ] {
-        assert!(ctx.table_provider(name, TableAccess::Read).await.is_err());
+        assert!(ctx.table_provider(name, TableIntent::Read).await.is_err());
         assert!(ctx.sql(&format!("SELECT * FROM '{name}'")).await.is_err());
     }
     assert!(
@@ -686,16 +683,16 @@ impl SchemaProvider for ForwardingSchema {
     async fn table(
         &self,
         name: &str,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.0.table(name, access).await
+        self.0.table(name, intent).await
     }
 }
 
 #[tokio::test]
 async fn forwarding_wrapper_preserves_mutation_intent() {
     let schema = Arc::new(AuthorizedSchema::new());
-    schema.grant("target", TableAccess::Read);
+    schema.grant("target", TableIntent::Read);
     let ctx = context(Arc::new(ForwardingSchema(schema.clone())));
     let error = ctx.sql("INSERT INTO target VALUES (1)").await.unwrap_err();
     assert_contains!(
@@ -708,7 +705,7 @@ async fn forwarding_wrapper_preserves_mutation_intent() {
 #[tokio::test]
 async fn merge_prefetch_and_planning_preserve_every_clause_action() {
     for mask in 1..8 {
-        let access = TableAccess::Merge {
+        let intent = TableIntent::Merge {
             insert: mask & 1 != 0,
             update: mask & 2 != 0,
             delete: mask & 4 != 0,
@@ -725,27 +722,27 @@ async fn merge_prefetch_and_planning_preserve_every_clause_action() {
             sql.push_str(" WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)");
         }
         let (ctx, schema) = authorized_context();
-        schema.grant("source", TableAccess::Read);
+        schema.grant("source", TableIntent::Read);
         let error = ctx.state().create_logical_plan(&sql).await.unwrap_err();
         assert_contains!(
             error.to_string(),
-            format!("Access denied to target for {access:?}")
+            format!("Access denied to target for {intent:?}")
         );
         assert_eq!(schema.tables["target"].schema_calls(), 0);
-        schema.grant("target", access);
+        schema.grant("target", intent);
         ctx.state().create_logical_plan(&sql).await.unwrap();
         assert_eq!(
-            schema.accesses(),
+            schema.intents(),
             HashSet::from([
-                ("target".into(), access),
-                ("source".into(), TableAccess::Read)
+                ("target".into(), intent),
+                ("source".into(), TableIntent::Read)
             ])
         );
     }
 }
 
 #[tokio::test]
-async fn show_and_information_schema_use_metadata_access() {
+async fn show_and_information_schema_request_describe() {
     let schema = Arc::new(AuthorizedSchema::new());
     let ctx = SessionContext::new_with_config(
         datafusion::execution::context::SessionConfig::new()
@@ -756,7 +753,7 @@ async fn show_and_information_schema_use_metadata_access() {
         .register_schema("public", Arc::clone(&schema) as Arc<dyn SchemaProvider>)
         .unwrap();
     for table in ["target", "source"] {
-        schema.grant(table, TableAccess::Metadata);
+        schema.grant(table, TableIntent::Describe);
     }
     for sql in [
         "SHOW COLUMNS FROM target",
@@ -768,23 +765,23 @@ async fn show_and_information_schema_use_metadata_access() {
         ctx.sql(sql).await.unwrap().collect().await.unwrap();
         assert!(
             schema
-                .accesses()
+                .intents()
                 .iter()
-                .all(|(_, access)| *access == TableAccess::Metadata),
+                .all(|(_, intent)| *intent == TableIntent::Describe),
             "{sql}"
         );
     }
     assert!(
         schema
-            .accesses()
-            .contains(&("target".into(), TableAccess::Metadata))
+            .intents()
+            .contains(&("target".into(), TableIntent::Describe))
     );
 }
 
 #[derive(Debug)]
 struct DdlOnlySchema {
     inner: MemorySchemaProvider,
-    allowed: TableAccess,
+    allowed: TableIntent,
 }
 
 #[async_trait]
@@ -798,12 +795,12 @@ impl SchemaProvider for DdlOnlySchema {
     async fn table(
         &self,
         name: &str,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
-        if access != self.allowed {
-            return plan_err!("unexpected prerequisite: {access:?}");
+        if intent != self.allowed {
+            return plan_err!("unexpected prerequisite: {intent:?}");
         }
-        self.inner.table(name, access).await
+        self.inner.table(name, intent).await
     }
     fn register_table(
         &self,
@@ -822,50 +819,50 @@ async fn ddl_execution_succeeds_with_only_the_requested_operation() {
     for (sql, allowed, existing) in [
         (
             "CREATE TABLE target(id BIGINT)",
-            TableAccess::CreateTable { or_replace: false },
+            TableIntent::CreateTable { or_replace: false },
             false,
         ),
         (
             "CREATE TABLE IF NOT EXISTS target(id BIGINT)",
-            TableAccess::CreateTable { or_replace: false },
+            TableIntent::CreateTable { or_replace: false },
             true,
         ),
         (
             "CREATE OR REPLACE TABLE target AS SELECT 1 AS id",
-            TableAccess::CreateTable { or_replace: true },
+            TableIntent::CreateTable { or_replace: true },
             true,
         ),
         (
             "SELECT 1 AS id INTO target",
-            TableAccess::CreateTable { or_replace: false },
+            TableIntent::CreateTable { or_replace: false },
             false,
         ),
         (
             "CREATE VIEW target AS SELECT 1 AS id",
-            TableAccess::CreateView { or_replace: false },
+            TableIntent::CreateView { or_replace: false },
             false,
         ),
         (
             "CREATE OR REPLACE VIEW target AS SELECT 1 AS id",
-            TableAccess::CreateView { or_replace: true },
+            TableIntent::CreateView { or_replace: true },
             true,
         ),
         (
             "CREATE OR REPLACE EXTERNAL TABLE target STORED AS CSV LOCATION 'tests/data/example.csv'",
-            TableAccess::CreateTable { or_replace: true },
+            TableIntent::CreateTable { or_replace: true },
             true,
         ),
-        ("DROP TABLE target", TableAccess::DropTable, true),
-        ("DROP VIEW target", TableAccess::DropView, true),
-        ("DROP TABLE IF EXISTS target", TableAccess::DropTable, false),
-        ("DROP VIEW IF EXISTS target", TableAccess::DropView, false),
+        ("DROP TABLE target", TableIntent::DropTable, true),
+        ("DROP VIEW target", TableIntent::DropView, true),
+        ("DROP TABLE IF EXISTS target", TableIntent::DropTable, false),
+        ("DROP VIEW IF EXISTS target", TableIntent::DropView, false),
     ] {
         let schema = Arc::new(DdlOnlySchema {
             inner: MemorySchemaProvider::new(),
             allowed,
         });
         if existing {
-            let provider: Arc<dyn TableProvider> = if allowed == TableAccess::DropView {
+            let provider: Arc<dyn TableProvider> = if allowed == TableIntent::DropView {
                 Arc::new(datafusion::datasource::ViewTable::new(
                     datafusion_expr::LogicalPlanBuilder::empty(false)
                         .build()
@@ -886,7 +883,7 @@ async fn ddl_execution_succeeds_with_only_the_requested_operation() {
             .unwrap();
         assert_eq!(
             schema.table_exist("target"),
-            !matches!(allowed, TableAccess::DropTable | TableAccess::DropView),
+            !matches!(allowed, TableIntent::DropTable | TableIntent::DropView),
             "{sql}"
         );
     }

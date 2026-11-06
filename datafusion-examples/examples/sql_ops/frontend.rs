@@ -21,7 +21,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::TableReference;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
-use datafusion::logical_expr::TableAccess;
+use datafusion::logical_expr::TableIntent;
 use datafusion::logical_expr::{
     AggregateUDF, Expr, HigherOrderUDF, LogicalPlan, ScalarUDF,
     TableProviderFilterPushDown, TableSource, WindowUDF,
@@ -141,7 +141,7 @@ impl ContextProvider for MyContextProvider {
     fn get_table_source(
         &self,
         name: TableReference,
-        _access: TableAccess,
+        _intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableSource>>> {
         if name.table() == "person" {
             Ok(Some(Arc::new(MyTableSource {

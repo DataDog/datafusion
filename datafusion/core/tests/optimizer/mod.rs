@@ -31,7 +31,7 @@ use datafusion_common::{DFSchema, Result, ScalarValue, TableReference};
 use datafusion_expr::interval_arithmetic::{Interval, NullableInterval};
 use datafusion_expr::{
     AggregateUDF, BinaryExpr, Expr, ExprSchemable, HigherOrderUDF, LogicalPlan, Operator,
-    ScalarUDF, TableAccess, TableSource, WindowUDF, col, lit,
+    ScalarUDF, TableIntent, TableSource, WindowUDF, col, lit,
 };
 use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_optimizer::analyzer::Analyzer;
@@ -181,7 +181,7 @@ impl ContextProvider for MyContextProvider {
     fn get_table_source(
         &self,
         name: TableReference,
-        _access: TableAccess,
+        _intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableSource>>> {
         let table_name = name.table();
         if table_name.starts_with("test") {

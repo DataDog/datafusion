@@ -35,7 +35,7 @@ use datafusion_common::error::Result;
 use datafusion_common::types::NativeType;
 use datafusion_execution::TaskContext;
 use datafusion_execution::runtime_env::RuntimeEnv;
-use datafusion_expr::TableAccess;
+use datafusion_expr::TableIntent;
 use datafusion_expr::function::WindowUDFFieldArgs;
 use datafusion_expr::{
     AggregateUDF, ReturnFieldArgs, ScalarUDF, Signature, TypeSignature, WindowUDF,
@@ -180,7 +180,7 @@ impl InformationSchemaConfig {
                     if let Some(schema) = catalog.schema(&schema_name) {
                         for table_name in schema.table_names() {
                             if let Some(table) =
-                                schema.table(&table_name, TableAccess::Metadata).await?
+                                schema.table(&table_name, TableIntent::Describe).await?
                             {
                                 builder.add_view(
                                     &catalog_name,
@@ -212,7 +212,7 @@ impl InformationSchemaConfig {
                     if let Some(schema) = catalog.schema(&schema_name) {
                         for table_name in schema.table_names() {
                             if let Some(table) =
-                                schema.table(&table_name, TableAccess::Metadata).await?
+                                schema.table(&table_name, TableIntent::Describe).await?
                             {
                                 for (field_position, field) in
                                     table.schema().fields().iter().enumerate()
@@ -590,7 +590,7 @@ impl SchemaProvider for InformationSchemaProvider {
     async fn table(
         &self,
         name: &str,
-        _access: TableAccess,
+        _intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
         let config = self.config.clone();
         let table: Arc<dyn PartitionStream> = match name.to_ascii_lowercase().as_str() {
@@ -1601,7 +1601,7 @@ mod tests {
         async fn table(
             &self,
             _: &str,
-            _access: TableAccess,
+            _intent: TableIntent,
         ) -> Result<Option<Arc<dyn TableProvider>>> {
             panic!(
                 "InformationSchemaConfig::make_tables called SchemaProvider::table instead of table_type"

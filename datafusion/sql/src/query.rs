@@ -366,7 +366,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let name = self.object_name_to_table_reference(into.name)?;
                 self.context_provider.get_table_source(
                     name.clone(),
-                    datafusion_expr::TableAccess::CreateTable { or_replace: false },
+                    datafusion_expr::TableIntent::CreateTable { or_replace: false },
                 )?;
                 Ok(LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
                     CreateMemoryTable {

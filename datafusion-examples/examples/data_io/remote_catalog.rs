@@ -40,7 +40,7 @@ use datafusion::common::Result;
 use datafusion::common::{assert_batches_eq, internal_datafusion_err, plan_err};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::logical_expr::TableAccess;
+use datafusion::logical_expr::TableIntent;
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -83,7 +83,7 @@ pub async fn remote_catalog() -> Result<()> {
     // Find all `TableReferences` in the parsed queries. These correspond to the
     // tables referred to by the query (in this case
     // `remote_schema.remote_table`)
-    let references = state.resolve_table_references_with_access(&statement)?;
+    let references = state.resolve_table_references_with_intent(&statement)?;
 
     // Now we can asynchronously resolve the table references to get a cached catalog
     // that we can use for our query
@@ -191,7 +191,7 @@ impl AsyncSchemaProvider for RemoteCatalogDatafusionAdapter {
     async fn table(
         &self,
         name: &str,
-        _access: TableAccess,
+        _intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
         // Fetch information about the table from the remote catalog
         //

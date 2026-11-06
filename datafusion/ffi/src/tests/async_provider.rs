@@ -35,7 +35,7 @@ use datafusion_catalog::{MemoryCatalogProvider, TableProvider};
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, exec_err};
 use datafusion_execution::RecordBatchStream;
-use datafusion_expr::{Expr, TableAccess};
+use datafusion_expr::{Expr, TableIntent};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion_physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions,
@@ -150,7 +150,7 @@ impl TableProvider for AsyncTableProvider {
             datafusion_common::exec_datafusion_err!("missing public schema")
         })?;
         if schema
-            .table("external_table", TableAccess::Read)
+            .table("external_table", TableIntent::Read)
             .await?
             .is_none()
         {

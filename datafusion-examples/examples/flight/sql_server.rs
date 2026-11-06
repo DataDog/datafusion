@@ -39,7 +39,7 @@ use arrow_flight::{
     HandshakeResponse, IpcMessage, SchemaAsIpc, Ticket,
 };
 use dashmap::DashMap;
-use datafusion::logical_expr::{LogicalPlan, TableAccess};
+use datafusion::logical_expr::{LogicalPlan, TableIntent};
 use datafusion::prelude::{DataFrame, ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_examples::utils::{datasets::ExampleDataset, write_csv_to_parquet};
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -181,7 +181,7 @@ impl FlightSqlServiceImpl {
                 let schema_provider = catalog_provider.schema(&schema).unwrap();
                 for table in schema_provider.table_names() {
                     let table_provider = schema_provider
-                        .table(&table, TableAccess::Metadata)
+                        .table(&table, TableIntent::Describe)
                         .await
                         .unwrap()
                         .unwrap();

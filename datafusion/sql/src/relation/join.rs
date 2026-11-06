@@ -17,7 +17,7 @@
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_common::{Column, Result, not_impl_err, plan_datafusion_err};
-use datafusion_expr::{JoinType, LogicalPlan, LogicalPlanBuilder, TableAccess};
+use datafusion_expr::{JoinType, LogicalPlan, LogicalPlanBuilder, TableIntent};
 use sqlparser::ast::{
     Join, JoinConstraint, JoinOperator, ObjectName, TableFactor, TableWithJoins,
 };
@@ -29,19 +29,19 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         t: TableWithJoins,
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
-        self.plan_table_with_joins_with_access(t, planner_context, TableAccess::Read)
+        self.plan_table_with_joins_with_intent(t, planner_context, TableIntent::Read)
     }
 
-    pub(crate) fn plan_table_with_joins_with_access(
+    pub(crate) fn plan_table_with_joins_with_intent(
         &self,
         t: TableWithJoins,
         planner_context: &mut PlannerContext,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> Result<LogicalPlan> {
         let mut left = if is_lateral(&t.relation) {
             self.create_relation_subquery(t.relation, planner_context)?
         } else {
-            self.create_relation_with_access(t.relation, planner_context, access)?
+            self.create_relation_with_intent(t.relation, planner_context, intent)?
         };
         let old_outer_from_schema = planner_context.outer_from_schema();
         for join in t.joins {

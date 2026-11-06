@@ -23,7 +23,7 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Result, TableReference};
 use datafusion_expr::planner::ExprPlanner;
 use datafusion_expr::{
-    AggregateUDF, ScalarUDF, TableAccess, TableSource,
+    AggregateUDF, ScalarUDF, TableIntent, TableSource,
     logical_plan::builder::LogicalTableSource,
 };
 use datafusion_expr::{HigherOrderUDF, WindowUDF};
@@ -131,7 +131,7 @@ impl ContextProvider for MyContextProvider {
     fn get_table_source(
         &self,
         name: TableReference,
-        _access: TableAccess,
+        _intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableSource>>> {
         match self.tables.get(name.table()) {
             Some(table) => Ok(Some(Arc::clone(table))),

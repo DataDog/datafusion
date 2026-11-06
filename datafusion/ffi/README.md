@@ -73,12 +73,12 @@ with your library and then to connect it to DataFusion using this crate.
 Alternatively, you could use [bindgen] to interface directly to the [FFI] provided
 by this crate, but that is currently not supported.
 
-In this fork, the schema-provider ABI does not carry `TableAccess`. A foreign
-schema adapter supports `Read` and rejects metadata and write intents instead
+In this fork, the schema-provider ABI does not carry `TableIntent`. A foreign
+schema adapter supports `Read` and rejects `Describe` and mutation intents instead
 of downgrading them to read lookups. This preserves the ABI layout but limits
 which operations can use a foreign catalog. Supporting other intents requires
 an ABI extension. A same-library round trip retains the original Rust provider
-and its access-aware implementation.
+and its intent-aware implementation.
 
 ## Stabby Usage
 

@@ -17,7 +17,7 @@
 
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::test_util::TestTableFactory;
-use datafusion_expr::TableAccess;
+use datafusion_expr::TableIntent;
 
 use super::*;
 
@@ -58,7 +58,7 @@ async fn create_external_table_with_ddl() -> Result<()> {
     assert!(exists, "Table should have been created!");
 
     let table_schema = schema
-        .table("dt", TableAccess::Read)
+        .table("dt", TableIntent::Read)
         .await
         .unwrap()
         .unwrap()

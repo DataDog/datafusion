@@ -81,7 +81,7 @@ impl SchemaProvider for MemorySchemaProvider {
             .collect()
     }
 
-    async fn table(&self, name: &str, _access: datafusion::logical_expr::TableAccess) -> Result<Option<Arc<dyn TableProvider>>> {
+    async fn table(&self, name: &str, _intent: datafusion::logical_expr::TableIntent) -> Result<Option<Arc<dyn TableProvider>>> {
         Ok(self.tables.get(name).map(|table| table.value().clone()))
     }
 
@@ -134,7 +134,7 @@ Without getting into a `CatalogProvider` implementation, we can create a `Memory
 #             .collect()
 #     }
 #
-#     async fn table(&self, name: &str, _access: datafusion::logical_expr::TableAccess) -> Result<Option<Arc<dyn TableProvider>>> {
+#     async fn table(&self, name: &str, _intent: datafusion::logical_expr::TableIntent) -> Result<Option<Arc<dyn TableProvider>>> {
 #         Ok(self.tables.get(name).map(|table| table.value().clone()))
 #     }
 #
@@ -185,7 +185,7 @@ let table_provider = {
 
 schema_provider.register_table("users".to_string(), table_provider);
 
-let table = schema_provider.table("users", datafusion::logical_expr::TableAccess::Read);
+let table = schema_provider.table("users", datafusion::logical_expr::TableIntent::Read);
 ```
 
 ### Asynchronous `SchemaProvider`
@@ -207,7 +207,7 @@ The trait is roughly the same except for the `table` method, and the addition of
 
 #[async_trait]
 impl SchemaProvider for Schema {
-    async fn table(&self, name: &str, _access: datafusion::logical_expr::TableAccess) -> Result<Option<Arc<dyn TableProvider>>> {
+    async fn table(&self, name: &str, _intent: datafusion::logical_expr::TableIntent) -> Result<Option<Arc<dyn TableProvider>>> {
 #       todo!();
     }
 
@@ -316,104 +316,135 @@ To recap, you need to:
 
 ## Operation-aware table resolution
 
-Authorizing catalogs need to distinguish access types to make fine-grained
+Authorizing catalogs need to distinguish operations to make fine-grained
 permission decisions. A caller may be allowed to insert into a table without
 being allowed to select from it. The planner still needs the destination schema.
-`SchemaProvider::table` lets the catalog check the intended operation
+`SchemaProvider::table(name, intent)` lets the catalog check the intended operation
 before returning a provider or exposing its schema.
 
-`TableAccess` describes DataFusion operations; applications map them to privileges:
+`TableIntent` describes why a table or view name is being resolved. It describes
+the operation, not granted permissions. Applications supply caller identity and
+map each intent to the privileges their policy requires.
 
-| Table occurrence                                     | Access                             |
-| ---------------------------------------------------- | ---------------------------------- |
-| Query source, including a subquery within a write    | `Read`                             |
-| `DESCRIBE table`, `SHOW COLUMNS`, `SHOW CREATE`      | `Metadata`                         |
-| `CREATE TABLE`, external table, `SELECT INTO` target | `CreateTable { or_replace }`       |
-| `CREATE VIEW` target                                 | `CreateView { or_replace }`        |
-| `DROP TABLE` / `DROP VIEW` target                    | `DropTable` / `DropView`           |
-| `CREATE INDEX` target table                          | `CreateIndex`                      |
-| `INSERT INTO` destination                            | `Insert(InsertOp::Append)`         |
-| `INSERT OVERWRITE` destination                       | `Insert(InsertOp::Overwrite)`      |
-| `REPLACE INTO` or `INSERT OR REPLACE` destination    | `Insert(InsertOp::Replace)`        |
-| `UPDATE` destination                                 | `Update`                           |
-| `DELETE` destination                                 | `Delete`                           |
-| `TRUNCATE` destination                               | `Truncate`                         |
-| `MERGE INTO` destination                             | `Merge { insert, update, delete }` |
+| Table occurrence                                          | Intent                             |
+| --------------------------------------------------------- | ---------------------------------- |
+| `DESCRIBE table`, `SHOW COLUMNS`, `SHOW CREATE`           | `Describe`                         |
+| Query source, including a subquery within a mutation      | `Read`                             |
+| `INSERT INTO` destination                                 | `Insert(InsertOp::Append)`         |
+| `INSERT OVERWRITE` destination                            | `Insert(InsertOp::Overwrite)`      |
+| `REPLACE INTO` or `INSERT OR REPLACE` destination         | `Insert(InsertOp::Replace)`        |
+| `UPDATE` destination                                      | `Update`                           |
+| `DELETE` destination                                      | `Delete`                           |
+| `TRUNCATE` destination                                    | `Truncate`                         |
+| `MERGE INTO` destination                                  | `Merge { insert, update, delete }` |
+| `CREATE TABLE`, external table, `SELECT INTO` destination | `CreateTable { or_replace }`       |
+| `CREATE VIEW` destination                                 | `CreateView { or_replace }`        |
+| `DROP TABLE` / `DROP VIEW` target                         | `DropTable` / `DropView`           |
+| `CREATE INDEX` target table                               | `CreateIndex`                      |
+
+Each operation includes the metadata needed to plan it. An insert lookup does
+not request a separate `Describe` or `Read` intent. Replacement does not cause a
+separate drop lookup. DataFusion defines no permission hierarchy: an application
+can require multiple privileges for one intent or map several intents to one
+privilege.
 
 Merge flags include every action present in the statement, regardless of which
 clauses will execute. Update, delete, and merge operations can inspect target
 rows without a separate target `Read` lookup. Applications must map these intents
 to all required privileges. Column-level permissions and row filtering require
-additional checks. Explicit sources and subqueries always request `Read`.
-Each operation includes the metadata needed to plan it. For example, `DropTable`
-does not require an additional `Metadata` grant, and replacement does not cause a
-separate `DropTable` check. Applications decide whether their policy requires
-multiple privileges for one intent. `Metadata` itself only authorizes inspection. A `DESCRIBE` of a query plans that
-query normally and retains its read checks.
+additional enforcement. Explicit sources and subqueries request `Read`.
 
-### Explicit intent at every lookup
+### Required lookup APIs
 
-`SchemaProvider::table(name, access)`, `AsyncSchemaProvider::table(name, access)`,
-and `ContextProvider::get_table_source(name, access)` require an explicit
-`TableAccess`. There is one lookup method per trait, with no name-only overload
+`SchemaProvider::table(name, intent)`, `AsyncSchemaProvider::table(name, intent)`,
+and `ContextProvider::get_table_source(name, intent)` require an explicit
+`TableIntent`. There is one lookup method per trait, with no name-only overload
 or default intent. Existing implementations and callers must migrate.
-Forwarding wrappers must pass access unchanged to their inner provider. Catalogs
+Forwarding wrappers must pass intent unchanged to their inner provider. Catalogs
 that do not enforce authorization can explicitly ignore the parameter.
 Authorizing implementations should reject unknown intent variants.
 
-All three trait methods return `Result<Option<...>>`: `Some` is an authorized
-existing object, `None` is an authorized absent name, and `Err` includes denial.
-Check creation intent before returning `None`, including `IF NOT EXISTS`.
-Direct `SqlToRel` callers receive the same DDL checks as built-in session planning.
+All three trait methods return `Result<Option<...>>`:
 
-Caller identity, query context, stable object identities, and the mapping from
-operations to privileges stay in the application.
+- `Ok(Some(provider))`: resolution is authorized and the object exists.
+- `Ok(None)`: resolution is authorized and the name is absent.
+- `Err(...)`: authorization or lookup failed.
+
+Authorize the name before returning `None`, including for `CREATE TABLE IF NOT EXISTS`. A creation policy can use privileges on the containing schema even when
+there is no existing table. An error must not be treated as absence or suppressed
+by `IF EXISTS` / `IF NOT EXISTS`. Direct `SqlToRel` callers receive the same DDL
+lookup checks as built-in session planning.
+
+`SessionContext::table_provider(name, intent)` also requires an explicit intent.
+`SessionContext::table` constructs a read DataFrame and supplies `Read` itself;
+`DataFrame::write_table` supplies the requested insert mode.
 
 ### Planning and caches
 
+The SQL planner identifies the operation for each table occurrence. Built-in
+session planning uses this information to fetch providers asynchronously before
+synchronous SQL planning. Both the fetch and the subsequent cached lookup carry
+the intent through to `SchemaProvider::table`.
+
 For `INSERT INTO destination SELECT * FROM source`, the destination requests
-insert access and the source requests read access. A self-insert checks both.
-Built-in session planning caches providers by resolved table name and access, so
-a cached insert provider cannot satisfy a read lookup. CTE aliases use their
-planned relations; tables inside their definitions resolve normally.
-`SessionContext::table` constructs a read DataFrame and requests `Read`.
-`SessionContext::table_provider(name, access)` requires an explicit operation;
-`DataFrame::write_table` forwards its insert mode.
+`Insert(InsertOp::Append)` and the source requests `Read`. A self-insert checks
+both intents. Built-in session planning caches providers by resolved table name
+and intent, so a cached insert provider cannot satisfy a read lookup. CTE aliases
+use their planned relations; tables inside their definitions resolve normally.
 
-Remote catalogs can use `resolve_table_references_with_access` together with
+Remote catalogs can use `resolve_table_references_with_intent` together with
 `AsyncSchemaProvider`, `AsyncCatalogProvider`, or `AsyncCatalogProviderList`'s
-`resolve`. The remote-catalog example demonstrates this path.
-Built-in session planning performs its own prefetch and does not call these
-helpers. They are optional for catalogs that check policy on each live lookup.
+`resolve`. The remote-catalog example demonstrates this path. These are optional
+snapshot helpers; built-in session planning performs its own prefetch and does
+not call them.
 
-These helpers build snapshots scoped to one caller and query. Every cache entry
-retains its authorized operation. `resolve` requires `(TableReference, TableAccess)`
-pairs; there is no name-only resolution path. Authorized absence is cached too.
-Requesting any name/operation pair not resolved in advance returns an error. Sharing the cache across identities or retaining it
-after permission changes can reuse stale authorization. Name and operation keys
-do not encode caller identity or policy versions.
+`resolve` requires `(TableReference, TableIntent)` pairs and builds a snapshot
+scoped to one caller and query. Every cache entry retains its authorized intent,
+including authorized absence. Requesting any name/intent pair not resolved in
+advance returns an error. Name and intent keys do not encode caller identity or
+policy versions. Sharing snapshots across identities or retaining them after
+permission changes can reuse stale authorization.
+
+Snapshot name enumeration includes providers resolved for any intent. It does
+not automatically limit discovery to objects resolved for `Describe`.
 
 A shared metadata cache can still fetch a schema once by stable identity; it
-must not reuse the authorization decision across callers or operations. A
-self-insert can cause two remote lookups, one per intent; implementations can
-share the metadata fetch while preserving both permission checks. Metadata
-queries may enumerate more tables than occur explicitly in SQL. A remote snapshot
-must resolve those metadata operations separately or provide a catalog that can
-authorize them live; `resolve` is not a metadata-enumeration API.
+must check authorization for the current caller and intent before returning the
+cached provider. A self-insert can cause two remote lookups, one per intent;
+implementations can share the metadata fetch while preserving both checks.
+Metadata queries may enumerate more tables than occur explicitly in SQL. A
+snapshot must resolve those `Describe` operations separately or provide a catalog
+that can authorize them live; `resolve` is not a metadata-enumeration API.
+
+### Describe and metadata visibility
+
+`Describe` requests an object's metadata without reading its rows. It is used
+for named table description and for underlying objects visited by
+`information_schema.columns` and `information_schema.views`. The default
+`SchemaProvider::table_type`, used by `information_schema.tables`, also requests
+`Describe`. `DESCRIBE` of a query plans that query normally and retains its read
+checks.
+
+This does not automatically filter system-table results. Catalogs still control
+`table_names`, schema and catalog names, existence checks, and `table_type`
+overrides. Authorizing implementations should apply their visibility policy to
+these APIs too; a common choice is to enumerate only names the caller may
+describe. A denied lookup during information-schema traversal returns an error,
+rather than silently hiding an object.
+
+Querying a system table and inspecting the underlying objects are separate
+operations. The built-in information-schema provider does not enforce policy on
+the system table itself. Applications that restrict access to system tables must
+enforce that restriction separately. Approval of `Describe` does not grant row
+access, and approval of another operation need not make an object discoverable.
 
 ### Integration boundaries
 
-- Return an error for denied access. `Ok(None)` means an authorized missing object.
-  Catalog lookup has no implicit file or object-store fallback. `enable_url_table`
-  and dynamic catalog wrappers are removed. Register files explicitly, use
-  `CREATE EXTERNAL TABLE`, or use the DataFrame file-reading APIs. Those explicit
-  APIs and file/table functions still require application policy for locations.
-- Information-schema column and view traversal, and the default `table_type`,
-  request `Metadata`. Table/schema names, existence checks, custom `table_type`
-  overrides, and other enumeration APIs still need their own visibility policy.
-  Metadata denial can fail an enumeration; catalogs should expose only names
-  visible to the caller where appropriate.
-- Table DDL requests its actual operation during planning; built-in create/drop
+- Catalog lookup has no implicit file or object-store fallback. Register files
+  explicitly, use `CREATE EXTERNAL TABLE`, or use DataFrame file-reading APIs.
+  Those explicit APIs and file/table functions still require application policy
+  for locations.
+- Table DDL requests its actual intent during planning; built-in create/drop
   execution checks it again. Registration/deregistration APIs, schema/catalog
   commands, and custom DDL execution still need their own checks. Keep mutation
   authorization atomic with the mutation where necessary: a successful lookup is
@@ -421,8 +452,8 @@ authorize them live; `resolve` is not a metadata-enumeration API.
   `CreateIndex` is planned but its execution is application-owned.
 - The current FFI schema-provider ABI cannot carry intent. A foreign adapter
   supports `Read` and rejects other intents; it does not downgrade them to reads.
-  A same-library round trip retains the original provider and its access handling.
-  Supporting writes or metadata across the FFI boundary needs an ABI extension.
+  A same-library round trip retains the original provider and its intent handling.
+  Supporting other intents across the FFI boundary needs an ABI extension.
 - A returned provider is not restricted to the requested operation. Physical DML
   uses the provider embedded in the plan without another catalog check. Prepared
   plans, stored view plans, externally supplied providers/plans, table functions,

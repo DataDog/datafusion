@@ -20,7 +20,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion_common::{HashMap, TableReference, error::Result, not_impl_err};
 use datafusion_execution::config::SessionConfig;
-use datafusion_expr::TableAccess;
+use datafusion_expr::TableIntent;
 
 use crate::{CatalogProvider, CatalogProviderList, SchemaProvider, TableProvider};
 
@@ -34,11 +34,11 @@ struct ResolvedSchemaProvider {
 }
 
 #[derive(Debug)]
-struct ResolvedTableCache(HashMap<(String, TableAccess), Option<Arc<dyn TableProvider>>>);
+struct ResolvedTableCache(HashMap<(String, TableIntent), Option<Arc<dyn TableProvider>>>);
 
 impl ResolvedTableCache {
     fn new(
-        tables: HashMap<(String, TableAccess), Option<Arc<dyn TableProvider>>>,
+        tables: HashMap<(String, TableIntent), Option<Arc<dyn TableProvider>>>,
     ) -> Self {
         Self(tables)
     }
@@ -62,15 +62,15 @@ impl SchemaProvider for ResolvedSchemaProvider {
     async fn table(
         &self,
         name: &str,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
         self.cached_tables
             .0
-            .get(&(name.to_string(), access))
+            .get(&(name.to_string(), intent))
             .cloned()
             .ok_or_else(|| {
                 datafusion_common::plan_datafusion_err!(
-                    "Table '{name}' was not resolved for operation {access:?}"
+                    "Table '{name}' was not resolved for operation {intent:?}"
                 )
             })
     }
@@ -103,7 +103,7 @@ impl SchemaProvider for ResolvedSchemaProvider {
 struct ResolvedSchemaProviderBuilder {
     owner_name: String,
     async_provider: Arc<dyn AsyncSchemaProvider>,
-    cached_tables: HashMap<(String, TableAccess), Option<Arc<dyn TableProvider>>>,
+    cached_tables: HashMap<(String, TableIntent), Option<Arc<dyn TableProvider>>>,
 }
 impl ResolvedSchemaProviderBuilder {
     fn new(owner_name: String, async_provider: Arc<dyn AsyncSchemaProvider>) -> Self {
@@ -117,11 +117,11 @@ impl ResolvedSchemaProviderBuilder {
     async fn resolve_table(
         &mut self,
         table_name: &str,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> Result<()> {
-        let key = (table_name.to_string(), access);
+        let key = (table_name.to_string(), intent);
         if !self.cached_tables.contains_key(&key) {
-            let resolved_table = self.async_provider.table(table_name, access).await?;
+            let resolved_table = self.async_provider.table(table_name, intent).await?;
             self.cached_tables.insert(key, resolved_table);
         }
         Ok(())
@@ -220,12 +220,12 @@ impl CatalogProviderList for ResolvedCatalogProviderList {
 #[async_trait]
 pub trait AsyncSchemaProvider: Send + Sync {
     /// Resolve a table for an operation before its schema is used.
-    /// Implementations must handle access explicitly; wrappers must forward it.
+    /// Implementations must handle intent explicitly; wrappers must forward it.
     /// Authorize absent names before returning `Ok(None)`; denials are errors.
     async fn table(
         &self,
         name: &str,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableProvider>>>;
 
     /// Resolve tables for the requested operations, retaining each operation in the cache.
@@ -234,15 +234,15 @@ pub trait AsyncSchemaProvider: Send + Sync {
     /// The snapshot is scoped to one caller and query; it does not refresh authorization.
     async fn resolve(
         &self,
-        references: &[(TableReference, TableAccess)],
+        references: &[(TableReference, TableIntent)],
         config: &SessionConfig,
         catalog_name: &str,
         schema_name: &str,
     ) -> Result<Arc<dyn SchemaProvider>> {
         let mut cached_tables =
-            HashMap::<(String, TableAccess), Option<Arc<dyn TableProvider>>>::new();
+            HashMap::<(String, TableIntent), Option<Arc<dyn TableProvider>>>::new();
 
-        for (reference, access) in references {
+        for (reference, intent) in references {
             let ref_catalog_name = reference
                 .catalog()
                 .unwrap_or(&config.options().catalog.default_catalog);
@@ -260,9 +260,9 @@ pub trait AsyncSchemaProvider: Send + Sync {
                 continue;
             }
 
-            let key = (reference.table().to_string(), *access);
+            let key = (reference.table().to_string(), *intent);
             if !cached_tables.contains_key(&key) {
-                let resolved_table = self.table(reference.table(), *access).await?;
+                let resolved_table = self.table(reference.table(), *intent).await?;
                 cached_tables.insert(key, resolved_table);
             }
         }
@@ -293,14 +293,14 @@ pub trait AsyncCatalogProvider: Send + Sync {
     /// The snapshot is scoped to one caller and query; it does not refresh authorization.
     async fn resolve(
         &self,
-        references: &[(TableReference, TableAccess)],
+        references: &[(TableReference, TableIntent)],
         config: &SessionConfig,
         catalog_name: &str,
     ) -> Result<Arc<dyn CatalogProvider>> {
         let mut cached_schemas =
             HashMap::<String, Option<ResolvedSchemaProviderBuilder>>::new();
 
-        for (reference, access) in references {
+        for (reference, intent) in references {
             let ref_catalog_name = reference
                 .catalog()
                 .unwrap_or(&config.options().catalog.default_catalog);
@@ -331,7 +331,7 @@ pub trait AsyncCatalogProvider: Send + Sync {
             // If we can't find the catalog don't bother checking the table
             let Some(schema) = schema else { continue };
 
-            schema.resolve_table(reference.table(), *access).await?;
+            schema.resolve_table(reference.table(), *intent).await?;
         }
 
         let cached_schemas = cached_schemas
@@ -361,13 +361,13 @@ pub trait AsyncCatalogProviderList: Send + Sync {
     /// The snapshot is scoped to one caller and query; it does not refresh authorization.
     async fn resolve(
         &self,
-        references: &[(TableReference, TableAccess)],
+        references: &[(TableReference, TableIntent)],
         config: &SessionConfig,
     ) -> Result<Arc<dyn CatalogProviderList>> {
         let mut cached_catalogs =
             HashMap::<String, Option<ResolvedCatalogProviderBuilder>>::new();
 
-        for (reference, access) in references {
+        for (reference, intent) in references {
             let catalog_name = reference
                 .catalog()
                 .unwrap_or(&config.options().catalog.default_catalog);
@@ -418,7 +418,7 @@ pub trait AsyncCatalogProviderList: Send + Sync {
             // If we can't find the catalog don't bother checking the table
             let Some(schema) = schema else { continue };
 
-            schema.resolve_table(reference.table(), *access).await?;
+            schema.resolve_table(reference.table(), *intent).await?;
         }
 
         // Build the cached catalog provider list
@@ -446,7 +446,7 @@ mod tests {
         Statistics, TableReference, assert_contains, error::Result, exec_err,
     };
     use datafusion_execution::config::SessionConfig;
-    use datafusion_expr::{Expr, TableAccess, TableType, dml::InsertOp};
+    use datafusion_expr::{Expr, TableIntent, TableType, dml::InsertOp};
     use datafusion_physical_plan::ExecutionPlan;
 
     use crate::{CatalogProviderList, SchemaProvider, Session, TableProvider};
@@ -495,7 +495,7 @@ mod tests {
         async fn table(
             &self,
             name: &str,
-            _access: TableAccess,
+            _intent: TableIntent,
         ) -> Result<Option<Arc<dyn TableProvider>>> {
             self.lookup_count.fetch_add(1, Ordering::Release);
             if name == MOCK_TABLE {
@@ -508,7 +508,7 @@ mod tests {
 
     struct OperationAwareSchema {
         allow_read: bool,
-        lookups: Mutex<Vec<TableAccess>>,
+        lookups: Mutex<Vec<TableIntent>>,
     }
 
     #[async_trait]
@@ -516,13 +516,13 @@ mod tests {
         async fn table(
             &self,
             name: &str,
-            access: TableAccess,
+            intent: TableIntent,
         ) -> Result<Option<Arc<dyn TableProvider>>> {
-            self.lookups.lock().unwrap().push(access);
-            if access != TableAccess::Insert(InsertOp::Append)
-                && !(self.allow_read && access == TableAccess::Read)
+            self.lookups.lock().unwrap().push(intent);
+            if intent != TableIntent::Insert(InsertOp::Append)
+                && !(self.allow_read && intent == TableIntent::Read)
             {
-                return exec_err!("operation denied: {access:?}");
+                return exec_err!("operation denied: {intent:?}");
             }
             Ok((name == MOCK_TABLE)
                 .then(|| Arc::new(MockTableProvider {}) as Arc<dyn TableProvider>))
@@ -564,7 +564,7 @@ mod tests {
 
     async fn resolve_operations(
         provider: Arc<dyn AsyncSchemaProvider>,
-        references: &[(TableReference, TableAccess)],
+        references: &[(TableReference, TableIntent)],
         level: ResolveLevel,
     ) -> Result<Arc<dyn SchemaProvider>> {
         let config = test_config();
@@ -601,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn operation_aware_caches_do_not_authorize_unresolved_operations() {
-        let insert = TableAccess::Insert(InsertOp::Append);
+        let insert = TableIntent::Insert(InsertOp::Append);
         let references = vec![
             (TableReference::bare(MOCK_TABLE), insert),
             (
@@ -623,14 +623,14 @@ mod tests {
                 .unwrap();
             assert_eq!(*provider.lookups.lock().unwrap(), vec![insert]);
             assert!(cached.table(MOCK_TABLE, insert).await.unwrap().is_some());
-            for access in [TableAccess::Read, TableAccess::Insert(InsertOp::Overwrite)] {
-                let error = cached.table(MOCK_TABLE, access).await.unwrap_err();
+            for intent in [TableIntent::Read, TableIntent::Insert(InsertOp::Overwrite)] {
+                let error = cached.table(MOCK_TABLE, intent).await.unwrap_err();
                 assert_contains!(
                     error.to_string(),
-                    format!("was not resolved for operation {access:?}")
+                    format!("was not resolved for operation {intent:?}")
                 );
             }
-            assert!(cached.table("missing", TableAccess::Read).await.is_err());
+            assert!(cached.table("missing", TableIntent::Read).await.is_err());
             assert_eq!(cached.table_names(), vec![MOCK_TABLE]);
             assert!(cached.table_exist(MOCK_TABLE));
         }
@@ -638,7 +638,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolved_absence_is_distinct_from_an_unrequested_operation() {
-        let create = TableAccess::CreateTable { or_replace: false };
+        let create = TableIntent::CreateTable { or_replace: false };
         for level in [
             ResolveLevel::Schema,
             ResolveLevel::Catalog,
@@ -650,7 +650,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(cached.table("absent", create).await.unwrap().is_none());
-            assert!(cached.table("absent", TableAccess::Read).await.is_err());
+            assert!(cached.table("absent", TableIntent::Read).await.is_err());
             assert!(cached.table("another", create).await.is_err());
             assert!(!cached.table_exist("absent"));
             assert!(cached.table_names().is_empty());
@@ -660,10 +660,10 @@ mod tests {
 
     #[tokio::test]
     async fn operation_aware_caches_check_each_operation() {
-        let insert = TableAccess::Insert(InsertOp::Append);
+        let insert = TableIntent::Insert(InsertOp::Append);
         let references = vec![
             (TableReference::bare(MOCK_TABLE), insert),
-            (TableReference::bare(MOCK_TABLE), TableAccess::Read),
+            (TableReference::bare(MOCK_TABLE), TableIntent::Read),
         ];
         for level in [
             ResolveLevel::Schema,
@@ -680,7 +680,7 @@ mod tests {
             assert!(error.to_string().contains("operation denied: Read"));
             assert_eq!(
                 *denied.lookups.lock().unwrap(),
-                vec![insert, TableAccess::Read]
+                vec![insert, TableIntent::Read]
             );
 
             let allowed = Arc::new(OperationAwareSchema {
@@ -692,11 +692,11 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 *allowed.lookups.lock().unwrap(),
-                vec![insert, TableAccess::Read]
+                vec![insert, TableIntent::Read]
             );
             let write_provider = cached.table(MOCK_TABLE, insert).await.unwrap().unwrap();
             let read_provider = cached
-                .table(MOCK_TABLE, TableAccess::Read)
+                .table(MOCK_TABLE, TableIntent::Read)
                 .await
                 .unwrap()
                 .unwrap();
@@ -708,11 +708,11 @@ mod tests {
     #[tokio::test]
     async fn resolved_read_does_not_authorize_insert() {
         let provider = MockAsyncSchemaProvider::default();
-        let insert = TableAccess::Insert(InsertOp::Append);
+        let insert = TableIntent::Insert(InsertOp::Append);
         let config = test_config();
         let cached = provider
             .resolve(
-                &[(TableReference::bare(MOCK_TABLE), TableAccess::Read)],
+                &[(TableReference::bare(MOCK_TABLE), TableIntent::Read)],
                 &config,
                 MOCK_CATALOG,
                 MOCK_SCHEMA,
@@ -721,7 +721,7 @@ mod tests {
             .unwrap();
         assert!(
             cached
-                .table(MOCK_TABLE, TableAccess::Read)
+                .table(MOCK_TABLE, TableIntent::Read)
                 .await
                 .unwrap()
                 .is_some()
@@ -739,7 +739,7 @@ mod tests {
             .unwrap();
         assert!(cached.table(MOCK_TABLE, insert).await.unwrap().is_some());
         let error = cached
-            .table(MOCK_TABLE, TableAccess::Read)
+            .table(MOCK_TABLE, TableIntent::Read)
             .await
             .unwrap_err();
         assert_contains!(error.to_string(), "was not resolved for operation Read");
@@ -764,7 +764,7 @@ mod tests {
         ) {
             let refs = refs
                 .into_iter()
-                .map(|reference| (reference, TableAccess::Read))
+                .map(|reference| (reference, TableIntent::Read))
                 .collect::<Vec<_>>();
             let async_provider = MockAsyncSchemaProvider::default();
             let cached_provider = async_provider
@@ -779,7 +779,7 @@ mod tests {
 
             for table_ref in found_tables {
                 let table = cached_provider
-                    .table(table_ref, TableAccess::Read)
+                    .table(table_ref, TableIntent::Read)
                     .await
                     .unwrap();
                 assert!(table.is_some());
@@ -788,7 +788,7 @@ mod tests {
             for table_ref in unresolved_tables {
                 assert!(
                     cached_provider
-                        .table(table_ref, TableAccess::Read)
+                        .table(table_ref, TableIntent::Read)
                         .await
                         .is_err()
                 );
@@ -796,7 +796,7 @@ mod tests {
             for table_ref in not_found_tables {
                 assert!(
                     cached_provider
-                        .table(table_ref, TableAccess::Read)
+                        .table(table_ref, TableIntent::Read)
                         .await
                         .unwrap()
                         .is_none()
@@ -876,7 +876,7 @@ mod tests {
         ) {
             let refs = refs
                 .into_iter()
-                .map(|reference| (reference, TableAccess::Read))
+                .map(|reference| (reference, TableIntent::Read))
                 .collect::<Vec<_>>();
             let async_provider = MockAsyncCatalogProvider::default();
             let cached_provider = async_provider
@@ -965,7 +965,7 @@ mod tests {
         ) {
             let refs = refs
                 .into_iter()
-                .map(|reference| (reference, TableAccess::Read))
+                .map(|reference| (reference, TableIntent::Read))
                 .collect::<Vec<_>>();
             let async_provider = MockAsyncCatalogProviderList::default();
             let cached_provider =
@@ -1022,7 +1022,7 @@ mod tests {
         ] {
             let async_provider = MockAsyncCatalogProviderList::default();
             let cached_provider = async_provider
-                .resolve(&[(table_ref.clone(), TableAccess::Read)], &test_config())
+                .resolve(&[(table_ref.clone(), TableIntent::Read)], &test_config())
                 .await
                 .unwrap();
 
@@ -1034,7 +1034,7 @@ mod tests {
                 .unwrap();
             assert!(
                 schema
-                    .table(table_ref.table(), TableAccess::Read)
+                    .table(table_ref.table(), TableIntent::Read)
                     .await
                     .unwrap()
                     .is_some()

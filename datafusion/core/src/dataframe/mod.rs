@@ -58,7 +58,7 @@ use datafusion_common::{
 };
 use datafusion_expr::select_expr::SelectExpr;
 use datafusion_expr::{
-    ExplainOption, ScalarUDF, SortExpr, TableAccess, TableProviderFilterPushDown,
+    ExplainOption, ScalarUDF, SortExpr, TableIntent, TableProviderFilterPushDown,
     UNNAMED_TABLE, case, dml::InsertOp, is_null, lit, utils::COUNT_STAR_EXPANSION,
 };
 use datafusion_functions::core::coalesce;
@@ -2013,7 +2013,7 @@ impl DataFrame {
         let target = match table_schema
             .table(
                 table_ref.table(),
-                TableAccess::Insert(write_options.insert_op),
+                TableIntent::Insert(write_options.insert_op),
             )
             .await?
         {

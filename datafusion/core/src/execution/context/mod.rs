@@ -91,7 +91,7 @@ use datafusion_expr::{
     logical_plan::{DdlStatement, Statement},
     planner::ExprPlanner,
 };
-use datafusion_expr::{HigherOrderUDF, TableAccess};
+use datafusion_expr::{HigherOrderUDF, TableIntent};
 use datafusion_optimizer::analyzer::type_coercion::TypeCoercion;
 use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_optimizer::{Analyzer, OptimizerContext};
@@ -753,7 +753,7 @@ impl SessionContext {
         let exist = schema
             .table(
                 cmd.name.table(),
-                TableAccess::CreateTable {
+                TableIntent::CreateTable {
                     or_replace: cmd.or_replace,
                 },
             )
@@ -771,7 +771,7 @@ impl SessionContext {
                     .find_and_deregister(
                         cmd.name.clone(),
                         TableType::Base,
-                        TableAccess::CreateTable {
+                        TableIntent::CreateTable {
                             or_replace: cmd.or_replace,
                         },
                     )
@@ -830,7 +830,7 @@ impl SessionContext {
 
         let schema_provider = self.state.read().schema_for_ref(name.clone())?;
         let table = schema_provider
-            .table(name.table(), TableAccess::CreateTable { or_replace })
+            .table(name.table(), TableIntent::CreateTable { or_replace })
             .await?;
         match (if_not_exists, or_replace, table) {
             (true, false, Some(_)) => self.return_empty_dataframe(),
@@ -895,7 +895,7 @@ impl SessionContext {
 
         let schema_provider = self.state.read().schema_for_ref(name.clone())?;
         let view = schema_provider
-            .table(name.table(), TableAccess::CreateView { or_replace })
+            .table(name.table(), TableIntent::CreateView { or_replace })
             .await?;
 
         if temporary {
@@ -1005,7 +1005,7 @@ impl SessionContext {
             name, if_exists, ..
         } = cmd;
         let result = self
-            .find_and_deregister(name.clone(), TableType::Base, TableAccess::DropTable)
+            .find_and_deregister(name.clone(), TableType::Base, TableIntent::DropTable)
             .await?;
         match (result, if_exists) {
             (true, _) => self.return_empty_dataframe(),
@@ -1019,7 +1019,7 @@ impl SessionContext {
             name, if_exists, ..
         } = cmd;
         let result = self
-            .find_and_deregister(name.clone(), TableType::View, TableAccess::DropView)
+            .find_and_deregister(name.clone(), TableType::View, TableIntent::DropView)
             .await?;
         match (result, if_exists) {
             (true, _) => self.return_empty_dataframe(),
@@ -1407,7 +1407,7 @@ impl SessionContext {
         &self,
         table_ref: impl Into<TableReference>,
         table_type: TableType,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> Result<bool> {
         let table_ref = table_ref.into();
         let table = table_ref.table().to_owned();
@@ -1421,7 +1421,7 @@ impl SessionContext {
         };
 
         if let Some(schema) = maybe_schema
-            && let Some(table_provider) = schema.table(&table, access).await?
+            && let Some(table_provider) = schema.table(&table, intent).await?
             && table_provider.table_type() == table_type
         {
             schema.deregister_table(&table)?;
@@ -1955,7 +1955,7 @@ impl SessionContext {
     pub async fn table(&self, table_ref: impl Into<TableReference>) -> Result<DataFrame> {
         let table_ref: TableReference = table_ref.into();
         let provider = self
-            .table_provider(table_ref.clone(), TableAccess::Read)
+            .table_provider(table_ref.clone(), TableIntent::Read)
             .await?;
         let plan = LogicalPlanBuilder::scan(
             table_ref,
@@ -1982,18 +1982,18 @@ impl SessionContext {
 
     /// Return a [`TableProvider`] for the specified table and operation.
     ///
-    /// The schema provider may use `access` to authorize resolution before the
+    /// The schema provider may use `intent` to authorize resolution before the
     /// returned provider's schema is used. This does not authorize other
     /// operations performed on the returned provider.
     pub async fn table_provider(
         &self,
         table_ref: impl Into<TableReference>,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> Result<Arc<dyn TableProvider>> {
         let table_ref = table_ref.into();
         let table = table_ref.table().to_string();
         let schema = self.state.read().schema_for_ref(table_ref)?;
-        match schema.table(&table, access).await? {
+        match schema.table(&table, intent).await? {
             Some(ref provider) => Ok(Arc::clone(provider)),
             _ => plan_err!("No table named '{table}'"),
         }

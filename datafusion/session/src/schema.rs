@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use crate::table::TableProvider;
 use datafusion_common::Result;
-use datafusion_expr::{TableAccess, TableType};
+use datafusion_expr::{TableIntent, TableType};
 
 /// Represents a schema, comprising a number of named tables.
 ///
@@ -42,6 +42,11 @@ pub trait SchemaProvider: Any + Debug + Sync + Send {
     }
 
     /// Retrieves the list of available table names in this schema.
+    ///
+    /// Implementations control name visibility. This method does not invoke
+    /// [`Self::table`] or automatically filter names by [`TableIntent::Describe`].
+    /// Information-schema traversal can subsequently request `Describe` for
+    /// returned names; a denied lookup fails that traversal rather than hiding a row.
     fn table_names(&self) -> Vec<String>;
 
     /// Resolves a table for an operation before the planner uses its schema.
@@ -50,14 +55,15 @@ pub trait SchemaProvider: Any + Debug + Sync + Send {
     /// must preserve it; authorizing catalogs must check it before returning a
     /// provider. Identity and privilege mapping belong to the application.
     /// Check absent names too: `Ok(None)` means an authorized missing object,
-    /// while denial is an error. DDL intents include their needed metadata and
-    /// must not implicitly require an additional metadata or read grant.
-    /// Metadata access does not authorize DDL or metadata enumeration.
+    /// while denial is an error. DataFusion does not issue a separate `Describe`
+    /// or `Read` lookup for metadata needed by the operation. Applications decide
+    /// all privileges that their policy requires for that operation.
+    /// [`TableIntent::Describe`] does not authorize DDL or filter name enumeration.
     /// Provider execution and externally supplied plans require separate checks.
     async fn table(
         &self,
         name: &str,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableProvider>>>;
 
     /// Retrieves the type of a specific table from the schema by name, if it exists, otherwise
@@ -65,10 +71,10 @@ pub trait SchemaProvider: Any + Debug + Sync + Send {
     /// expensive can override this to improve operations that only need the type, e.g.
     /// `SELECT * FROM information_schema.tables`.
     ///
-    /// The default requests [`TableAccess::Metadata`]. Overrides must enforce
-    /// their own metadata visibility policy.
+    /// The default requests [`TableIntent::Describe`]. Overrides must enforce
+    /// the same description policy when bypassing [`Self::table`].
     async fn table_type(&self, name: &str) -> Result<Option<TableType>> {
-        self.table(name, TableAccess::Metadata)
+        self.table(name, TableIntent::Describe)
             .await
             .map(|o| o.map(|t| t.table_type()))
     }

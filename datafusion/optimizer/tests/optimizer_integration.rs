@@ -29,7 +29,7 @@ use datafusion_expr::logical_plan::builder::LogicalPlanBuilder;
 use datafusion_expr::planner::ExprPlanner;
 use datafusion_expr::test::function_stub::sum_udaf;
 use datafusion_expr::{
-    AggregateUDF, Expr, Extension, LogicalPlan, ScalarUDF, SortExpr, TableAccess,
+    AggregateUDF, Expr, Extension, LogicalPlan, ScalarUDF, SortExpr, TableIntent,
     TableProviderFilterPushDown, TableSource, UserDefinedLogicalNodeCore, WindowUDF, col,
 };
 use datafusion_functions_aggregate::average::avg_udaf;
@@ -834,7 +834,7 @@ impl ContextProvider for MyContextProvider {
     fn get_table_source(
         &self,
         name: TableReference,
-        _access: TableAccess,
+        _intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableSource>>> {
         let table_name = name.table();
         if let Some(table) = self.tables.get(table_name) {

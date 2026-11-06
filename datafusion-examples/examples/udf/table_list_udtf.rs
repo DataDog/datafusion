@@ -25,7 +25,7 @@ use datafusion::{
     catalog::{MemTable, TableFunctionArgs, TableFunctionImpl, TableProvider},
     common::Result,
     execution::SessionState,
-    logical_expr::TableAccess,
+    logical_expr::TableIntent,
     prelude::SessionContext,
 };
 use datafusion_common::{DataFusionError, plan_err};
@@ -99,7 +99,7 @@ impl TableFunctionImpl for TableListUdtf {
                 for table_name in schema.table_names() {
                     let Some(provider) = block_in_place(|| {
                         Handle::current()
-                            .block_on(schema.table(&table_name, TableAccess::Metadata))
+                            .block_on(schema.table(&table_name, TableIntent::Describe))
                     })?
                     else {
                         continue;

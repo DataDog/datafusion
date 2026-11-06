@@ -24,7 +24,7 @@ use crate::expr::NullTreatment;
 #[cfg(feature = "sql")]
 use crate::logical_plan::LogicalPlan;
 use crate::{
-    AggregateUDF, Expr, GetFieldAccess, HigherOrderUDF, ScalarUDF, SortExpr, TableAccess,
+    AggregateUDF, Expr, GetFieldAccess, HigherOrderUDF, ScalarUDF, SortExpr, TableIntent,
     TableSource, WindowFrame, WindowFunctionDefinition, WindowUDF,
 };
 use arrow::datatypes::{DataType, Field, FieldRef, SchemaRef};
@@ -45,7 +45,7 @@ pub trait ContextProvider {
     /// Resolves a table for an operation before the SQL planner uses its schema.
     ///
     /// Implementations must explicitly handle the intent. Forwarding wrappers
-    /// must preserve it, and caches must distinguish both table and access.
+    /// must preserve it, and caches must distinguish both table and intent.
     /// Identity and the mapping from operations to privileges are application-owned.
     /// Check authorization even for absent names: `Ok(None)` means the lookup was
     /// allowed but no table exists. Denials and unresolved cache entries are errors.
@@ -53,7 +53,7 @@ pub trait ContextProvider {
     fn get_table_source(
         &self,
         name: TableReference,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableSource>>>;
 
     /// Return the type of a file based on its extension (e.g. `.parquet`)

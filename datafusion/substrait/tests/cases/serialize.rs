@@ -18,7 +18,7 @@
 #[cfg(test)]
 mod tests {
     use datafusion::datasource::provider_as_source;
-    use datafusion::logical_expr::{LogicalPlanBuilder, TableAccess};
+    use datafusion::logical_expr::{LogicalPlanBuilder, TableIntent};
     use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
     use datafusion_substrait::logical_plan::producer::to_substrait_plan;
     use datafusion_substrait::serializer;
@@ -96,7 +96,7 @@ mod tests {
     async fn table_scan_without_projection() -> Result<()> {
         let ctx = create_context().await?;
         let table =
-            provider_as_source(ctx.table_provider("data", TableAccess::Read).await?);
+            provider_as_source(ctx.table_provider("data", TableIntent::Read).await?);
         let table_scan = LogicalPlanBuilder::scan("data", table, None)?.build()?;
         let convert_result = to_substrait_plan(&table_scan, &ctx.state());
         assert!(convert_result.is_ok());

@@ -19,7 +19,7 @@
 //!
 //! Simple example of a catalog/schema implementation.
 use async_trait::async_trait;
-use datafusion::logical_expr::TableAccess;
+use datafusion::logical_expr::TableIntent;
 use datafusion::{
     arrow::util::pretty,
     catalog::{CatalogProvider, CatalogProviderList, SchemaProvider},
@@ -187,7 +187,7 @@ impl SchemaProvider for DirSchema {
     async fn table(
         &self,
         name: &str,
-        _access: TableAccess,
+        _intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
         let tables = self.tables.read().unwrap();
         Ok(tables.get(name).cloned())

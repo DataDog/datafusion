@@ -41,7 +41,7 @@ mod higher_order_function;
 mod literal;
 mod operation;
 mod partition_evaluator;
-mod table_access;
+mod table_intent;
 mod table_source;
 mod udaf;
 mod udf;
@@ -134,7 +134,7 @@ pub use logical_plan::*;
 pub use partition_evaluator::PartitionEvaluator;
 #[cfg(feature = "sql")]
 pub use sqlparser;
-pub use table_access::TableAccess;
+pub use table_intent::TableIntent;
 pub use table_source::{TableProviderFilterPushDown, TableSource, TableType};
 pub use udaf::{
     AggregateUDF, AggregateUDFImpl, ReversedUDAF, SetMonotonicity, StatisticsArgs,

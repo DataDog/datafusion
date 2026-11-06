@@ -35,7 +35,7 @@ use datafusion::common::{
 };
 use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::logical_expr::expr::LambdaVariable;
-use datafusion::logical_expr::{Expr, Extension, LogicalPlan, TableAccess};
+use datafusion::logical_expr::{Expr, Extension, LogicalPlan, TableIntent};
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 use substrait::proto::expression as substrait_expression;
@@ -65,7 +65,7 @@ use substrait::proto::{
 /// # use datafusion::common::{not_impl_err, substrait_err, DFSchema, ScalarValue, TableReference};
 /// # use datafusion::error::Result;
 /// # use datafusion::execution::{FunctionRegistry, SessionState};
-/// # use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableAccess};
+/// # use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableIntent};
 /// # use std::sync::Arc;
 /// # use substrait::proto;
 /// # use substrait::proto::{ExtensionLeafRel, FilterRel, ProjectRel, Type};
@@ -91,7 +91,7 @@ use substrait::proto::{
 ///     ) -> Result<Option<Arc<dyn TableProvider>>> {
 ///         let table = table_ref.table().to_string();
 ///         let schema = self.state.schema_for_ref(table_ref.clone())?;
-///         let table_provider = schema.table(&table, TableAccess::Read).await?;
+///         let table_provider = schema.table(&table, TableIntent::Read).await?;
 ///         Ok(table_provider)
 ///     }
 ///
@@ -581,7 +581,7 @@ impl SubstraitConsumer for DefaultSubstraitConsumer<'_> {
     ) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
         let table = table_ref.table().to_string();
         let schema = self.state.schema_for_ref(table_ref.clone())?;
-        let table_provider = schema.table(&table, TableAccess::Read).await?;
+        let table_provider = schema.table(&table, TableIntent::Read).await?;
         Ok(table_provider)
     }
 

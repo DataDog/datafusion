@@ -27,7 +27,7 @@ use datafusion_expr::builder::subquery_alias;
 use datafusion_expr::planner::{
     PlannedRelation, RelationPlannerContext, RelationPlanning,
 };
-use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableAccess, expr::Unnest};
+use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableIntent, expr::Unnest};
 use datafusion_expr::{Subquery, SubqueryAlias};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};
 
@@ -89,20 +89,20 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         relation: TableFactor,
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
-        self.create_relation_with_access(relation, planner_context, TableAccess::Read)
+        self.create_relation_with_intent(relation, planner_context, TableIntent::Read)
     }
 
-    fn create_relation_with_access(
+    fn create_relation_with_intent(
         &self,
         relation: TableFactor,
         planner_context: &mut PlannerContext,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> Result<LogicalPlan> {
         let planned_relation =
             match self.create_extension_relation(relation, planner_context)? {
                 RelationPlanning::Planned(planned) => planned,
                 RelationPlanning::Original(original) => Box::new(
-                    self.create_default_relation(*original, planner_context, access)?,
+                    self.create_default_relation(*original, planner_context, intent)?,
                 ),
             };
 
@@ -155,7 +155,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         &self,
         relation: TableFactor,
         planner_context: &mut PlannerContext,
-        access: TableAccess,
+        intent: TableIntent,
     ) -> Result<PlannedRelation> {
         let relation_span = relation.span();
         let (plan, alias) = match relation {
@@ -203,7 +203,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             Some(cte_plan) => Ok(cte_plan.clone()),
                             None => {
                                 let provider = self
-                                    .require_table_source(table_ref.clone(), access)
+                                    .require_table_source(table_ref.clone(), intent)
                                     .map_err(|e| {
                                         e.with_diagnostic(Diagnostic::new_error(
                                             format!("table '{table_ref}' not found"),
