@@ -205,7 +205,7 @@ SELECT id, CAST(string_col AS varchar) FROM alltypes_plain
 1 1
 
 # Ensure that local files can not be read by default (a potential security issue)
-# File paths require explicit registration.
+# (url table is only supported when DynamicFileCatalog is enabled)
 statement error DataFusion error: Error during planning: table 'datafusion.public.../../parquet-testing/data/alltypes_plain.parquet' not found
 SELECT id, CAST(string_col AS varchar) FROM '../../parquet-testing/data/alltypes_plain.parquet';
 

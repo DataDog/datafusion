@@ -438,12 +438,35 @@ the system table itself. Applications that restrict access to system tables must
 enforce that restriction separately. Approval of `Describe` does not grant row
 access, and approval of another operation need not make an object discoverable.
 
+### Implicit file resolution
+
+`SessionContext::enable_url_table()` enables file paths and URLs as table names;
+the CLI enables this convenience by default. A dynamic schema first calls its
+inner catalog with the original intent. An existing provider wins. Errors stop
+resolution. Only `Ok(None)` may invoke `UrlTableFactory::try_new(url, intent)`.
+
+Description and row operations retain their intent through the factory. DDL
+intents inspect catalog entries without file fallback, including absent creation
+destinations. The built-in listing factory returns `None` for missing files or
+empty listings and propagates inference failures. Its shared options-inference
+helper avoids an extra file listing to distinguish absence from failure.
+
+The CLI configures object stores inside its file factory before inference. It
+wraps an ordinary catalog instead of retrying an unsuccessful lookup through a
+second wrapper. Registered table hits and catalog denials never enter that file
+factory. Automatic store creation requires the typed `ObjectStoreNotFound`
+registry error; permission, configuration, and discovery failures propagate.
+
+File locations have a separate policy boundary. The built-in factories provide
+convenience, not authorization. An authorizing application must check the
+location and intent before calling them, or leave implicit file access disabled.
+An approved absent catalog name alone is insufficient permission to open a file.
+
 ### Integration boundaries
 
-- Catalog lookup has no implicit file or object-store fallback. Register files
-  explicitly, use `CREATE EXTERNAL TABLE`, or use DataFrame file-reading APIs.
-  Those explicit APIs and file/table functions still require application policy
-  for locations.
+- Optional implicit file resolution and explicit file APIs, external tables,
+  COPY, and table functions require application policy for locations. The catalog
+  intent does not provide a filesystem or object-store sandbox.
 - Table DDL requests its actual intent during planning; built-in create/drop
   execution checks it again. Registration/deregistration APIs, schema/catalog
   commands, and custom DDL execution still need their own checks. Keep mutation

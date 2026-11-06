@@ -46,7 +46,7 @@ SELECT a, b FROM json_test
 7 -3.5
 
 # Ensure that local files can not be read by default (a potential security issue)
-# File paths require explicit registration.
+# (url table is only supported when DynamicFileCatalog is enabled)
 statement error DataFusion error: Error during planning: table 'datafusion.public.../core/tests/data/2.json' not found
 SELECT a, b FROM '../core/tests/data/2.json'
 

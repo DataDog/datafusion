@@ -29,6 +29,28 @@ use object_store::local::LocalFileSystem;
 use std::sync::Arc;
 use url::Url;
 
+/// No object store is registered or discoverable for a URL.
+///
+/// Registries return this as [`DataFusionError::External`] to distinguish a
+/// missing registration from authorization, configuration, and discovery errors.
+#[derive(Debug)]
+pub struct ObjectStoreNotFound {
+    /// The store URL, without credentials or an object path.
+    pub url: String,
+}
+
+impl std::fmt::Display for ObjectStoreNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "No suitable object store found for {}. See `RuntimeEnv::register_object_store`",
+            self.url
+        )
+    }
+}
+
+impl std::error::Error for ObjectStoreNotFound {}
+
 /// A parsed URL identifying a particular [`ObjectStore`] instance
 ///
 /// For example:
@@ -174,6 +196,9 @@ pub trait ObjectStoreRegistry: Send + Sync + std::fmt::Debug + 'static {
     /// If no [`ObjectStore`] found for the `url`, ad-hoc discovery may be executed depending on
     /// the `url` and [`ObjectStoreRegistry`] implementation. An [`ObjectStore`] may be lazily
     /// created and registered.
+    /// Return [`ObjectStoreNotFound`] inside [`DataFusionError::External`] only
+    /// for an absent store. Callers may use that result to configure a store;
+    /// other errors must not trigger automatic registration.
     fn get_store(&self, url: &Url) -> Result<Arc<dyn ObjectStore>>;
 }
 
@@ -258,7 +283,7 @@ impl ObjectStoreRegistry for DefaultObjectStoreRegistry {
             .get(&s)
             .map(|o| Arc::clone(o.value()))
             .ok_or_else(|| {
-                internal_datafusion_err!("No suitable object store found for {url}. See `RuntimeEnv::register_object_store`")
+                DataFusionError::External(Box::new(ObjectStoreNotFound { url: s }))
             })
     }
 }
@@ -276,6 +301,19 @@ fn get_url_key(url: &Url) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_registration_has_a_distinct_error_type() {
+        let registry = DefaultObjectStoreRegistry::new();
+        let error = registry
+            .get_store(&Url::parse("s3://unregistered/data.csv").unwrap())
+            .unwrap_err();
+        let DataFusionError::External(error) = error else {
+            panic!("expected typed missing-store error")
+        };
+        let missing = error.downcast_ref::<ObjectStoreNotFound>().unwrap();
+        assert_eq!(missing.url, "s3://unregistered");
+    }
 
     #[test]
     fn test_object_store_url() {

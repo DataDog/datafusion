@@ -49,7 +49,7 @@ SELECT * FROM arrow_simple
 4 NULL true
 
 # Ensure that local files can not be read by default (a potential security issue)
-# File paths require explicit registration.
+# (url table is only supported when DynamicFileCatalog is enabled)
 statement error DataFusion error: Error during planning: table 'datafusion.public.../datasource-arrow/tests/data/example.arrow' not found
 SELECT * FROM '../datasource-arrow/tests/data/example.arrow';
 

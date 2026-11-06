@@ -623,7 +623,7 @@ async fn direct_ddl_execution_checks_absent_names() {
 }
 
 #[tokio::test]
-async fn missing_file_names_do_not_open_files_or_register_stores() {
+async fn file_resolution_requires_explicit_opt_in() {
     let ctx = SessionContext::new();
     for name in [
         "tests/data/example.csv",

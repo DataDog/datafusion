@@ -121,8 +121,7 @@ performed during query execution to STDOUT.
 ```sql
 > \object_store_profiling trace
 ObjectStore Profile mode set to Trace
-> CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION 'https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_1.parquet';
-> select count(*) from hits;
+> select count(*) from 'https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_1.parquet';
 +----------+
 | count(*) |
 +----------+

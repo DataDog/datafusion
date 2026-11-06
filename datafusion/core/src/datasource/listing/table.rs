@@ -51,56 +51,59 @@ impl ListingTableConfigExt for ListingTableConfig {
         self,
         state: &dyn Session,
     ) -> datafusion_common::Result<ListingTableConfig> {
-        let store = if let Some(url) = self.table_paths.first() {
-            state.runtime_env().object_store(url)?
-        } else {
+        let Some(url) = self.table_paths.first() else {
             return Ok(self);
         };
-
-        let file = self
-            .table_paths
-            .first()
-            .unwrap()
-            .list_all_files(state, store.as_ref(), "")
+        let options = infer_listing_options(url, state)
             .await?
-            .next()
-            .await
-            .ok_or_else(|| internal_datafusion_err!("No files for table"))??;
-
-        let (file_extension, maybe_compression_type) =
-            ListingTableConfig::infer_file_extension_and_compression_type(
-                file.location.as_ref(),
-            )?;
-
-        let mut format_options = HashMap::new();
-        if let Some(ref compression_type) = maybe_compression_type {
-            format_options
-                .insert("format.compression".to_string(), compression_type.clone());
-        }
-        let state = state.as_any().downcast_ref::<SessionState>().unwrap();
-        let file_format = state
-            .get_file_format_factory(&file_extension)
-            .ok_or(config_datafusion_err!(
-                "No file_format found with extension {file_extension}"
-            ))?
-            .create(state, &format_options)?;
-
-        let listing_file_extension =
-            if let Some(compression_type) = maybe_compression_type {
-                format!("{file_extension}.{compression_type}")
-            } else {
-                file_extension
-            };
-
-        let listing_options =
-            ListingOptions::new(file_format).with_file_extension(listing_file_extension);
-
-        Ok(self.with_listing_options(listing_options))
+            .ok_or_else(|| internal_datafusion_err!("No files for table"))?;
+        Ok(self.with_listing_options(options))
     }
 
     async fn infer(self, state: &dyn Session) -> datafusion_common::Result<Self> {
         self.infer_options(state).await?.infer_schema(state).await
     }
+}
+
+/// Infer options when a location contains at least one file.
+/// An empty listing is distinct from configuration and storage errors.
+pub(crate) async fn infer_listing_options(
+    url: &datafusion_datasource::ListingTableUrl,
+    state: &dyn Session,
+) -> datafusion_common::Result<Option<ListingOptions>> {
+    let store = state.runtime_env().object_store(url)?;
+    let mut files = url.list_all_files(state, store.as_ref(), "").await?;
+    let Some(file) = files.next().await else {
+        return Ok(None);
+    };
+    let file = file?;
+    let (file_extension, maybe_compression_type) =
+        ListingTableConfig::infer_file_extension_and_compression_type(
+            file.location.as_ref(),
+        )?;
+
+    let mut format_options = HashMap::new();
+    if let Some(ref compression_type) = maybe_compression_type {
+        format_options.insert("format.compression".to_string(), compression_type.clone());
+    }
+    let state = state.as_any().downcast_ref::<SessionState>().unwrap();
+    let file_format = state
+        .get_file_format_factory(&file_extension)
+        .ok_or(config_datafusion_err!(
+            "No file_format found with extension {file_extension}"
+        ))?
+        .create(state, &format_options)?;
+
+    let listing_file_extension = if let Some(compression_type) = maybe_compression_type {
+        format!("{file_extension}.{compression_type}")
+    } else {
+        file_extension
+    };
+
+    let listing_options =
+        ListingOptions::new(file_format).with_file_extension(listing_file_extension);
+
+    Ok(Some(listing_options))
 }
 
 #[cfg(test)]

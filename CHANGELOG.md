@@ -22,8 +22,10 @@
 **Breaking changes:** table lookup now requires `TableIntent` across catalog,
 SQL planner, and remote snapshot APIs. `ContextProvider::get_table_source` returns
 an optional source; unresolved snapshot lookups fail instead of returning
-absence. Implicit file-table lookup has been removed, and foreign FFI schema
-adapters reject non-read intents. See the
+absence. Implicit file lookup preserves intent and propagates failures;
+`UrlTableFactory::try_new` now requires intent too. Missing object-store
+registrations use a typed `ObjectStoreNotFound` error. Foreign FFI schema adapters
+reject non-read intents. See the
 [migration guide](docs/source/library-user-guide/upgrading/55.0.0.md#den-fork-operation-aware-table-resolution)
 for required implementation changes and authorization boundaries.
 

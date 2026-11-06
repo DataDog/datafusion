@@ -17,33 +17,85 @@
   under the License.
 -->
 
-# Files and directories
+# Local Files / Directories
 
-Register files explicitly with `CREATE EXTERNAL TABLE` before querying them.
-A missing catalog name is not interpreted as a file path or URL. Implicit file
-queries and automatic object-store registration during catalog lookup are removed.
-The CLI still configures object stores for explicit external-table and `COPY`
-statements.
+Files can be queried directly by enclosing the file, directory name
+or a remote location in single `'` quotes as shown in the examples.
 
-For a local CSV file with a header:
+Create a CSV file to query.
 
-```sql
-CREATE EXTERNAL TABLE data STORED AS CSV LOCATION 'data.csv'
-OPTIONS ('format.has_header' 'true');
-SELECT * FROM data;
+```shell
+$ echo "a,b" > data.csv
+$ echo "1,2" >> data.csv
 ```
 
-For a directory, use its path as `LOCATION`. For a remote Parquet file:
+Query that single file (the CLI also supports parquet, compressed csv, avro, json and more)
 
-```sql
-CREATE EXTERNAL TABLE hits STORED AS PARQUET
-LOCATION 'https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_1.parquet';
-SELECT count(*) FROM hits;
+```shell
+$ datafusion-cli
+DataFusion CLI v17.0.0
+> select * from 'data.csv';
++---+---+
+| a | b |
++---+---+
+| 1 | 2 |
++---+---+
+1 row in set. Query took 0.007 seconds.
 ```
 
-Cloud locations use their normal schemes (`s3://`, `gs://`, and others) and
-credentials as described below. Registration makes the file access explicit; an
-embedding application must still authorize the location and the command.
+You can also query directories of files with compatible schemas:
+
+```shell
+$ ls data_dir/
+data.csv   data2.csv
+```
+
+```shell
+$ datafusion-cli
+DataFusion CLI v16.0.0
+> select * from 'data_dir';
++---+---+
+| a | b |
++---+---+
+| 3 | 4 |
+| 1 | 2 |
++---+---+
+2 rows in set. Query took 0.007 seconds.
+```
+
+# Remote Files / Directories
+
+You can also query directly any remote location supported by DataFusion without
+registering the location as a table.
+For example, to read from a remote parquet file via HTTP(S) you can use the following:
+
+```sql
+select count(*) from 'https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_1.parquet'
++----------+
+| COUNT(*) |
++----------+
+| 1000000  |
++----------+
+1 row in set. Query took 0.595 seconds.
+```
+
+To read from an AWS S3 or GCS, use `s3` or `gs` as a protocol prefix. For
+example, to read a file in an S3 bucket named `my-data-bucket` use the URL
+`s3://my-data-bucket`and set the relevant access credentials as environmental
+variables (e.g. for AWS S3 you can use `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`).
+
+```sql
+> select count(*) from 's3://altinity-clickhouse-data/nyc_taxi_rides/data/tripdata_parquet/';
++------------+
+| count(*)   |
++------------+
+| 1310903963 |
++------------+
+```
+
+See the [`CREATE EXTERNAL TABLE`](#create-external-table) section below for
+additional configuration options.
 
 # `CREATE EXTERNAL TABLE`
 

@@ -63,5 +63,14 @@ pub async fn query_aws_s3() -> Result<()> {
     // print the results
     df.show().await?;
 
+    // dynamic query by the file path
+    let ctx = ctx.enable_url_table();
+    let df = ctx
+        .sql(format!(r#"SELECT * FROM '{path}' LIMIT 10"#).as_str())
+        .await?;
+
+    // print the results
+    df.show().await?;
+
     Ok(())
 }

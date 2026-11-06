@@ -57,7 +57,7 @@ statement ok
 DROP TABLE aggregate_simple;
 
 ##########
-# An unregistered file is not a catalog table.
+# Describe file (we can only describe file if the default catalog is `DynamicFileCatalog`)
 ##########
 
 statement error Error during planning: table 'datafusion.public.../core/tests/data/aggregate_simple.csv' not found
