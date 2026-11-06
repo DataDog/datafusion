@@ -27,7 +27,7 @@ use datafusion_expr::test::function_stub::{
 };
 use datafusion_expr::{
     ColumnarValue, EmptyRelation, Expr, Extension, LogicalPlan, LogicalPlanBuilder,
-    ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Union,
+    ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TableIntent, Union,
     UserDefinedLogicalNode, UserDefinedLogicalNodeCore, Volatility, WindowFrame,
     WindowFunctionDefinition, cast, col, exists, in_subquery, lit, scalar_subquery,
     table_scan, wildcard,
@@ -100,7 +100,10 @@ fn roundtrip_expr(table: TableReference, sql: &str) -> Result<String> {
     let sql_expr = Parser::new(&dialect).try_with_sql(sql)?.parse_expr()?;
     let state = MockSessionState::default().with_aggregate_function(sum_udaf());
     let context = MockContextProvider { state };
-    let schema = context.get_table_source(table)?.schema();
+    let schema = context
+        .get_table_source(table, TableIntent::Read)?
+        .unwrap()
+        .schema();
     let df_schema = DFSchema::try_from(schema)?;
     let sql_to_rel = SqlToRel::new(&context);
     let expr =
@@ -3504,7 +3507,8 @@ fn test_unparse_aggregate_over_subquery_no_inner_proj() -> Result<()> {
         state: MockSessionState::default(),
     };
     let j1_schema = context
-        .get_table_source(TableReference::bare("j1"))?
+        .get_table_source(TableReference::bare("j1"), TableIntent::Read)?
+        .unwrap()
         .schema();
 
     let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
@@ -3538,7 +3542,8 @@ fn test_unparse_aggregate_no_outer_rename() -> Result<()> {
         state: MockSessionState::default(),
     };
     let j1_schema = context
-        .get_table_source(TableReference::bare("j1"))?
+        .get_table_source(TableReference::bare("j1"), TableIntent::Read)?
+        .unwrap()
         .schema();
 
     let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
@@ -3569,7 +3574,8 @@ fn test_unparse_aggregate_with_sort_no_inner_proj() -> Result<()> {
         state: MockSessionState::default(),
     };
     let j1_schema = context
-        .get_table_source(TableReference::bare("j1"))?
+        .get_table_source(TableReference::bare("j1"), TableIntent::Read)?
+        .unwrap()
         .schema();
 
     let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
@@ -3599,7 +3605,8 @@ fn test_unparse_aggregate_with_limit_sort_no_inner_proj() -> Result<()> {
         state: MockSessionState::default(),
     };
     let j1_schema = context
-        .get_table_source(TableReference::bare("j1"))?
+        .get_table_source(TableReference::bare("j1"), TableIntent::Read)?
+        .unwrap()
         .schema();
 
     let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
@@ -3632,7 +3639,8 @@ fn test_unparse_aggregate_with_sort_over_limit_no_inner_proj() -> Result<()> {
         state: MockSessionState::default(),
     };
     let j1_schema = context
-        .get_table_source(TableReference::bare("j1"))?
+        .get_table_source(TableReference::bare("j1"), TableIntent::Read)?
+        .unwrap()
         .schema();
 
     let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
@@ -3662,7 +3670,8 @@ fn test_unparse_aggregate_with_repeated_limits_combines() -> Result<()> {
         state: MockSessionState::default(),
     };
     let j1_schema = context
-        .get_table_source(TableReference::bare("j1"))?
+        .get_table_source(TableReference::bare("j1"), TableIntent::Read)?
+        .unwrap()
         .schema();
 
     let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
@@ -3692,7 +3701,8 @@ fn test_unparse_aggregate_with_repeated_limits_combines_offset() -> Result<()> {
         state: MockSessionState::default(),
     };
     let j1_schema = context
-        .get_table_source(TableReference::bare("j1"))?
+        .get_table_source(TableReference::bare("j1"), TableIntent::Read)?
+        .unwrap()
         .schema();
 
     let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
@@ -3723,7 +3733,8 @@ fn test_unparse_aggregate_with_repeated_sorts_keeps_outermost() -> Result<()> {
         state: MockSessionState::default(),
     };
     let j1_schema = context
-        .get_table_source(TableReference::bare("j1"))?
+        .get_table_source(TableReference::bare("j1"), TableIntent::Read)?
+        .unwrap()
         .schema();
 
     let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
@@ -3755,7 +3766,8 @@ fn test_unparse_aggregate_with_sort_limit_sort_uses_derived_subquery() -> Result
         state: MockSessionState::default(),
     };
     let j1_schema = context
-        .get_table_source(TableReference::bare("j1"))?
+        .get_table_source(TableReference::bare("j1"), TableIntent::Read)?
+        .unwrap()
         .schema();
 
     let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
@@ -3788,7 +3800,8 @@ fn test_unparse_aggregate_with_non_literal_limit_over_sort_with_fetch() -> Resul
         state: MockSessionState::default(),
     };
     let j1_schema = context
-        .get_table_source(TableReference::bare("j1"))?
+        .get_table_source(TableReference::bare("j1"), TableIntent::Read)?
+        .unwrap()
         .schema();
 
     let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
@@ -3822,10 +3835,12 @@ fn test_unparse_manual_join_with_subquery_aggregate() -> Result<()> {
         state: MockSessionState::default(),
     };
     let j1_schema = context
-        .get_table_source(TableReference::bare("j1"))?
+        .get_table_source(TableReference::bare("j1"), TableIntent::Read)?
+        .unwrap()
         .schema();
     let j2_schema = context
-        .get_table_source(TableReference::bare("j2"))?
+        .get_table_source(TableReference::bare("j2"), TableIntent::Read)?
+        .unwrap()
         .schema();
 
     // Build the right side: SELECT max(j2_id) AS max_id FROM j2

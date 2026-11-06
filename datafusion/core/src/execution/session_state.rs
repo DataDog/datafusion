@@ -51,8 +51,6 @@ use datafusion_common::{
 use datafusion_execution::TaskContext;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::runtime_env::RuntimeEnv;
-#[cfg(feature = "sql")]
-use datafusion_expr::TableSource;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::expr_rewriter::FunctionRewrite;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
@@ -67,6 +65,8 @@ use datafusion_expr::simplify::SimplifyContext;
 use datafusion_expr::{
     AggregateUDF, Explain, Expr, HigherOrderUDF, LogicalPlan, ScalarUDF, WindowUDF,
 };
+#[cfg(feature = "sql")]
+use datafusion_expr::{TableIntent, TableSource};
 use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_optimizer::{
     Analyzer, AnalyzerRule, Optimizer, OptimizerConfig, OptimizerRule,
@@ -527,6 +527,9 @@ impl SessionState {
 
     /// Resolve all table references in the SQL statement. Does not include CTE references.
     ///
+    /// This collects dependencies without operation intent. Use
+    /// [`Self::resolve_table_references_with_intent`] to prepare catalog lookups.
+    ///
     /// See [`datafusion_sql::resolve::resolve_table_references`] for more information.
     ///
     /// [`datafusion_sql::resolve::resolve_table_references`]: datafusion_sql::resolve::resolve_table_references
@@ -544,28 +547,50 @@ impl SessionState {
         Ok(table_refs)
     }
 
+    /// Resolve table references and the operation required by each occurrence.
+    ///
+    /// CTE references are excluded. A table used for both reading and writing is
+    /// returned separately for each operation.
+    #[cfg(feature = "sql")]
+    pub fn resolve_table_references_with_intent(
+        &self,
+        statement: &Statement,
+    ) -> datafusion_common::Result<Vec<(TableReference, TableIntent)>> {
+        let enable_ident_normalization =
+            self.config.options().sql_parser.enable_ident_normalization;
+        let (table_refs, _) =
+            datafusion_sql::resolve::resolve_table_references_with_intent(
+                statement,
+                enable_ident_normalization,
+            )?;
+        Ok(table_refs)
+    }
+
     /// Convert an AST Statement into a LogicalPlan
     #[cfg(feature = "sql")]
     pub async fn statement_to_plan(
         &self,
         statement: Statement,
     ) -> datafusion_common::Result<LogicalPlan> {
-        let references = self.resolve_table_references(&statement)?;
+        let references = self.resolve_table_references_with_intent(&statement)?;
 
         let mut provider = SessionContextProvider {
             state: self,
             tables: HashMap::with_capacity(references.len()),
         };
 
-        for reference in references {
+        for (reference, intent) in references {
             let resolved = self.resolve_table_ref(reference);
-            if let Entry::Vacant(v) = provider.tables.entry(resolved) {
-                let resolved = v.key();
-                if let Ok(schema) = self.schema_for_ref(resolved.clone())
-                    && let Some(table) = schema.table(&resolved.table).await?
-                {
-                    v.insert(provider_as_source(table));
-                }
+            if let Entry::Vacant(v) = provider.tables.entry((resolved, intent)) {
+                let (resolved, intent) = v.key();
+                let table = match self.schema_for_ref(resolved.clone()) {
+                    Ok(schema) => schema
+                        .table(&resolved.table, *intent)
+                        .await?
+                        .map(provider_as_source),
+                    Err(_) => None,
+                };
+                v.insert(table);
             }
         }
 
@@ -1959,7 +1984,7 @@ impl From<SessionState> for SessionStateBuilder {
 #[cfg(feature = "sql")]
 struct SessionContextProvider<'a> {
     state: &'a SessionState,
-    tables: HashMap<ResolvedTableReference, Arc<dyn TableSource>>,
+    tables: HashMap<(ResolvedTableReference, TableIntent), Option<Arc<dyn TableSource>>>,
 }
 
 #[cfg(feature = "sql")]
@@ -1983,12 +2008,17 @@ impl ContextProvider for SessionContextProvider<'_> {
     fn get_table_source(
         &self,
         name: TableReference,
-    ) -> datafusion_common::Result<Arc<dyn TableSource>> {
+        intent: TableIntent,
+    ) -> datafusion_common::Result<Option<Arc<dyn TableSource>>> {
         let name = self.state.resolve_table_ref(name);
         self.tables
-            .get(&name)
+            .get(&(name.clone(), intent))
             .cloned()
-            .ok_or_else(|| plan_datafusion_err!("table '{name}' not found"))
+            .ok_or_else(|| {
+                plan_datafusion_err!(
+                    "table '{name}' was not resolved for operation {intent:?}"
+                )
+            })
     }
 
     fn get_table_function_source(
@@ -2389,7 +2419,7 @@ mod tests {
     use datafusion_common::{DFSchema, ResolvedTableReference, Result, TableReference};
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::Expr;
-    use datafusion_expr::HigherOrderUDF;
+    use datafusion_expr::{HigherOrderUDF, TableIntent};
     use datafusion_optimizer::Optimizer;
     use datafusion_optimizer::optimizer::OptimizerRule;
     use datafusion_physical_plan::display::DisplayableExecutionPlan;
@@ -2693,13 +2723,17 @@ mod tests {
     }
 
     impl ContextProvider for MyContextProvider {
-        fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
+        fn get_table_source(
+            &self,
+            name: TableReference,
+            _intent: TableIntent,
+        ) -> Result<Option<Arc<dyn TableSource>>> {
             let resolved_table_ref = ResolvedTableReference {
                 catalog: "default".to_string().into(),
                 schema: "public".to_string().into(),
                 table: name.table().to_string().into(),
             };
-            let source = self.tables.get(&resolved_table_ref).cloned().unwrap();
+            let source = self.tables.get(&resolved_table_ref).cloned();
             Ok(source)
         }
 

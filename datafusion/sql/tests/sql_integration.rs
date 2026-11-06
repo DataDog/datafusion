@@ -290,7 +290,7 @@ fn parse_ident_normalization_5() {
         .strip_backtrace();
     assert_snapshot!(
         plan,
-        @"Error during planning: No table named: PERSON found"
+        @"Error during planning: table 'datafusion.public.PERSON' not found"
     );
 }
 

@@ -58,8 +58,8 @@ use datafusion_common::{
 };
 use datafusion_expr::select_expr::SelectExpr;
 use datafusion_expr::{
-    ExplainOption, ScalarUDF, SortExpr, TableProviderFilterPushDown, UNNAMED_TABLE, case,
-    dml::InsertOp, is_null, lit, utils::COUNT_STAR_EXPANSION,
+    ExplainOption, ScalarUDF, SortExpr, TableIntent, TableProviderFilterPushDown,
+    UNNAMED_TABLE, case, dml::InsertOp, is_null, lit, utils::COUNT_STAR_EXPANSION,
 };
 use datafusion_functions::core::coalesce;
 use datafusion_functions::math::nanvl;
@@ -2010,7 +2010,13 @@ impl DataFrame {
 
         let table_ref: TableReference = table_name.into();
         let table_schema = self.session_state.schema_for_ref(table_ref.clone())?;
-        let target = match table_schema.table(table_ref.table()).await? {
+        let target = match table_schema
+            .table(
+                table_ref.table(),
+                TableIntent::Insert(write_options.insert_op),
+            )
+            .await?
+        {
             Some(ref provider) => Ok(Arc::clone(provider)),
             _ => plan_err!("No table named '{table_name}'"),
         }?;

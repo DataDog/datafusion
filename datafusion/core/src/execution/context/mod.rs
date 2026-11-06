@@ -84,7 +84,6 @@ use datafusion_execution::disk_manager::{
     DEFAULT_MAX_SPILL_MERGE_FAN_IN, DEFAULT_MAX_TEMP_DIRECTORY_SIZE, DiskManagerBuilder,
 };
 use datafusion_execution::registry::SerializerRegistry;
-use datafusion_expr::HigherOrderUDF;
 pub use datafusion_expr::execution_props::ExecutionProps;
 #[cfg(feature = "sql")]
 use datafusion_expr::planner::RelationPlanner;
@@ -95,6 +94,7 @@ use datafusion_expr::{
     logical_plan::{DdlStatement, Statement},
     planner::ExprPlanner,
 };
+use datafusion_expr::{HigherOrderUDF, TableIntent};
 use datafusion_optimizer::analyzer::type_coercion::TypeCoercion;
 use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_optimizer::{Analyzer, OptimizerContext};
@@ -383,6 +383,12 @@ impl SessionContext {
     /// ```sql
     /// SELECT * from 'my_file.parquet'
     /// ```
+    ///
+    /// Catalog errors are propagated without file fallback. A missing name may
+    /// resolve to a file for description or row operations; DDL destinations do
+    /// not trigger file inference. This convenience factory does not authorize
+    /// file locations. Applications with restricted storage access must enforce
+    /// location policy before inference, or leave this feature disabled.
     ///
     /// See [DynamicFileCatalog] for more details
     ///
@@ -813,7 +819,16 @@ impl SessionContext {
         &self,
         cmd: &CreateExternalTable,
     ) -> Result<DataFrame> {
-        let exist = self.table_exist(cmd.name.clone())?;
+        let schema = self.state.read().schema_for_ref(cmd.name.clone())?;
+        let exist = schema
+            .table(
+                cmd.name.table(),
+                TableIntent::CreateTable {
+                    or_replace: cmd.or_replace,
+                },
+            )
+            .await?
+            .is_some();
 
         if cmd.temporary {
             return not_impl_err!("Temporary tables not supported");
@@ -823,7 +838,13 @@ impl SessionContext {
             (true, false, true) => self.return_empty_dataframe(),
             (false, true, true) => {
                 let result = self
-                    .find_and_deregister(cmd.name.clone(), TableType::Base)
+                    .find_and_deregister(
+                        cmd.name.clone(),
+                        TableType::Base,
+                        TableIntent::CreateTable {
+                            or_replace: cmd.or_replace,
+                        },
+                    )
                     .await;
 
                 match result {
@@ -877,10 +898,13 @@ impl SessionContext {
             return not_impl_err!("Temporary tables not supported");
         }
 
-        let table = self.table(name.clone()).await;
+        let schema_provider = self.state.read().schema_for_ref(name.clone())?;
+        let table = schema_provider
+            .table(name.table(), TableIntent::CreateTable { or_replace })
+            .await?;
         match (if_not_exists, or_replace, table) {
-            (true, false, Ok(_)) => self.return_empty_dataframe(),
-            (false, true, Ok(_)) => {
+            (true, false, Some(_)) => self.return_empty_dataframe(),
+            (false, true, Some(_)) => {
                 Self::ensure_unique_column_names(input.schema())?;
                 self.deregister_table(name.clone())?;
                 let schema = Arc::clone(input.schema().inner());
@@ -897,10 +921,10 @@ impl SessionContext {
                 self.register_table(name.clone(), table)?;
                 self.return_empty_dataframe()
             }
-            (true, true, Ok(_)) => {
+            (true, true, Some(_)) => {
                 exec_err!("'IF NOT EXISTS' cannot coexist with 'REPLACE'")
             }
-            (_, _, Err(_)) => {
+            (_, _, None) => {
                 Self::ensure_unique_column_names(input.schema())?;
                 let schema = Arc::clone(input.schema().inner());
                 let physical = DataFrame::new(self.state(), input);
@@ -916,7 +940,7 @@ impl SessionContext {
                 self.register_table(name, table)?;
                 self.return_empty_dataframe()
             }
-            (false, false, Ok(_)) => exec_err!("Table '{name}' already exists"),
+            (false, false, Some(_)) => exec_err!("Table '{name}' already exists"),
         }
     }
 
@@ -939,14 +963,17 @@ impl SessionContext {
             temporary,
         } = cmd;
 
-        let view = self.table(name.clone()).await;
+        let schema_provider = self.state.read().schema_for_ref(name.clone())?;
+        let view = schema_provider
+            .table(name.table(), TableIntent::CreateView { or_replace })
+            .await?;
 
         if temporary {
             return not_impl_err!("Temporary views not supported");
         }
 
         match (or_replace, view) {
-            (true, Ok(_)) => {
+            (true, Some(_)) => {
                 let input = Self::apply_type_coercion(Arc::unwrap_or_clone(input))?;
                 Self::ensure_unique_column_names(input.schema())?;
                 self.deregister_table(name.clone())?;
@@ -954,14 +981,14 @@ impl SessionContext {
                 self.register_table(name, table)?;
                 self.return_empty_dataframe()
             }
-            (_, Err(_)) => {
+            (_, None) => {
                 let input = Self::apply_type_coercion(Arc::unwrap_or_clone(input))?;
                 Self::ensure_unique_column_names(input.schema())?;
                 let table = Arc::new(ViewTable::new(input, definition));
                 self.register_table(name, table)?;
                 self.return_empty_dataframe()
             }
-            (false, Ok(_)) => exec_err!("Table '{name}' already exists"),
+            (false, Some(_)) => exec_err!("Table '{name}' already exists"),
         }
     }
 
@@ -1048,10 +1075,10 @@ impl SessionContext {
             name, if_exists, ..
         } = cmd;
         let result = self
-            .find_and_deregister(name.clone(), TableType::Base)
-            .await;
+            .find_and_deregister(name.clone(), TableType::Base, TableIntent::DropTable)
+            .await?;
         match (result, if_exists) {
-            (Ok(true), _) => self.return_empty_dataframe(),
+            (true, _) => self.return_empty_dataframe(),
             (_, true) => self.return_empty_dataframe(),
             (_, _) => exec_err!("Table '{name}' doesn't exist."),
         }
@@ -1062,10 +1089,10 @@ impl SessionContext {
             name, if_exists, ..
         } = cmd;
         let result = self
-            .find_and_deregister(name.clone(), TableType::View)
-            .await;
+            .find_and_deregister(name.clone(), TableType::View, TableIntent::DropView)
+            .await?;
         match (result, if_exists) {
-            (Ok(true), _) => self.return_empty_dataframe(),
+            (true, _) => self.return_empty_dataframe(),
             (_, true) => self.return_empty_dataframe(),
             (_, _) => exec_err!("View '{name}' doesn't exist."),
         }
@@ -1450,6 +1477,7 @@ impl SessionContext {
         &self,
         table_ref: impl Into<TableReference>,
         table_type: TableType,
+        intent: TableIntent,
     ) -> Result<bool> {
         let table_ref = table_ref.into();
         let table = table_ref.table().to_owned();
@@ -1463,7 +1491,7 @@ impl SessionContext {
         };
 
         if let Some(schema) = maybe_schema
-            && let Some(table_provider) = schema.table(&table).await?
+            && let Some(table_provider) = schema.table(&table, intent).await?
             && table_provider.table_type() == table_type
         {
             schema.deregister_table(&table)?;
@@ -1996,7 +2024,9 @@ impl SessionContext {
     /// [`register_table`]: SessionContext::register_table
     pub async fn table(&self, table_ref: impl Into<TableReference>) -> Result<DataFrame> {
         let table_ref: TableReference = table_ref.into();
-        let provider = self.table_provider(table_ref.clone()).await?;
+        let provider = self
+            .table_provider(table_ref.clone(), TableIntent::Read)
+            .await?;
         let plan = LogicalPlanBuilder::scan(
             table_ref,
             provider_as_source(Arc::clone(&provider)),
@@ -2020,15 +2050,20 @@ impl SessionContext {
             .ok_or_else(|| plan_datafusion_err!("Table function '{name}' not found"))
     }
 
-    /// Return a [`TableProvider`] for the specified table.
+    /// Return a [`TableProvider`] for the specified table and operation.
+    ///
+    /// The schema provider may use `intent` to authorize resolution before the
+    /// returned provider's schema is used. This does not authorize other
+    /// operations performed on the returned provider.
     pub async fn table_provider(
         &self,
         table_ref: impl Into<TableReference>,
+        intent: TableIntent,
     ) -> Result<Arc<dyn TableProvider>> {
         let table_ref = table_ref.into();
         let table = table_ref.table().to_string();
         let schema = self.state.read().schema_for_ref(table_ref)?;
-        match schema.table(&table).await? {
+        match schema.table(&table, intent).await? {
             Some(ref provider) => Ok(Arc::clone(provider)),
             _ => plan_err!("No table named '{table}'"),
         }

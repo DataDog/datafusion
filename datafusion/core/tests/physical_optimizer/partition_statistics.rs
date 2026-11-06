@@ -32,7 +32,7 @@ mod test {
     };
     use datafusion_execution::TaskContext;
     use datafusion_execution::config::SessionConfig;
-    use datafusion_expr::{WindowFrame, WindowFunctionDefinition};
+    use datafusion_expr::{TableIntent, WindowFrame, WindowFunctionDefinition};
     use datafusion_expr_common::operator::Operator;
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_physical_expr::Partitioning;
@@ -106,7 +106,10 @@ mod test {
             .collect()
             .await
             .unwrap();
-        let table = ctx.table_provider(table_name.as_str()).await.unwrap();
+        let table = ctx
+            .table_provider(table_name.as_str(), TableIntent::Read)
+            .await
+            .unwrap();
         let listing_table = table.downcast_ref::<ListingTable>().unwrap().clone();
         listing_table
             .scan(&ctx.state(), None, &[], None)

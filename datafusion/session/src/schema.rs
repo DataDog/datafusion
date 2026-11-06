@@ -19,14 +19,14 @@
 //! representing collections of named tables.
 
 use async_trait::async_trait;
-use datafusion_common::{DataFusionError, exec_err};
+use datafusion_common::exec_err;
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::table::TableProvider;
 use datafusion_common::Result;
-use datafusion_expr::TableType;
+use datafusion_expr::{TableIntent, TableType};
 
 /// Represents a schema, comprising a number of named tables.
 ///
@@ -42,21 +42,41 @@ pub trait SchemaProvider: Any + Debug + Sync + Send {
     }
 
     /// Retrieves the list of available table names in this schema.
+    ///
+    /// Implementations control name visibility. This method does not invoke
+    /// [`Self::table`] or automatically filter names by [`TableIntent::Describe`].
+    /// Information-schema traversal can subsequently request `Describe` for
+    /// returned names; a denied lookup fails that traversal rather than hiding a row.
     fn table_names(&self) -> Vec<String>;
 
-    /// Retrieves a specific table from the schema by name, if it exists,
-    /// otherwise returns `None`.
+    /// Resolves a table for an operation before the planner uses its schema.
+    ///
+    /// Implementations must explicitly handle the intent. Forwarding wrappers
+    /// must preserve it; authorizing catalogs must check it before returning a
+    /// provider. Identity and privilege mapping belong to the application.
+    /// Check absent names too: `Ok(None)` means an authorized missing object,
+    /// while denial is an error. DataFusion does not issue a separate `Describe`
+    /// or `Read` lookup for metadata needed by the operation. Applications decide
+    /// all privileges that their policy requires for that operation.
+    /// [`TableIntent::Describe`] does not authorize DDL or filter name enumeration.
+    /// Provider execution and externally supplied plans require separate checks.
     async fn table(
         &self,
         name: &str,
-    ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError>;
+        intent: TableIntent,
+    ) -> Result<Option<Arc<dyn TableProvider>>>;
 
     /// Retrieves the type of a specific table from the schema by name, if it exists, otherwise
     /// returns `None`.  Implementations for which this operation is cheap but [Self::table] is
     /// expensive can override this to improve operations that only need the type, e.g.
     /// `SELECT * FROM information_schema.tables`.
+    ///
+    /// The default requests [`TableIntent::Describe`]. Overrides must enforce
+    /// the same description policy when bypassing [`Self::table`].
     async fn table_type(&self, name: &str) -> Result<Option<TableType>> {
-        self.table(name).await.map(|o| o.map(|t| t.table_type()))
+        self.table(name, TableIntent::Describe)
+            .await
+            .map(|o| o.map(|t| t.table_type()))
     }
 
     /// If supported by the implementation, adds a new table named `name` to

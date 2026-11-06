@@ -16,3 +16,4 @@
 // under the License.
 
 mod memory;
+mod operation_aware;
