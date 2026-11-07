@@ -53,7 +53,9 @@ use datafusion_execution::TaskContext;
 use datafusion_expr::ExpressionPlacement;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::projection::Projector;
-use datafusion_physical_expr_common::physical_expr::{PhysicalExprRef, fmt_sql};
+use datafusion_physical_expr_common::physical_expr::{
+    PhysicalExprRef, fmt_sql, is_volatile,
+};
 use datafusion_physical_expr_common::sort_expr::{
     LexOrdering, LexRequirement, PhysicalSortExpr,
 };
@@ -1272,7 +1274,7 @@ fn try_collapse_projection_chain(
 
     let mut current_exprs: Vec<ProjectionExpr> = outer.expr().to_vec();
     let mut current_input: Arc<dyn ExecutionPlan> = Arc::clone(outer.input());
-    let mut column_ref_map: HashMap<Column, usize> = HashMap::new();
+    let mut column_ref_map: HashMap<usize, usize> = HashMap::new();
     let mut collapsed_any = false;
 
     'outer: while let Some(inner_proj) = current_input.downcast_ref::<ProjectionExec>() {
@@ -1285,22 +1287,20 @@ fn try_collapse_projection_chain(
         for proj_expr in &current_exprs {
             proj_expr.expr.apply(|expr| {
                 if let Some(column) = expr.downcast_ref::<Column>() {
-                    *column_ref_map.entry(column.clone()).or_default() += 1;
+                    *column_ref_map.entry(column.index()).or_default() += 1;
                 }
                 Ok(TreeNodeRecursion::Continue)
             })?;
         }
         let inner_exprs = inner_proj.expr();
-        // Merging these projections is not beneficial, e.g
-        // If an expression is not trivial (KeepInPlace) and it is referred more than 1, unifies projections will be
-        // beneficial as caching mechanism for non-trivial computations.
-        // See discussion in: https://github.com/apache/datafusion/issues/8296
-        let blocked = column_ref_map.iter().any(|(column, count)| {
-            *count > 1
-                && !inner_exprs[column.index()]
-                    .expr
-                    .placement()
-                    .should_push_to_leaves()
+        // Keep a shared expression when inlining it would repeat a volatile or
+        // costly computation.
+        let blocked = column_ref_map.iter().any(|(&index, &count)| {
+            count > 1
+                && inner_exprs.get(index).is_some_and(|inner| {
+                    !inner.expr.placement().should_push_to_leaves()
+                        || is_volatile(&inner.expr)
+                })
         });
         if blocked {
             break;

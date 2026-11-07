@@ -559,9 +559,9 @@ fn merge_consecutive_projections_one_level(
         return Projection::try_new_with_schema(expr, input, schema).map(Transformed::no);
     };
 
-    // A fast path: if the previous projection is same as the current projection
-    // we can directly remove the current projection and return child projection.
-    if prev_projection.expr == expr {
+    // Identical column lists can collapse directly. An outer computation can
+    // read the inner result even when both expressions are identical.
+    if expr.iter().all(|e| matches!(e, Expr::Column(_))) && prev_projection.expr == expr {
         return Projection::try_new_with_schema(
             expr,
             Arc::clone(&prev_projection.input),

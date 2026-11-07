@@ -910,6 +910,8 @@ fn split_and_push_projection(
             proj_exprs_captured += 1;
         } else if let Expr::Alias(alias) = expr
             && alias.name.starts_with(EXTRACTED_EXPR_PREFIX)
+            // A user can give a KeepInPlace expression the same alias prefix.
+            && alias.expr.placement().should_push_to_leaves()
             && !references_volatile_output(&alias.expr, &extractors[0].volatile_columns)
         {
             // Insert the full Alias expression as the key so that
