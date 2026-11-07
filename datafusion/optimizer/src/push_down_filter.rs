@@ -47,8 +47,7 @@ use datafusion_expr::{
 use crate::optimizer::ApplyOrder;
 use crate::simplify_expressions::{reorder_predicates, simplify_predicates};
 use crate::utils::{
-    ColumnReference, has_all_column_refs, is_repeatable, is_restrict_null_predicate,
-    schema_columns,
+    ColumnReference, has_all_column_refs, is_restrict_null_predicate, schema_columns,
 };
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_expr::ExpressionPlacement;
@@ -716,7 +715,7 @@ fn join_input_predicates(
             let refs = predicate.column_refs();
             if refs.is_empty()
                 || !refs.iter().all(|column| columns.contains_key(*column))
-                || !is_repeatable(predicate)
+                || !is_join_key_predicate(predicate)
             {
                 continue;
             }
@@ -729,6 +728,32 @@ fn join_input_predicates(
         }
     }
     Ok(predicates)
+}
+
+/// Only infer predicates that are invariant under join-key equality. Repeatability
+/// alone is insufficient: `atan2` distinguishes -0.0 from +0.0, which join equally.
+fn is_join_key_predicate(predicate: &Expr) -> bool {
+    match predicate {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            [
+                Operator::Eq,
+                Operator::NotEq,
+                Operator::Lt,
+                Operator::LtEq,
+                Operator::Gt,
+                Operator::GtEq,
+            ]
+            .contains(op)
+                && ((left.try_as_col().is_some() && right.as_literal().is_some())
+                    || (left.as_literal().is_some() && right.try_as_col().is_some()))
+        }
+        Expr::IsNull(expr) | Expr::IsNotNull(expr) => expr.try_as_col().is_some(),
+        Expr::InList(list) => {
+            list.expr.try_as_col().is_some()
+                && list.list.iter().all(|expr| expr.as_literal().is_some())
+        }
+        _ => false,
+    }
 }
 
 /// Inferred predicates collector.
