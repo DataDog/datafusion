@@ -57,6 +57,39 @@ fn has_extractable_expr(exprs: &[Expr]) -> bool {
     })
 }
 
+/// Tracks both spellings because a plan can refer to a qualified projection
+/// output by its bare name after an empty UNION input is removed.
+fn volatile_output_columns(plan: &LogicalPlan) -> BTreeSet<String> {
+    let LogicalPlan::Projection(projection) = plan else {
+        return BTreeSet::new();
+    };
+    projection
+        .schema
+        .iter()
+        .zip(projection.expr.iter())
+        .filter(|(_, expr)| expr.is_volatile())
+        .flat_map(|((qualifier, field), _)| {
+            [
+                qualified_name(qualifier, field.name()),
+                field.name().clone(),
+            ]
+        })
+        .collect()
+}
+
+/// Returns `true` if merging this expression into the input projection would
+/// inline a volatile definition.
+///
+/// For example, if `s` contains `random()`, extracting `s['a']` must read
+/// the value already computed for `s`.
+fn references_volatile_output(expr: &Expr, volatile: &BTreeSet<String>) -> bool {
+    !volatile.is_empty()
+        && expr
+            .column_refs()
+            .iter()
+            .any(|col| volatile.contains(&col.flat_name()))
+}
+
 /// Extracts `MoveTowardsLeafNodes` sub-expressions from non-projection nodes
 /// into **extraction projections** (pass 1 of 2).
 ///
@@ -207,9 +240,9 @@ fn extract_from_plan(
         inputs.iter().map(|i| Arc::clone(i.schema())).collect();
 
     // Build per-input extractors
-    let mut extractors: Vec<LeafExpressionExtractor> = input_schemas
+    let mut extractors: Vec<LeafExpressionExtractor> = inputs
         .iter()
-        .map(|schema| LeafExpressionExtractor::new(schema.as_ref(), alias_generator))
+        .map(|input| LeafExpressionExtractor::new(input, alias_generator))
         .collect();
 
     // Build per-input column sets for routing expressions to the correct input
@@ -313,11 +346,12 @@ fn routing_extract(
 
         match e.placement() {
             ExpressionPlacement::MoveTowardsLeafNodes => {
-                if let Some(idx) = find_owning_input(&e, input_column_sets) {
+                if let Some(idx) = find_owning_input(&e, input_column_sets)
+                    && !references_volatile_output(&e, &extractors[idx].volatile_columns)
+                {
                     let col_ref = extractors[idx].add_extracted(e)?;
                     Ok(Transformed::yes(col_ref))
                 } else {
-                    // References columns from multiple inputs — cannot extract
                     Ok(Transformed::no(e))
                 }
             }
@@ -510,18 +544,18 @@ struct LeafExpressionExtractor<'a> {
     /// Columns referenced by extracted expressions or the parent node,
     /// included as pass-through in the extraction projection.
     columns_needed: IndexSet<Column>,
-    /// Input schema
-    input_schema: &'a DFSchema,
+    /// Definitions that must stay in the input projection.
+    volatile_columns: BTreeSet<String>,
     /// Alias generator
     alias_generator: &'a Arc<AliasGenerator>,
 }
 
 impl<'a> LeafExpressionExtractor<'a> {
-    fn new(input_schema: &'a DFSchema, alias_generator: &'a Arc<AliasGenerator>) -> Self {
+    fn new(input: &LogicalPlan, alias_generator: &'a Arc<AliasGenerator>) -> Self {
         Self {
             extracted: IndexMap::new(),
             columns_needed: IndexSet::new(),
-            input_schema,
+            volatile_columns: volatile_output_columns(input),
             alias_generator,
         }
     }
@@ -540,7 +574,14 @@ impl<'a> LeafExpressionExtractor<'a> {
 
         // Generate unique alias
         let alias = self.alias_generator.next(EXTRACTED_EXPR_PREFIX);
-        self.extracted.insert(expr, alias.clone());
+        // Give independent volatile calls distinct keys even when they have
+        // the same arguments. Their placement can still require a file scan.
+        let key = if expr.is_volatile() {
+            expr.alias(&alias)
+        } else {
+            expr
+        };
+        self.extracted.insert(key, alias.clone());
 
         Ok(Expr::Column(Column::new_unqualified(&alias)))
     }
@@ -557,18 +598,20 @@ impl<'a> LeafExpressionExtractor<'a> {
         if self.extracted.is_empty() {
             return Ok(None);
         }
-        let pairs: Vec<(Expr, String)> = self
-            .extracted
-            .iter()
-            .map(|(e, a)| (e.clone(), a.clone()))
-            .collect();
         let proj = build_extraction_projection_impl(
-            &pairs,
+            &self.extraction_pairs(),
             &self.columns_needed,
             input,
-            self.input_schema,
+            input.schema(),
         )?;
         Ok(Some(LogicalPlan::Projection(proj)))
+    }
+
+    fn extraction_pairs(&self) -> Vec<(Expr, String)> {
+        self.extracted
+            .iter()
+            .map(|(expr, alias)| (expr.clone().unalias(), alias.clone()))
+            .collect()
     }
 }
 
@@ -844,16 +887,13 @@ fn split_and_push_projection(
     // so the alias name participates in equality. This prevents collisions
     // when CSE rewrites produce the same inner expression under different
     // alias names (e.g. `__common_expr_4 AS __datafusion_extracted_1` and
-    // `__common_expr_4 AS __datafusion_extracted_3`). New extractions from
-    // `routing_extract` use bare (non-Alias) keys and get normal dedup.
+    // `__common_expr_4 AS __datafusion_extracted_3`). New extractions use
+    // bare keys for expressions that can share an evaluation.
     //
     // When building the final `extraction_pairs`, the Alias wrapper is
     // stripped so consumers see the usual `(inner_expr, alias_name)` tuples.
 
-    let mut extractors = vec![LeafExpressionExtractor::new(
-        input_schema.as_ref(),
-        alias_generator,
-    )];
+    let mut extractors = vec![LeafExpressionExtractor::new(input, alias_generator)];
     let input_column_sets = vec![schema_columns(input_schema.as_ref())];
 
     let original_schema = proj.schema.as_ref();
@@ -870,6 +910,7 @@ fn split_and_push_projection(
             proj_exprs_captured += 1;
         } else if let Expr::Alias(alias) = expr
             && alias.name.starts_with(EXTRACTED_EXPR_PREFIX)
+            && !references_volatile_output(&alias.expr, &extractors[0].volatile_columns)
         {
             // Insert the full Alias expression as the key so that
             // distinct alias names don't collide in the IndexMap.
@@ -916,14 +957,7 @@ fn split_and_push_projection(
     // Build extraction_pairs, stripping the Alias wrapper from pre-existing
     // entries (they used the full Alias as the map key to avoid dedup).
     let extractor = &extractors[0];
-    let extraction_pairs: Vec<(Expr, String)> = extractor
-        .extracted
-        .iter()
-        .map(|(e, a)| match e {
-            Expr::Alias(alias) => (*alias.expr.clone(), a.clone()),
-            _ => (e.clone(), a.clone()),
-        })
-        .collect();
+    let extraction_pairs = extractor.extraction_pairs();
     let columns_needed = &extractor.columns_needed;
 
     // If no extractions found, nothing to do
@@ -1229,6 +1263,17 @@ fn try_push_into_inputs(
         if per_input[idx].pairs.is_empty() {
             new_inputs.push(input.clone());
         } else {
+            // Merging into an input projection inlines the referenced columns'
+            // definitions; bail out when that would duplicate a volatile
+            // computation.
+            let volatile = volatile_output_columns(input);
+            if per_input[idx]
+                .pairs
+                .iter()
+                .any(|(expr, _)| references_volatile_output(expr, &volatile))
+            {
+                return Ok(None);
+            }
             let input_arc = Arc::new(input.clone());
             let target_schema = Arc::clone(input.schema());
             let proj = build_extraction_projection_impl(
@@ -1284,7 +1329,7 @@ mod tests {
     use crate::{Optimizer, OptimizerContext};
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{
-        ScalarUDF, col, lit, logical_plan::builder::LogicalPlanBuilder,
+        ScalarUDF, Volatility, col, lit, logical_plan::builder::LogicalPlanBuilder,
     };
 
     fn leaf_udf(expr: Expr, name: &str) -> Expr {
@@ -1294,6 +1339,19 @@ mod tests {
                     .with_placement(ExpressionPlacement::MoveTowardsLeafNodes),
             )),
             vec![expr, lit(name)],
+        ))
+    }
+
+    /// A stand-in for `random()`: a volatile expression that must be evaluated
+    /// exactly once per row.
+    fn volatile_udf(expr: Expr) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(ScalarUDF::new_from_impl(
+                PlacementTestUDF::new()
+                    .with_placement(ExpressionPlacement::KeepInPlace)
+                    .with_volatility(Volatility::Volatile),
+            )),
+            vec![expr],
         ))
     }
 
@@ -1972,6 +2030,111 @@ mod tests {
         Projection: leaf_udf(test.user, Utf8("name"))
           TableScan: test projection=[user]
         "#)
+    }
+
+    /// Merging an extraction into an input projection inlines the definition of
+    /// every column the extraction references. When that definition is volatile
+    /// the inlined copy is an independent evaluation, so the extraction must be
+    /// skipped and the plan left alone.
+    #[test]
+    fn test_no_merge_into_volatile_projection() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![volatile_udf(col("a")).alias("v")])?
+            .project(vec![col("v"), leaf_udf(col("v"), "x")])?
+            .build()?;
+
+        assert_stages!(plan, @r#"
+        ## Original Plan
+        Projection: v, leaf_udf(v, Utf8("x"))
+          Projection: keep_in_place_udf(test.a) AS v
+            TableScan: test projection=[a]
+
+        ## After Extraction
+        (same as original)
+
+        ## After Pushdown
+        (same as after extraction)
+
+        ## Optimized
+        (same as after pushdown)
+        "#)
+    }
+
+    /// Same guard for pass 1: extracting out of a `Filter` whose input
+    /// projection defines the referenced column volatilely would make the
+    /// predicate test a second, independent evaluation.
+    #[test]
+    fn test_no_extraction_from_filter_over_volatile_projection() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![volatile_udf(col("a")).alias("v")])?
+            .filter(leaf_udf(col("v"), "x").eq(lit(1u32)))?
+            .build()?;
+
+        assert_stages!(plan, @r#"
+        ## Original Plan
+        Filter: leaf_udf(v, Utf8("x")) = UInt32(1)
+          Projection: keep_in_place_udf(test.a) AS v
+            TableScan: test projection=[a]
+
+        ## After Extraction
+        (same as original)
+
+        ## After Pushdown
+        (same as after extraction)
+
+        ## Optimized
+        (same as after pushdown)
+        "#)
+    }
+
+    #[test]
+    fn test_extract_only_independent_field_from_volatile_projection() -> Result<()> {
+        let input = LogicalPlanBuilder::from(test_table_scan()?)
+            .project(vec![
+                volatile_udf(col("a")).alias_qualified(Some("q"), "v"),
+                col("b"),
+            ])?
+            .build()?;
+        // Filters can retain bare references after a UNION input is removed.
+        let predicate = leaf_udf(col("v"), "x").eq(leaf_udf(col("test.b"), "y"));
+        let plan = LogicalPlan::Filter(datafusion_expr::Filter::try_new(
+            predicate,
+            Arc::new(input),
+        )?);
+        let result = ExtractLeafExpressions::new()
+            .rewrite(plan, &OptimizerContext::new())?
+            .data;
+        insta::assert_snapshot!(format!("{result}"), @r#"
+        Projection: q.v, test.b
+          Filter: leaf_udf(v, Utf8("x")) = __datafusion_extracted_1
+            Projection: keep_in_place_udf(test.a) AS v, test.b, leaf_udf(test.b, Utf8("y")) AS __datafusion_extracted_1
+              TableScan: test
+        "#);
+        Ok(())
+    }
+
+    #[test]
+    fn test_leaf_placement_preserves_independent_volatile_calls() -> Result<()> {
+        let udf = ScalarUDF::new_from_impl(
+            PlacementTestUDF::new().with_volatility(Volatility::Volatile),
+        );
+        let call = udf.call(vec![col("a")]);
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .limit(1, None)?
+            .project(vec![call.clone().alias("x"), call.alias("y")])?
+            .build()?;
+        let optimizer =
+            Optimizer::with_rules(vec![Arc::new(PushDownLeafProjections::new())]);
+        let result = optimizer.optimize(plan, &OptimizerContext::new(), |_, _| {})?;
+        insta::assert_snapshot!(format!("{result}"), @r#"
+        Projection: __datafusion_extracted_1 AS x, __datafusion_extracted_2 AS y
+          Limit: skip=1, fetch=None
+            Projection: leaf_udf(test.a) AS __datafusion_extracted_1, leaf_udf(test.a) AS __datafusion_extracted_2, test.a, test.b, test.c
+              TableScan: test
+        "#);
+        Ok(())
     }
 
     /// Projections with aliased columns (nothing to extract) return unchanged.
