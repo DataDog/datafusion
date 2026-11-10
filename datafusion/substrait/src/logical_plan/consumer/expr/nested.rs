@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::literal::name_struct_literals_like_siblings;
 use crate::logical_plan::consumer::SubstraitConsumer;
 use datafusion::common::{DFSchema, not_impl_err, substrait_err};
 use datafusion::execution::FunctionRegistry;
@@ -49,6 +50,12 @@ pub async fn from_nested(
             for value in &list.values {
                 args.push(consumer.consume_expression(value, input_schema).await?);
             }
+            // the elements of a list share one type, so a struct literal element takes the
+            // field names of a struct column element, as in `[s, {c0: 1, c1: 'x'}]`
+            name_struct_literals_like_siblings(
+                &mut args.iter_mut().collect::<Vec<_>>(),
+                input_schema,
+            );
 
             let make_array_udf = consumer.get_function_registry().udf("make_array")?;
             Ok(Expr::ScalarFunction(
