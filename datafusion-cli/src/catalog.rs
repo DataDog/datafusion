@@ -18,25 +18,32 @@
 use std::sync::{Arc, Weak};
 
 use crate::object_storage::{AwsOptions, GcpOptions, get_object_store};
-
-use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider};
-
-use datafusion::common::plan_datafusion_err;
-use datafusion::datasource::TableProvider;
-use datafusion::datasource::listing::ListingTableUrl;
-use datafusion::error::Result;
-use datafusion::execution::context::SessionState;
-use datafusion::execution::session_state::SessionStateBuilder;
-
 use async_trait::async_trait;
+use datafusion::catalog::{
+    CatalogProvider, CatalogProviderList, DynamicFileCatalog, TableProvider,
+    UrlTableFactory,
+};
+use datafusion::common::plan_datafusion_err;
+use datafusion::datasource::dynamic_file::DynamicListTableFactory;
+use datafusion::datasource::listing::ListingTableUrl;
+use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::context::SessionState;
+use datafusion::execution::object_store::ObjectStoreNotFound;
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::logical_expr::TableIntent;
 use dirs::home_dir;
 use parking_lot::RwLock;
 
-/// Wraps another catalog, automatically register require object stores for the file locations
+/// Resolves implicit file tables and configures their object stores after a
+/// successful catalog miss. Wrap an ordinary catalog, without `enable_url_table`:
+/// this wrapper installs its own file factory so store setup precedes inference.
+///
+/// This CLI convenience enables file access using the session's credentials.
+/// It does not enforce location policy; restricted applications need an
+/// authorizing file factory or must leave implicit file resolution disabled.
 #[derive(Debug)]
 pub struct DynamicObjectStoreCatalog {
-    inner: Arc<dyn CatalogProviderList>,
-    state: Weak<RwLock<SessionState>>,
+    inner: DynamicFileCatalog,
 }
 
 impl DynamicObjectStoreCatalog {
@@ -44,7 +51,12 @@ impl DynamicObjectStoreCatalog {
         inner: Arc<dyn CatalogProviderList>,
         state: Weak<RwLock<SessionState>>,
     ) -> Self {
-        Self { inner, state }
+        Self {
+            inner: DynamicFileCatalog::new(
+                inner,
+                Arc::new(DynamicObjectStoreTableFactory::new(state)),
+            ),
+        }
     }
 }
 
@@ -62,91 +74,24 @@ impl CatalogProviderList for DynamicObjectStoreCatalog {
     }
 
     fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
-        let state = self.state.clone();
-        self.inner.catalog(name).map(|catalog| {
-            Arc::new(DynamicObjectStoreCatalogProvider::new(catalog, state)) as _
-        })
+        self.inner.catalog(name)
     }
 }
 
-/// Wraps another catalog provider
 #[derive(Debug)]
-struct DynamicObjectStoreCatalogProvider {
-    inner: Arc<dyn CatalogProvider>,
+struct DynamicObjectStoreTableFactory {
     state: Weak<RwLock<SessionState>>,
+    inner: DynamicListTableFactory,
 }
 
-impl DynamicObjectStoreCatalogProvider {
-    pub fn new(
-        inner: Arc<dyn CatalogProvider>,
-        state: Weak<RwLock<SessionState>>,
-    ) -> Self {
-        Self { inner, state }
-    }
-}
-
-impl CatalogProvider for DynamicObjectStoreCatalogProvider {
-    fn schema_names(&self) -> Vec<String> {
-        self.inner.schema_names()
+impl DynamicObjectStoreTableFactory {
+    fn new(state: Weak<RwLock<SessionState>>) -> Self {
+        let inner = DynamicListTableFactory::default();
+        inner.session_store().with_state(state.clone());
+        Self { state, inner }
     }
 
-    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        let state = self.state.clone();
-        self.inner.schema(name).map(|schema| {
-            Arc::new(DynamicObjectStoreSchemaProvider::new(schema, state)) as _
-        })
-    }
-
-    fn register_schema(
-        &self,
-        name: &str,
-        schema: Arc<dyn SchemaProvider>,
-    ) -> Result<Option<Arc<dyn SchemaProvider>>> {
-        self.inner.register_schema(name, schema)
-    }
-}
-
-/// Wraps another schema provider. [DynamicObjectStoreSchemaProvider] is responsible for registering the required
-/// object stores for the file locations.
-#[derive(Debug)]
-struct DynamicObjectStoreSchemaProvider {
-    inner: Arc<dyn SchemaProvider>,
-    state: Weak<RwLock<SessionState>>,
-}
-
-impl DynamicObjectStoreSchemaProvider {
-    pub fn new(
-        inner: Arc<dyn SchemaProvider>,
-        state: Weak<RwLock<SessionState>>,
-    ) -> Self {
-        Self { inner, state }
-    }
-}
-
-#[async_trait]
-impl SchemaProvider for DynamicObjectStoreSchemaProvider {
-    fn table_names(&self) -> Vec<String> {
-        self.inner.table_names()
-    }
-
-    fn register_table(
-        &self,
-        name: String,
-        table: Arc<dyn TableProvider>,
-    ) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.inner.register_table(name, table)
-    }
-
-    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        let inner_table = self.inner.table(name).await;
-        if inner_table.is_ok()
-            && let Some(inner_table) = inner_table?
-        {
-            return Ok(Some(inner_table));
-        }
-
-        // if the inner schema provider didn't have a table by
-        // that name, try to treat it as a listing table
+    async fn prepare_store(&self, name: &str) -> Result<()> {
         let mut state = self
             .state
             .upgrade()
@@ -154,18 +99,15 @@ impl SchemaProvider for DynamicObjectStoreSchemaProvider {
             .read()
             .clone();
         let mut builder = SessionStateBuilder::from(state.clone());
-        let optimized_name = substitute_tilde(name.to_owned());
-        let table_url = ListingTableUrl::parse(optimized_name.as_str())?;
+        let table_url = ListingTableUrl::parse(name)?;
         let scheme = table_url.scheme();
         let url = table_url.as_ref();
 
-        // If the store is already registered for this URL then `get_store`
-        // will return `Ok` which means we don't need to register it again. However,
-        // if `get_store` returns an `Err` then it means the corresponding store is
-        // not registered yet and we need to register it
         match state.runtime_env().object_store_registry.get_store(url) {
-            Ok(_) => { /*Nothing to do here, store for this URL is already registered*/ }
-            Err(_) => {
+            Ok(_) => return Ok(()),
+            Err(DataFusionError::External(error))
+                if error.is::<ObjectStoreNotFound>() =>
+            {
                 // Register the store for this URL. Here we don't have access
                 // to any command options so the only choice is to use an empty collection
                 match scheme {
@@ -192,16 +134,22 @@ impl SchemaProvider for DynamicObjectStoreSchemaProvider {
                 .await?;
                 state.runtime_env().register_object_store(url, store);
             }
+            Err(error) => return Err(error),
         }
-        self.inner.table(name).await
+        Ok(())
     }
+}
 
-    fn deregister_table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.inner.deregister_table(name)
-    }
-
-    fn table_exist(&self, name: &str) -> bool {
-        self.inner.table_exist(name)
+#[async_trait]
+impl UrlTableFactory for DynamicObjectStoreTableFactory {
+    async fn try_new(
+        &self,
+        url: &str,
+        intent: TableIntent,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        let location = substitute_tilde(url.to_owned());
+        self.prepare_store(&location).await?;
+        self.inner.try_new(&location, intent).await
     }
 }
 
@@ -221,27 +169,125 @@ mod tests {
 
     use super::*;
 
-    use datafusion::catalog::SchemaProvider;
     use datafusion::prelude::SessionContext;
 
-    fn setup_context() -> (SessionContext, Arc<dyn SchemaProvider>) {
+    fn setup_context() -> (SessionContext, DynamicObjectStoreTableFactory) {
         let ctx = SessionContext::new();
-        ctx.register_catalog_list(Arc::new(DynamicObjectStoreCatalog::new(
-            ctx.state().catalog_list().clone(),
-            ctx.state_weak_ref(),
-        )));
+        let factory = DynamicObjectStoreTableFactory::new(ctx.state_weak_ref());
+        (ctx, factory)
+    }
 
-        let provider = &DynamicObjectStoreCatalog::new(
+    #[derive(Debug)]
+    struct DeniedRegistry;
+
+    impl datafusion::execution::object_store::ObjectStoreRegistry for DeniedRegistry {
+        fn register_store(
+            &self,
+            _url: &url::Url,
+            _store: Arc<dyn object_store::ObjectStore>,
+        ) -> Option<Arc<dyn object_store::ObjectStore>> {
+            panic!("denial must not register a replacement store")
+        }
+        fn get_store(
+            &self,
+            _url: &url::Url,
+        ) -> Result<Arc<dyn object_store::ObjectStore>> {
+            datafusion::common::plan_err!("registry denied")
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_failure_does_not_trigger_automatic_registration() {
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .with_object_store_registry(Arc::new(DeniedRegistry))
+            .build_arc()
+            .unwrap();
+        let ctx = SessionContext::new_with_config_rt(Default::default(), runtime);
+        let factory = DynamicObjectStoreTableFactory::new(ctx.state_weak_ref());
+        let error = factory
+            .prepare_store("https://example.com/private.csv")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("registry denied"));
+    }
+
+    #[derive(Debug)]
+    struct DeniedSchema;
+
+    #[async_trait]
+    impl datafusion::catalog::SchemaProvider for DeniedSchema {
+        fn table_names(&self) -> Vec<String> {
+            vec![]
+        }
+        fn table_exist(&self, _name: &str) -> bool {
+            false
+        }
+        async fn table(
+            &self,
+            _name: &str,
+            _intent: TableIntent,
+        ) -> Result<Option<Arc<dyn TableProvider>>> {
+            datafusion::common::plan_err!("catalog denied")
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_denial_does_not_register_a_store() {
+        let ctx = SessionContext::new();
+        ctx.catalog("datafusion")
+            .unwrap()
+            .register_schema("public", Arc::new(DeniedSchema))
+            .unwrap();
+        let catalog = DynamicObjectStoreCatalog::new(
             ctx.state().catalog_list().clone(),
             ctx.state_weak_ref(),
-        ) as &dyn CatalogProviderList;
-        let catalog = provider
-            .catalog(provider.catalog_names().first().unwrap())
-            .unwrap();
+        );
         let schema = catalog
-            .schema(catalog.schema_names().first().unwrap())
+            .catalog("datafusion")
+            .unwrap()
+            .schema("public")
             .unwrap();
-        (ctx, schema)
+        let location = "https://example.com/private.csv";
+        for intent in [
+            TableIntent::Read,
+            TableIntent::Describe,
+            TableIntent::CreateTable { or_replace: false },
+        ] {
+            let error = schema.table(location, intent).await.unwrap_err();
+            assert!(error.to_string().contains("catalog denied"));
+        }
+        assert!(
+            ctx.runtime_env()
+                .object_store(ListingTableUrl::parse(location).unwrap())
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ddl_miss_does_not_register_a_store() {
+        let ctx = SessionContext::new();
+        let catalog = DynamicObjectStoreCatalog::new(
+            ctx.state().catalog_list().clone(),
+            ctx.state_weak_ref(),
+        );
+        let schema = catalog
+            .catalog("datafusion")
+            .unwrap()
+            .schema("public")
+            .unwrap();
+        let location = "https://example.com/private.csv";
+        assert!(
+            schema
+                .table(location, TableIntent::CreateTable { or_replace: false })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ctx.runtime_env()
+                .object_store(ListingTableUrl::parse(location).unwrap())
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -251,11 +297,9 @@ mod tests {
         let domain = "example.com";
         let location = format!("http://{domain}/file.parquet");
 
-        let (ctx, schema) = setup_context();
+        let (ctx, factory) = setup_context();
 
-        // That's a non registered table so expecting None here
-        let table = schema.table(&location).await?;
-        assert!(table.is_none());
+        factory.prepare_store(&location).await?;
 
         // It should still create an object store for the location in the SessionState
         let store = ctx
@@ -289,10 +333,9 @@ mod tests {
         let bucket = "examples3bucket";
         let location = format!("s3://{bucket}/file.parquet");
 
-        let (ctx, schema) = setup_context();
+        let (ctx, factory) = setup_context();
 
-        let table = schema.table(&location).await?;
-        assert!(table.is_none());
+        factory.prepare_store(&location).await?;
 
         let store = ctx
             .runtime_env()
@@ -311,10 +354,9 @@ mod tests {
         let bucket = "examplegsbucket";
         let location = format!("gs://{bucket}/file.parquet");
 
-        let (ctx, schema) = setup_context();
+        let (ctx, factory) = setup_context();
 
-        let table = schema.table(&location).await?;
-        assert!(table.is_none());
+        factory.prepare_store(&location).await?;
 
         let store = ctx
             .runtime_env()
@@ -331,9 +373,9 @@ mod tests {
     #[tokio::test]
     async fn query_invalid_location_test() {
         let location = "ts://file.parquet";
-        let (_ctx, schema) = setup_context();
+        let (_ctx, factory) = setup_context();
 
-        assert!(schema.table(location).await.is_err());
+        assert!(factory.prepare_store(location).await.is_err());
     }
 
     #[cfg(not(target_os = "windows"))]

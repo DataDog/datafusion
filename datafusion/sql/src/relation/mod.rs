@@ -27,7 +27,7 @@ use datafusion_expr::builder::subquery_alias;
 use datafusion_expr::planner::{
     PlannedRelation, RelationPlannerContext, RelationPlanning,
 };
-use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, expr::Unnest};
+use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableIntent, expr::Unnest};
 use datafusion_expr::{Subquery, SubqueryAlias};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};
 
@@ -89,12 +89,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         relation: TableFactor,
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
+        self.create_relation_with_intent(relation, planner_context, TableIntent::Read)
+    }
+
+    fn create_relation_with_intent(
+        &self,
+        relation: TableFactor,
+        planner_context: &mut PlannerContext,
+        intent: TableIntent,
+    ) -> Result<LogicalPlan> {
         let planned_relation =
             match self.create_extension_relation(relation, planner_context)? {
                 RelationPlanning::Planned(planned) => planned,
-                RelationPlanning::Original(original) => {
-                    Box::new(self.create_default_relation(*original, planner_context)?)
-                }
+                RelationPlanning::Original(original) => Box::new(
+                    self.create_default_relation(*original, planner_context, intent)?,
+                ),
             };
 
         let optimized_plan = optimize_subquery_sort(
@@ -146,6 +155,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         &self,
         relation: TableFactor,
         planner_context: &mut PlannerContext,
+        intent: TableIntent,
     ) -> Result<PlannedRelation> {
         let relation_span = relation.span();
         let (plan, alias) = match relation {
@@ -189,23 +199,23 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     let table_name = table_ref.to_string();
                     let cte = planner_context.get_cte(&table_name);
                     (
-                        match (
-                            cte,
-                            self.context_provider.get_table_source(table_ref.clone()),
-                        ) {
-                            (Some(cte_plan), _) => Ok(cte_plan.clone()),
-                            (_, Ok(provider)) => LogicalPlanBuilder::scan(
-                                table_ref.clone(),
-                                provider,
-                                None,
-                            )?
-                            .build(),
-                            (None, Err(e)) => {
-                                let e = e.with_diagnostic(Diagnostic::new_error(
-                                    format!("table '{table_ref}' not found"),
-                                    Span::try_from_sqlparser_span(relation_span),
-                                ));
-                                Err(e)
+                        match cte {
+                            Some(cte_plan) => Ok(cte_plan.clone()),
+                            None => {
+                                let provider = self
+                                    .require_table_source(table_ref.clone(), intent)
+                                    .map_err(|e| {
+                                        e.with_diagnostic(Diagnostic::new_error(
+                                            format!("table '{table_ref}' not found"),
+                                            Span::try_from_sqlparser_span(relation_span),
+                                        ))
+                                    })?;
+                                LogicalPlanBuilder::scan(
+                                    table_ref.clone(),
+                                    provider,
+                                    None,
+                                )?
+                                .build()
                             }
                         }?,
                         alias,

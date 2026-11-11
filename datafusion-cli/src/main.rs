@@ -243,11 +243,9 @@ async fn main_inner() -> Result<()> {
 
     let runtime_env = rt_builder.build_arc()?;
 
-    // enable dynamic file query
-    let ctx = SessionContext::new_with_config_rt(session_config, runtime_env)
-        .enable_url_table();
+    let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
     ctx.refresh_catalogs().await?;
-    // install dynamic catalog provider that can register required object stores
+    // Configure object stores after catalog misses and before file inference.
     ctx.register_catalog_list(Arc::new(DynamicObjectStoreCatalog::new(
         ctx.state().catalog_list().clone(),
         ctx.state_weak_ref(),

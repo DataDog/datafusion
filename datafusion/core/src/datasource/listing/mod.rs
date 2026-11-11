@@ -26,3 +26,4 @@ pub use datafusion_catalog_listing::{ListingOptions, ListingTable, ListingTableC
 pub use datafusion_datasource::PartitionedFileStream;
 pub use datafusion_datasource::{FileRange, ListingTableUrl, PartitionedFile};
 pub use table::ListingTableConfigExt;
+pub(crate) use table::infer_listing_options;

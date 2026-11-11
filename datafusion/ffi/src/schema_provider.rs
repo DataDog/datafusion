@@ -22,6 +22,7 @@ use async_ffi::{FfiFuture, FutureExt};
 use async_trait::async_trait;
 use datafusion_catalog::{SchemaProvider, TableProvider};
 use datafusion_common::error::{DataFusionError, Result};
+use datafusion_expr::TableIntent;
 use datafusion_proto::logical_plan::{
     DefaultLogicalExtensionCodec, LogicalExtensionCodec,
 };
@@ -132,11 +133,17 @@ unsafe extern "C" fn table_fn_wrapper(
         let provider = Arc::clone(provider.inner());
 
         async move {
-            let table = sresult_return!(provider.table(name.as_str()).await)
-                .map(|t| {
-                    FFI_TableProvider::new_with_ffi_codec(t, true, runtime, logical_codec)
-                })
-                .into();
+            let table =
+                sresult_return!(provider.table(name.as_str(), TableIntent::Read).await)
+                    .map(|t| {
+                        FFI_TableProvider::new_with_ffi_codec(
+                            t,
+                            true,
+                            runtime,
+                            logical_codec,
+                        )
+                    })
+                    .into();
 
             FFI_Result::Ok(table)
         }
@@ -328,7 +335,15 @@ impl SchemaProvider for ForeignSchemaProvider {
     async fn table(
         &self,
         name: &str,
+        intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
+        // The legacy FFI ABI carries no access intent. Never downgrade a request
+        // that the foreign provider cannot authorize to a read lookup.
+        if intent != TableIntent::Read {
+            return datafusion_common::not_impl_err!(
+                "Foreign schema provider cannot resolve operation {intent:?}; the FFI ABI only supports Read"
+            );
+        }
         unsafe {
             let table: Option<FFI_TableProvider> =
                 df_result!((self.0.table)(&self.0, name.into()).await)?.into();
@@ -392,6 +407,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foreign_schema_rejects_operations_missing_from_legacy_abi() {
+        use datafusion_expr::{TableIntent, dml::InsertOp};
+        let schema = Arc::new(MemorySchemaProvider::new());
+        schema
+            .register_table("target".into(), empty_table())
+            .unwrap();
+        let (_ctx, task_ctx_provider) = crate::util::tests::test_session_and_ctx();
+        let mut ffi = FFI_SchemaProvider::new(schema, None, task_ctx_provider, None);
+        let local: Arc<dyn SchemaProvider> = (&ffi).into();
+        assert!(
+            local
+                .table("target", TableIntent::Describe)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        ffi.library_marker_id = crate::mock_foreign_marker_id;
+        let foreign: Arc<dyn SchemaProvider> = (&ffi).into();
+        assert!(foreign.downcast_ref::<ForeignSchemaProvider>().is_some());
+        assert!(
+            foreign
+                .table("target", TableIntent::Read)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        for intent in [
+            TableIntent::CreateTable { or_replace: true },
+            TableIntent::CreateView { or_replace: false },
+            TableIntent::DropTable,
+            TableIntent::DropView,
+            TableIntent::CreateIndex,
+            TableIntent::Describe,
+            TableIntent::Insert(InsertOp::Append),
+            TableIntent::Update,
+            TableIntent::Delete,
+            TableIntent::Truncate,
+            TableIntent::Merge {
+                insert: true,
+                update: true,
+                delete: true,
+            },
+        ] {
+            let error = foreign.table("target", intent).await.unwrap_err();
+            assert!(error.to_string().contains("FFI ABI only supports Read"));
+        }
+    }
+
+    #[tokio::test]
     async fn test_round_trip_ffi_schema_provider() {
         let schema_provider = Arc::new(MemorySchemaProvider::new());
         assert!(
@@ -437,7 +501,7 @@ mod tests {
 
         // Retrieve non-existent table
         let returned_schema = foreign_schema_provider
-            .table("prior_table")
+            .table("prior_table", TableIntent::Read)
             .await
             .expect("Unable to query table");
         assert!(returned_schema.is_none());
@@ -445,7 +509,7 @@ mod tests {
 
         // Retrieve valid table
         let returned_schema = foreign_schema_provider
-            .table("second_table")
+            .table("second_table", TableIntent::Read)
             .await
             .expect("Unable to query table");
         assert!(returned_schema.is_some());

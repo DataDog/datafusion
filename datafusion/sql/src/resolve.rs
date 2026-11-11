@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 use datafusion_common::{DataFusionError, Result};
+use datafusion_expr::{TableIntent, dml::InsertOp};
 
 use crate::parser::{CopyToSource, CopyToStatement, Statement as DFStatement};
 use crate::planner::object_name_to_table_reference;
@@ -50,28 +51,59 @@ const INFORMATION_SCHEMA_TABLES: &[&str] = &[
 // Collect table/CTE references as `TableReference`s and normalize them during traversal.
 // This avoids a second normalization/conversion pass after visiting the AST.
 struct RelationVisitor {
-    relations: BTreeSet<TableReference>,
+    relations: BTreeMap<TableReference, Vec<TableIntent>>,
+    intent_targets: HashMap<*const ObjectName, TableIntent>,
     all_ctes: BTreeSet<TableReference>,
     ctes_in_scope: Vec<TableReference>,
     enable_ident_normalization: bool,
 }
 
 impl RelationVisitor {
+    fn new(enable_ident_normalization: bool) -> Self {
+        Self {
+            relations: BTreeMap::new(),
+            intent_targets: HashMap::new(),
+            all_ctes: BTreeSet::new(),
+            ctes_in_scope: vec![],
+            enable_ident_normalization,
+        }
+    }
+
     /// Record the reference to `relation`, if it's not a CTE reference.
     fn insert_relation(&mut self, relation: &ObjectName) -> ControlFlow<DataFusionError> {
+        let intent = self
+            .intent_targets
+            .get(&std::ptr::from_ref(relation))
+            .copied()
+            .unwrap_or(TableIntent::Read);
         match object_name_to_table_reference(
             relation.clone(),
             self.enable_ident_normalization,
         ) {
             Ok(relation) => {
-                if !self.relations.contains(&relation)
-                    && !self.ctes_in_scope.contains(&relation)
+                if intent != TableIntent::Read || !self.ctes_in_scope.contains(&relation)
                 {
-                    self.relations.insert(relation);
+                    let intents = self.relations.entry(relation).or_default();
+                    if !intents.contains(&intent) {
+                        intents.push(intent);
+                    }
                 }
                 ControlFlow::Continue(())
             }
             Err(e) => ControlFlow::Break(e),
+        }
+    }
+
+    fn mark_target(&mut self, relation: &ObjectName, intent: TableIntent) {
+        // Match AST occurrences, not names: INSERT INTO t SELECT * FROM t needs
+        // separate insert and read lookups. These pointers are never dereferenced.
+        self.intent_targets
+            .insert(std::ptr::from_ref(relation), intent);
+    }
+
+    fn mark_table(&mut self, table: &TableFactor, intent: TableIntent) {
+        if let TableFactor::Table { name, .. } = table {
+            self.mark_target(name, intent);
         }
     }
 }
@@ -84,6 +116,12 @@ impl Visitor for RelationVisitor {
     }
 
     fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<Self::Break> {
+        if let SetExpr::Select(select) = q.body.as_ref()
+            && let Some(into) = &select.into
+        {
+            self.mark_target(&into.name, TableIntent::CreateTable { or_replace: false });
+            self.insert_relation(&into.name)?;
+        }
         if let Some(with) = &q.with {
             for cte in &with.cte_tables {
                 // The non-recursive CTE name is not in scope when evaluating the CTE itself, so this is valid:
@@ -119,6 +157,103 @@ impl Visitor for RelationVisitor {
     }
 
     fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
+        match statement {
+            Statement::Insert(insert) => {
+                if let TableObject::TableName(name) = &insert.table {
+                    let replace_into = insert.replace_into
+                        || insert.or == Some(SqliteOnConflict::Replace);
+                    let operation = match (insert.overwrite, replace_into) {
+                        (false, false) => InsertOp::Append,
+                        (true, false) => InsertOp::Overwrite,
+                        (false, true) => InsertOp::Replace,
+                        (true, true) => {
+                            return ControlFlow::Break(
+                                datafusion_common::plan_datafusion_err!(
+                                    "Conflicting insert operations: `overwrite` and `replace_into` cannot both be true"
+                                ),
+                            );
+                        }
+                    };
+                    self.mark_target(name, TableIntent::Insert(operation));
+                }
+            }
+            Statement::Update(update) => {
+                self.mark_table(&update.table.relation, TableIntent::Update);
+            }
+            Statement::Delete(delete) => {
+                let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) =
+                    &delete.from;
+                for table in from {
+                    self.mark_table(&table.relation, TableIntent::Delete);
+                }
+            }
+            Statement::Merge(merge) => {
+                self.mark_table(&merge.table, merge_table_intent(&merge.clauses));
+            }
+            Statement::Truncate(truncate) => {
+                for table in &truncate.table_names {
+                    self.mark_target(&table.name, TableIntent::Truncate);
+                }
+            }
+            Statement::ExplainTable { table_name, .. } => {
+                self.mark_target(table_name, TableIntent::Describe);
+                self.insert_relation(table_name)?;
+            }
+            Statement::ShowCreate { obj_name, .. } => {
+                self.mark_target(obj_name, TableIntent::Describe);
+            }
+            Statement::ShowColumns { show_options, .. } => {
+                if let Some(name) = show_options
+                    .show_in
+                    .as_ref()
+                    .and_then(|show_in| show_in.parent_name.as_ref())
+                {
+                    self.mark_target(name, TableIntent::Describe);
+                    self.insert_relation(name)?;
+                }
+            }
+            Statement::CreateIndex(index) => {
+                self.mark_target(&index.table_name, TableIntent::CreateIndex);
+                self.insert_relation(&index.table_name)?;
+            }
+            Statement::CreateTable(table) => {
+                self.mark_target(
+                    &table.name,
+                    TableIntent::CreateTable {
+                        or_replace: table.or_replace,
+                    },
+                );
+                self.insert_relation(&table.name)?;
+            }
+            Statement::CreateView(view) => {
+                self.mark_target(
+                    &view.name,
+                    TableIntent::CreateView {
+                        or_replace: view.or_replace,
+                    },
+                );
+                self.insert_relation(&view.name)?;
+            }
+            Statement::Drop {
+                object_type: object_type @ (ObjectType::Table | ObjectType::View),
+                names,
+                ..
+            } => {
+                for name in names {
+                    self.mark_target(
+                        name,
+                        if *object_type == ObjectType::Table {
+                            TableIntent::DropTable
+                        } else {
+                            TableIntent::DropView
+                        },
+                    );
+                    self.insert_relation(name)?;
+                }
+            }
+            _ => {}
+        }
+
         if let Statement::ShowCreate {
             obj_type: ShowCreateObject::Table | ShowCreateObject::View,
             obj_name,
@@ -149,13 +284,32 @@ impl Visitor for RelationVisitor {
                 match object_name_to_table_reference(obj, self.enable_ident_normalization)
                 {
                     Ok(tbl_ref) => {
-                        self.relations.insert(tbl_ref);
+                        self.relations
+                            .entry(tbl_ref)
+                            .or_insert_with(|| vec![TableIntent::Read]);
                     }
                     Err(e) => return ControlFlow::Break(e),
                 }
             }
         }
         ControlFlow::Continue(())
+    }
+}
+
+/// Determine all possible target mutations before resolving the target schema.
+pub(crate) fn merge_table_intent(clauses: &[MergeClause]) -> TableIntent {
+    let (mut insert, mut update, mut delete) = (false, false, false);
+    for clause in clauses {
+        match clause.action {
+            MergeAction::Insert(_) => insert = true,
+            MergeAction::Update(_) => update = true,
+            MergeAction::Delete { .. } => delete = true,
+        }
+    }
+    TableIntent::Merge {
+        insert,
+        update,
+        delete,
     }
 }
 
@@ -172,6 +326,12 @@ fn visit_statement(statement: &DFStatement, visitor: &mut RelationVisitor) -> Re
             control_flow_to_result(s.as_ref().visit(visitor))?;
         }
         DFStatement::CreateExternalTable(table) => {
+            visitor.mark_target(
+                &table.name,
+                TableIntent::CreateTable {
+                    or_replace: table.or_replace,
+                },
+            );
             control_flow_to_result(visitor.insert_relation(&table.name))?;
         }
         DFStatement::CopyTo(CopyToStatement { source, .. }) => match source {
@@ -224,21 +384,50 @@ fn visit_statement(statement: &DFStatement, visitor: &mut RelationVisitor) -> Re
 /// assert_eq!(ctes.len(), 1);
 /// assert_eq!(ctes[0].to_string(), "my_cte");
 /// ```
+/// This collects dependencies without operation intent. Use
+/// [`resolve_table_references_with_intent`] to prepare catalog lookups.
 pub fn resolve_table_references(
     statement: &crate::parser::Statement,
     enable_ident_normalization: bool,
 ) -> Result<(Vec<TableReference>, Vec<TableReference>)> {
-    let mut visitor = RelationVisitor {
-        relations: BTreeSet::new(),
-        all_ctes: BTreeSet::new(),
-        ctes_in_scope: vec![],
-        enable_ident_normalization,
-    };
+    let mut visitor = RelationVisitor::new(enable_ident_normalization);
 
     visit_statement(statement, &mut visitor)?;
 
     Ok((
-        visitor.relations.into_iter().collect(),
+        visitor.relations.into_keys().collect(),
+        visitor.all_ctes.into_iter().collect(),
+    ))
+}
+
+/// Table references paired with the operations required to resolve them.
+pub type TableReferencesWithIntent = Vec<(TableReference, TableIntent)>;
+
+/// Collects table references together with the operation performed on each occurrence.
+///
+/// Write targets use their specific operation, while query sources use [`TableIntent::Read`].
+/// A table used as both a target and a source appears once for each distinct operation.
+/// CTE aliases are excluded from table references and returned separately. Metadata and
+/// DDL target lookups carry their own operation; they do not imply a separate read grant.
+///
+/// Prefetch caches must retain the intent alongside the table reference so that a provider
+/// authorized for one operation cannot satisfy a lookup for another operation.
+pub fn resolve_table_references_with_intent(
+    statement: &crate::parser::Statement,
+    enable_ident_normalization: bool,
+) -> Result<(TableReferencesWithIntent, Vec<TableReference>)> {
+    let mut visitor = RelationVisitor::new(enable_ident_normalization);
+    visit_statement(statement, &mut visitor)?;
+    Ok((
+        visitor
+            .relations
+            .into_iter()
+            .flat_map(|(table, intents)| {
+                intents
+                    .into_iter()
+                    .map(move |intent| (table.clone(), intent))
+            })
+            .collect(),
         visitor.all_ctes.into_iter().collect(),
     ))
 }
@@ -246,6 +435,132 @@ pub fn resolve_table_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_aware_table_references() {
+        use crate::parser::DFParser;
+        use TableIntent::{Delete, Insert, Merge, Read, Truncate, Update};
+
+        let cases = [
+            (
+                "INSERT INTO dst VALUES (1)",
+                vec![("dst", Insert(InsertOp::Append))],
+            ),
+            (
+                "INSERT OVERWRITE dst SELECT * FROM src",
+                vec![("dst", Insert(InsertOp::Overwrite)), ("src", Read)],
+            ),
+            (
+                "REPLACE INTO dst SELECT * FROM src",
+                vec![("dst", Insert(InsertOp::Replace)), ("src", Read)],
+            ),
+            (
+                "INSERT OR REPLACE INTO dst VALUES (1)",
+                vec![("dst", Insert(InsertOp::Replace))],
+            ),
+            (
+                "INSERT INTO t SELECT * FROM t",
+                vec![("t", Insert(InsertOp::Append)), ("t", Read)],
+            ),
+            (
+                "INSERT INTO t WITH t AS (SELECT 1) SELECT * FROM t",
+                vec![("t", Insert(InsertOp::Append))],
+            ),
+            (
+                "INSERT INTO dst WITH t AS (SELECT * FROM src) SELECT * FROM t",
+                vec![("dst", Insert(InsertOp::Append)), ("src", Read)],
+            ),
+            ("UPDATE t SET id = 1", vec![("t", Update)]),
+            (
+                "UPDATE t SET id = (SELECT id FROM t)",
+                vec![("t", Update), ("t", Read)],
+            ),
+            (
+                "DELETE FROM t WHERE id IN (SELECT id FROM t)",
+                vec![("t", Delete), ("t", Read)],
+            ),
+            ("TRUNCATE TABLE t", vec![("t", Truncate)]),
+            (
+                "MERGE INTO t USING t AS s ON t.id = s.id WHEN MATCHED THEN DELETE",
+                vec![
+                    (
+                        "t",
+                        Merge {
+                            insert: false,
+                            update: false,
+                            delete: true,
+                        },
+                    ),
+                    ("t", Read),
+                ],
+            ),
+            (
+                "EXPLAIN INSERT INTO dst SELECT * FROM src",
+                vec![("dst", Insert(InsertOp::Append)), ("src", Read)],
+            ),
+            ("COPY t TO 'out.csv'", vec![("t", Read)]),
+            (
+                "SELECT * FROM t a JOIN t b ON a.id = b.id",
+                vec![("t", Read)],
+            ),
+        ];
+        for (sql, expected) in cases {
+            let statement = DFParser::parse_sql(sql).unwrap().pop_back().unwrap();
+            let (tables, _) =
+                resolve_table_references_with_intent(&statement, true).unwrap();
+            let tables: Vec<_> = tables
+                .into_iter()
+                .map(|(name, intent)| (name.to_string(), intent))
+                .collect();
+            let expected: Vec<_> = expected
+                .iter()
+                .map(|(name, intent)| (name.to_string(), *intent))
+                .collect();
+            assert_eq!(tables, expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn metadata_and_ddl_targets_are_distinct_from_query_sources() {
+        use crate::parser::DFParser;
+        for (sql, intent) in [
+            ("DESCRIBE target", TableIntent::Describe),
+            ("SHOW COLUMNS FROM target", TableIntent::Describe),
+            ("SHOW CREATE TABLE target", TableIntent::Describe),
+            ("CREATE INDEX idx ON target(id)", TableIntent::CreateIndex),
+            (
+                "CREATE TABLE target AS SELECT * FROM source",
+                TableIntent::CreateTable { or_replace: false },
+            ),
+            (
+                "CREATE VIEW target AS SELECT * FROM source",
+                TableIntent::CreateView { or_replace: false },
+            ),
+            (
+                "SELECT * INTO target FROM source",
+                TableIntent::CreateTable { or_replace: false },
+            ),
+            ("DROP TABLE target", TableIntent::DropTable),
+        ] {
+            let statement = DFParser::parse_sql(sql).unwrap().pop_back().unwrap();
+            let (tables, _) =
+                resolve_table_references_with_intent(&statement, true).unwrap();
+            assert!(
+                tables.contains(&(TableReference::bare("target"), intent)),
+                "{sql}: {tables:?}"
+            );
+            assert!(
+                !tables.contains(&(TableReference::bare("target"), TableIntent::Read)),
+                "{sql}"
+            );
+            if sql.contains("FROM source") {
+                assert!(
+                    tables.contains(&(TableReference::bare("source"), TableIntent::Read)),
+                    "{sql}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn resolve_table_references_shadowed_cte() {

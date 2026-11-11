@@ -20,6 +20,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion_common::{HashMap, TableReference, error::Result, not_impl_err};
 use datafusion_execution::config::SessionConfig;
+use datafusion_expr::TableIntent;
 
 use crate::{CatalogProvider, CatalogProviderList, SchemaProvider, TableProvider};
 
@@ -29,7 +30,18 @@ use crate::{CatalogProvider, CatalogProviderList, SchemaProvider, TableProvider}
 #[derive(Debug)]
 struct ResolvedSchemaProvider {
     owner_name: Option<String>,
-    cached_tables: HashMap<String, Arc<dyn TableProvider>>,
+    cached_tables: ResolvedTableCache,
+}
+
+#[derive(Debug)]
+struct ResolvedTableCache(HashMap<(String, TableIntent), Option<Arc<dyn TableProvider>>>);
+
+impl ResolvedTableCache {
+    fn new(
+        tables: HashMap<(String, TableIntent), Option<Arc<dyn TableProvider>>>,
+    ) -> Self {
+        Self(tables)
+    }
 }
 #[async_trait]
 impl SchemaProvider for ResolvedSchemaProvider {
@@ -38,11 +50,29 @@ impl SchemaProvider for ResolvedSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.cached_tables.keys().cloned().collect()
+        self.cached_tables
+            .0
+            .iter()
+            .filter_map(|((name, _), table)| table.as_ref().map(|_| name.clone()))
+            .collect::<datafusion_common::HashSet<_>>()
+            .into_iter()
+            .collect()
     }
 
-    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        Ok(self.cached_tables.get(name).cloned())
+    async fn table(
+        &self,
+        name: &str,
+        intent: TableIntent,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        self.cached_tables
+            .0
+            .get(&(name.to_string(), intent))
+            .cloned()
+            .ok_or_else(|| {
+                datafusion_common::plan_datafusion_err!(
+                    "Table '{name}' was not resolved for operation {intent:?}"
+                )
+            })
     }
 
     fn register_table(
@@ -62,7 +92,10 @@ impl SchemaProvider for ResolvedSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.cached_tables.contains_key(name)
+        self.cached_tables
+            .0
+            .iter()
+            .any(|((table, _), provider)| table == name && provider.is_some())
     }
 }
 
@@ -70,7 +103,7 @@ impl SchemaProvider for ResolvedSchemaProvider {
 struct ResolvedSchemaProviderBuilder {
     owner_name: String,
     async_provider: Arc<dyn AsyncSchemaProvider>,
-    cached_tables: HashMap<String, Option<Arc<dyn TableProvider>>>,
+    cached_tables: HashMap<(String, TableIntent), Option<Arc<dyn TableProvider>>>,
 }
 impl ResolvedSchemaProviderBuilder {
     fn new(owner_name: String, async_provider: Arc<dyn AsyncSchemaProvider>) -> Self {
@@ -81,21 +114,21 @@ impl ResolvedSchemaProviderBuilder {
         }
     }
 
-    async fn resolve_table(&mut self, table_name: &str) -> Result<()> {
-        if !self.cached_tables.contains_key(table_name) {
-            let resolved_table = self.async_provider.table(table_name).await?;
-            self.cached_tables
-                .insert(table_name.to_string(), resolved_table);
+    async fn resolve_table(
+        &mut self,
+        table_name: &str,
+        intent: TableIntent,
+    ) -> Result<()> {
+        let key = (table_name.to_string(), intent);
+        if !self.cached_tables.contains_key(&key) {
+            let resolved_table = self.async_provider.table(table_name, intent).await?;
+            self.cached_tables.insert(key, resolved_table);
         }
         Ok(())
     }
 
     fn finish(self) -> Arc<dyn SchemaProvider> {
-        let cached_tables = self
-            .cached_tables
-            .into_iter()
-            .filter_map(|(key, maybe_value)| maybe_value.map(|value| (key, value)))
-            .collect();
+        let cached_tables = ResolvedTableCache::new(self.cached_tables);
         Arc::new(ResolvedSchemaProvider {
             owner_name: Some(self.owner_name),
             cached_tables,
@@ -186,28 +219,30 @@ impl CatalogProviderList for ResolvedCatalogProviderList {
 /// [remote_catalog.rs]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/data_io/remote_catalog.rs
 #[async_trait]
 pub trait AsyncSchemaProvider: Send + Sync {
-    /// Lookup a table in the schema provider
-    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>>;
-    /// Creates a cached provider that can be used to execute a query containing given references
+    /// Resolve a table for an operation before its schema is used.
+    /// Implementations must handle intent explicitly; wrappers must forward it.
+    /// Authorize absent names before returning `Ok(None)`; denials are errors.
+    async fn table(
+        &self,
+        name: &str,
+        intent: TableIntent,
+    ) -> Result<Option<Arc<dyn TableProvider>>>;
+
+    /// Resolve tables for the requested operations, retaining each operation in the cache.
     ///
-    /// This method will walk through the references and look them up once, creating a cache of table
-    /// providers.  This cache will be returned as a synchronous TableProvider that can be used to plan
-    /// and execute a query containing the given references.
-    ///
-    /// This cache is intended to be short-lived for the execution of a single query.  There is no mechanism
-    /// for refresh or eviction of stale entries.
-    ///
-    /// See the [`AsyncSchemaProvider`] documentation for additional details
+    /// Authorized absence is cached; every unresolved name/operation pair is an error.
+    /// The snapshot is scoped to one caller and query; it does not refresh authorization.
     async fn resolve(
         &self,
-        references: &[TableReference],
+        references: &[(TableReference, TableIntent)],
         config: &SessionConfig,
         catalog_name: &str,
         schema_name: &str,
     ) -> Result<Arc<dyn SchemaProvider>> {
-        let mut cached_tables = HashMap::<String, Option<Arc<dyn TableProvider>>>::new();
+        let mut cached_tables =
+            HashMap::<(String, TableIntent), Option<Arc<dyn TableProvider>>>::new();
 
-        for reference in references {
+        for (reference, intent) in references {
             let ref_catalog_name = reference
                 .catalog()
                 .unwrap_or(&config.options().catalog.default_catalog);
@@ -225,16 +260,14 @@ pub trait AsyncSchemaProvider: Send + Sync {
                 continue;
             }
 
-            if !cached_tables.contains_key(reference.table()) {
-                let resolved_table = self.table(reference.table()).await?;
-                cached_tables.insert(reference.table().to_string(), resolved_table);
+            let key = (reference.table().to_string(), *intent);
+            if !cached_tables.contains_key(&key) {
+                let resolved_table = self.table(reference.table(), *intent).await?;
+                cached_tables.insert(key, resolved_table);
             }
         }
 
-        let cached_tables = cached_tables
-            .into_iter()
-            .filter_map(|(key, maybe_value)| maybe_value.map(|value| (key, value)))
-            .collect();
+        let cached_tables = ResolvedTableCache::new(cached_tables);
 
         Ok(Arc::new(ResolvedSchemaProvider {
             cached_tables,
@@ -254,25 +287,20 @@ pub trait AsyncCatalogProvider: Send + Sync {
     /// Lookup a schema in the provider
     async fn schema(&self, name: &str) -> Result<Option<Arc<dyn AsyncSchemaProvider>>>;
 
-    /// Creates a cached provider that can be used to execute a query containing given references
+    /// Resolve tables for the requested operations, retaining each operation in the cache.
     ///
-    /// This method will walk through the references and look them up once, creating a cache of schema
-    /// providers (each with their own cache of table providers).  This cache will be returned as a
-    /// synchronous CatalogProvider that can be used to plan and execute a query containing the given
-    /// references.
-    ///
-    /// This cache is intended to be short-lived for the execution of a single query.  There is no mechanism
-    /// for refresh or eviction of stale entries.
+    /// Authorized absence is cached; every unresolved name/operation pair is an error.
+    /// The snapshot is scoped to one caller and query; it does not refresh authorization.
     async fn resolve(
         &self,
-        references: &[TableReference],
+        references: &[(TableReference, TableIntent)],
         config: &SessionConfig,
         catalog_name: &str,
     ) -> Result<Arc<dyn CatalogProvider>> {
         let mut cached_schemas =
             HashMap::<String, Option<ResolvedSchemaProviderBuilder>>::new();
 
-        for reference in references {
+        for (reference, intent) in references {
             let ref_catalog_name = reference
                 .catalog()
                 .unwrap_or(&config.options().catalog.default_catalog);
@@ -303,7 +331,7 @@ pub trait AsyncCatalogProvider: Send + Sync {
             // If we can't find the catalog don't bother checking the table
             let Some(schema) = schema else { continue };
 
-            schema.resolve_table(reference.table()).await?;
+            schema.resolve_table(reference.table(), *intent).await?;
         }
 
         let cached_schemas = cached_schemas
@@ -327,24 +355,19 @@ pub trait AsyncCatalogProviderList: Send + Sync {
     /// Lookup a catalog in the provider
     async fn catalog(&self, name: &str) -> Result<Option<Arc<dyn AsyncCatalogProvider>>>;
 
-    /// Creates a cached provider that can be used to execute a query containing given references
+    /// Resolve tables for the requested operations, retaining each operation in the cache.
     ///
-    /// This method will walk through the references and look them up once, creating a cache of catalog
-    /// providers, schema providers, and table providers.  This cache will be returned as a
-    /// synchronous CatalogProvider that can be used to plan and execute a query containing the given
-    /// references.
-    ///
-    /// This cache is intended to be short-lived for the execution of a single query.  There is no mechanism
-    /// for refresh or eviction of stale entries.
+    /// Authorized absence is cached; every unresolved name/operation pair is an error.
+    /// The snapshot is scoped to one caller and query; it does not refresh authorization.
     async fn resolve(
         &self,
-        references: &[TableReference],
+        references: &[(TableReference, TableIntent)],
         config: &SessionConfig,
     ) -> Result<Arc<dyn CatalogProviderList>> {
         let mut cached_catalogs =
             HashMap::<String, Option<ResolvedCatalogProviderBuilder>>::new();
 
-        for reference in references {
+        for (reference, intent) in references {
             let catalog_name = reference
                 .catalog()
                 .unwrap_or(&config.options().catalog.default_catalog);
@@ -395,7 +418,7 @@ pub trait AsyncCatalogProviderList: Send + Sync {
             // If we can't find the catalog don't bother checking the table
             let Some(schema) = schema else { continue };
 
-            schema.resolve_table(reference.table()).await?;
+            schema.resolve_table(reference.table(), *intent).await?;
         }
 
         // Build the cached catalog provider list
@@ -413,18 +436,20 @@ pub trait AsyncCatalogProviderList: Send + Sync {
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU32, Ordering},
     };
 
     use arrow::datatypes::SchemaRef;
     use async_trait::async_trait;
-    use datafusion_common::{Statistics, TableReference, error::Result};
+    use datafusion_common::{
+        Statistics, TableReference, assert_contains, error::Result, exec_err,
+    };
     use datafusion_execution::config::SessionConfig;
-    use datafusion_expr::{Expr, TableType};
+    use datafusion_expr::{Expr, TableIntent, TableType, dml::InsertOp};
     use datafusion_physical_plan::ExecutionPlan;
 
-    use crate::{Session, TableProvider};
+    use crate::{CatalogProviderList, SchemaProvider, Session, TableProvider};
 
     use super::{AsyncCatalogProvider, AsyncCatalogProviderList, AsyncSchemaProvider};
 
@@ -467,7 +492,11 @@ mod tests {
 
     #[async_trait]
     impl AsyncSchemaProvider for MockAsyncSchemaProvider {
-        async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        async fn table(
+            &self,
+            name: &str,
+            _intent: TableIntent,
+        ) -> Result<Option<Arc<dyn TableProvider>>> {
             self.lookup_count.fetch_add(1, Ordering::Release);
             if name == MOCK_TABLE {
                 Ok(Some(Arc::new(MockTableProvider {})))
@@ -475,6 +504,246 @@ mod tests {
                 Ok(None)
             }
         }
+    }
+
+    struct OperationAwareSchema {
+        allow_read: bool,
+        lookups: Mutex<Vec<TableIntent>>,
+    }
+
+    #[async_trait]
+    impl AsyncSchemaProvider for OperationAwareSchema {
+        async fn table(
+            &self,
+            name: &str,
+            intent: TableIntent,
+        ) -> Result<Option<Arc<dyn TableProvider>>> {
+            self.lookups.lock().unwrap().push(intent);
+            if intent != TableIntent::Insert(InsertOp::Append)
+                && !(self.allow_read && intent == TableIntent::Read)
+            {
+                return exec_err!("operation denied: {intent:?}");
+            }
+            Ok((name == MOCK_TABLE)
+                .then(|| Arc::new(MockTableProvider {}) as Arc<dyn TableProvider>))
+        }
+    }
+
+    #[derive(Clone)]
+    struct OperationAwareCatalog {
+        schema: Arc<dyn AsyncSchemaProvider>,
+    }
+
+    #[async_trait]
+    impl AsyncCatalogProvider for OperationAwareCatalog {
+        async fn schema(
+            &self,
+            name: &str,
+        ) -> Result<Option<Arc<dyn AsyncSchemaProvider>>> {
+            Ok((name == MOCK_SCHEMA).then(|| Arc::clone(&self.schema)))
+        }
+    }
+
+    #[async_trait]
+    impl AsyncCatalogProviderList for OperationAwareCatalog {
+        async fn catalog(
+            &self,
+            name: &str,
+        ) -> Result<Option<Arc<dyn AsyncCatalogProvider>>> {
+            Ok((name == MOCK_CATALOG)
+                .then(|| Arc::new(self.clone()) as Arc<dyn AsyncCatalogProvider>))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ResolveLevel {
+        Schema,
+        Catalog,
+        CatalogList,
+    }
+
+    async fn resolve_operations(
+        provider: Arc<dyn AsyncSchemaProvider>,
+        references: &[(TableReference, TableIntent)],
+        level: ResolveLevel,
+    ) -> Result<Arc<dyn SchemaProvider>> {
+        let config = test_config();
+        let catalog = OperationAwareCatalog {
+            schema: Arc::clone(&provider),
+        };
+        match level {
+            ResolveLevel::Schema => {
+                provider
+                    .resolve(references, &config, MOCK_CATALOG, MOCK_SCHEMA)
+                    .await
+            }
+            ResolveLevel::Catalog => Ok(AsyncCatalogProvider::resolve(
+                &catalog,
+                references,
+                &config,
+                MOCK_CATALOG,
+            )
+            .await?
+            .schema(MOCK_SCHEMA)
+            .unwrap()),
+            ResolveLevel::CatalogList => {
+                let catalogs: Arc<dyn CatalogProviderList> =
+                    AsyncCatalogProviderList::resolve(&catalog, references, &config)
+                        .await?;
+                Ok(catalogs
+                    .catalog(MOCK_CATALOG)
+                    .unwrap()
+                    .schema(MOCK_SCHEMA)
+                    .unwrap())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn operation_aware_caches_do_not_authorize_unresolved_operations() {
+        let insert = TableIntent::Insert(InsertOp::Append);
+        let references = vec![
+            (TableReference::bare(MOCK_TABLE), insert),
+            (
+                TableReference::full(MOCK_CATALOG, MOCK_SCHEMA, MOCK_TABLE),
+                insert,
+            ),
+        ];
+        for level in [
+            ResolveLevel::Schema,
+            ResolveLevel::Catalog,
+            ResolveLevel::CatalogList,
+        ] {
+            let provider = Arc::new(OperationAwareSchema {
+                allow_read: false,
+                lookups: Mutex::new(vec![]),
+            });
+            let cached = resolve_operations(provider.clone(), &references, level)
+                .await
+                .unwrap();
+            assert_eq!(*provider.lookups.lock().unwrap(), vec![insert]);
+            assert!(cached.table(MOCK_TABLE, insert).await.unwrap().is_some());
+            for intent in [TableIntent::Read, TableIntent::Insert(InsertOp::Overwrite)] {
+                let error = cached.table(MOCK_TABLE, intent).await.unwrap_err();
+                assert_contains!(
+                    error.to_string(),
+                    format!("was not resolved for operation {intent:?}")
+                );
+            }
+            assert!(cached.table("missing", TableIntent::Read).await.is_err());
+            assert_eq!(cached.table_names(), vec![MOCK_TABLE]);
+            assert!(cached.table_exist(MOCK_TABLE));
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_absence_is_distinct_from_an_unrequested_operation() {
+        let create = TableIntent::CreateTable { or_replace: false };
+        for level in [
+            ResolveLevel::Schema,
+            ResolveLevel::Catalog,
+            ResolveLevel::CatalogList,
+        ] {
+            let provider = Arc::new(MockAsyncSchemaProvider::default());
+            let references = [(TableReference::bare("absent"), create)];
+            let cached = resolve_operations(provider.clone(), &references, level)
+                .await
+                .unwrap();
+            assert!(cached.table("absent", create).await.unwrap().is_none());
+            assert!(cached.table("absent", TableIntent::Read).await.is_err());
+            assert!(cached.table("another", create).await.is_err());
+            assert!(!cached.table_exist("absent"));
+            assert!(cached.table_names().is_empty());
+            assert_eq!(provider.lookup_count.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn operation_aware_caches_check_each_operation() {
+        let insert = TableIntent::Insert(InsertOp::Append);
+        let references = vec![
+            (TableReference::bare(MOCK_TABLE), insert),
+            (TableReference::bare(MOCK_TABLE), TableIntent::Read),
+        ];
+        for level in [
+            ResolveLevel::Schema,
+            ResolveLevel::Catalog,
+            ResolveLevel::CatalogList,
+        ] {
+            let denied = Arc::new(OperationAwareSchema {
+                allow_read: false,
+                lookups: Mutex::new(vec![]),
+            });
+            let error = resolve_operations(denied.clone(), &references, level)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("operation denied: Read"));
+            assert_eq!(
+                *denied.lookups.lock().unwrap(),
+                vec![insert, TableIntent::Read]
+            );
+
+            let allowed = Arc::new(OperationAwareSchema {
+                allow_read: true,
+                lookups: Mutex::new(vec![]),
+            });
+            let cached = resolve_operations(allowed.clone(), &references, level)
+                .await
+                .unwrap();
+            assert_eq!(
+                *allowed.lookups.lock().unwrap(),
+                vec![insert, TableIntent::Read]
+            );
+            let write_provider = cached.table(MOCK_TABLE, insert).await.unwrap().unwrap();
+            let read_provider = cached
+                .table(MOCK_TABLE, TableIntent::Read)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!Arc::ptr_eq(&write_provider, &read_provider));
+            assert_eq!(cached.table_names(), vec![MOCK_TABLE]);
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_read_does_not_authorize_insert() {
+        let provider = MockAsyncSchemaProvider::default();
+        let insert = TableIntent::Insert(InsertOp::Append);
+        let config = test_config();
+        let cached = provider
+            .resolve(
+                &[(TableReference::bare(MOCK_TABLE), TableIntent::Read)],
+                &config,
+                MOCK_CATALOG,
+                MOCK_SCHEMA,
+            )
+            .await
+            .unwrap();
+        assert!(
+            cached
+                .table(MOCK_TABLE, TableIntent::Read)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(cached.table(MOCK_TABLE, insert).await.is_err());
+
+        let cached = provider
+            .resolve(
+                &[(TableReference::bare(MOCK_TABLE), insert)],
+                &config,
+                MOCK_CATALOG,
+                MOCK_SCHEMA,
+            )
+            .await
+            .unwrap();
+        assert!(cached.table(MOCK_TABLE, insert).await.unwrap().is_some());
+        let error = cached
+            .table(MOCK_TABLE, TableIntent::Read)
+            .await
+            .unwrap_err();
+        assert_contains!(error.to_string(), "was not resolved for operation Read");
+        assert_eq!(provider.lookup_count.load(Ordering::Acquire), 2);
     }
 
     fn test_config() -> SessionConfig {
@@ -491,7 +760,12 @@ mod tests {
             expected_lookup_count: u32,
             found_tables: &[&str],
             not_found_tables: &[&str],
+            unresolved_tables: &[&str],
         ) {
+            let refs = refs
+                .into_iter()
+                .map(|reference| (reference, TableIntent::Read))
+                .collect::<Vec<_>>();
             let async_provider = MockAsyncSchemaProvider::default();
             let cached_provider = async_provider
                 .resolve(&refs, &test_config(), MOCK_CATALOG, MOCK_SCHEMA)
@@ -504,12 +778,29 @@ mod tests {
             );
 
             for table_ref in found_tables {
-                let table = cached_provider.table(table_ref).await.unwrap();
+                let table = cached_provider
+                    .table(table_ref, TableIntent::Read)
+                    .await
+                    .unwrap();
                 assert!(table.is_some());
             }
 
+            for table_ref in unresolved_tables {
+                assert!(
+                    cached_provider
+                        .table(table_ref, TableIntent::Read)
+                        .await
+                        .is_err()
+                );
+            }
             for table_ref in not_found_tables {
-                assert!(cached_provider.table(table_ref).await.unwrap().is_none());
+                assert!(
+                    cached_provider
+                        .table(table_ref, TableIntent::Read)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
             }
         }
 
@@ -522,6 +813,7 @@ mod tests {
             2,
             &[MOCK_TABLE],
             &["not_exists"],
+            &[],
         )
         .await;
 
@@ -532,6 +824,7 @@ mod tests {
                 TableReference::full("foo", MOCK_SCHEMA, MOCK_TABLE),
             ],
             0,
+            &[],
             &[],
             &[MOCK_TABLE],
         )
@@ -548,6 +841,7 @@ mod tests {
             2,
             &[MOCK_TABLE],
             &["not_exists"],
+            &[],
         )
         .await;
     }
@@ -580,6 +874,10 @@ mod tests {
             found_schemas: &[&str],
             not_found_schemas: &[&str],
         ) {
+            let refs = refs
+                .into_iter()
+                .map(|reference| (reference, TableIntent::Read))
+                .collect::<Vec<_>>();
             let async_provider = MockAsyncCatalogProvider::default();
             let cached_provider = async_provider
                 .resolve(&refs, &test_config(), MOCK_CATALOG)
@@ -665,6 +963,10 @@ mod tests {
             found_catalogs: &[&str],
             not_found_catalogs: &[&str],
         ) {
+            let refs = refs
+                .into_iter()
+                .map(|reference| (reference, TableIntent::Read))
+                .collect::<Vec<_>>();
             let async_provider = MockAsyncCatalogProviderList::default();
             let cached_provider =
                 async_provider.resolve(&refs, &test_config()).await.unwrap();
@@ -720,7 +1022,7 @@ mod tests {
         ] {
             let async_provider = MockAsyncCatalogProviderList::default();
             let cached_provider = async_provider
-                .resolve(std::slice::from_ref(table_ref), &test_config())
+                .resolve(&[(table_ref.clone(), TableIntent::Read)], &test_config())
                 .await
                 .unwrap();
 
@@ -730,7 +1032,13 @@ mod tests {
             let schema = catalog
                 .schema(table_ref.schema().unwrap_or(MOCK_SCHEMA))
                 .unwrap();
-            assert!(schema.table(table_ref.table()).await.unwrap().is_some());
+            assert!(
+                schema
+                    .table(table_ref.table(), TableIntent::Read)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
         }
     }
 }

@@ -17,7 +17,20 @@
   under the License.
 -->
 
-Change logs for each release can be found [here](dev/changelog).
+## Unreleased changes in this fork
 
+**Breaking changes:** table lookup now requires `TableIntent` across catalog,
+SQL planner, and remote snapshot APIs. `ContextProvider::get_table_source` returns
+an optional source; unresolved snapshot lookups fail instead of returning
+absence. Implicit file lookup preserves intent and propagates failures;
+`UrlTableFactory::try_new` now requires intent too. Missing object-store
+registrations use a typed `ObjectStoreNotFound` error. Foreign FFI schema adapters
+reject non-read intents. See the
+[migration guide](docs/source/library-user-guide/upgrading/55.0.0.md#den-fork-operation-aware-table-resolution)
+for required implementation changes and authorization boundaries.
+
+## Upstream releases
+
+Change logs for each release can be found [here](dev/changelog).
 
 For older versions, see [apache/arrow/CHANGELOG.md](https://github.com/apache/arrow/blob/master/CHANGELOG.md).

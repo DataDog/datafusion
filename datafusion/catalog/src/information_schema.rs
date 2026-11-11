@@ -35,6 +35,7 @@ use datafusion_common::error::Result;
 use datafusion_common::types::NativeType;
 use datafusion_execution::TaskContext;
 use datafusion_execution::runtime_env::RuntimeEnv;
+use datafusion_expr::TableIntent;
 use datafusion_expr::function::WindowUDFFieldArgs;
 use datafusion_expr::{
     AggregateUDF, ReturnFieldArgs, ScalarUDF, Signature, TypeSignature, WindowUDF,
@@ -178,7 +179,9 @@ impl InformationSchemaConfig {
                     // schema name may not exist in the catalog, so we need to check
                     if let Some(schema) = catalog.schema(&schema_name) {
                         for table_name in schema.table_names() {
-                            if let Some(table) = schema.table(&table_name).await? {
+                            if let Some(table) =
+                                schema.table(&table_name, TableIntent::Describe).await?
+                            {
                                 builder.add_view(
                                     &catalog_name,
                                     &schema_name,
@@ -208,7 +211,9 @@ impl InformationSchemaConfig {
                     // schema name may not exist in the catalog, so we need to check
                     if let Some(schema) = catalog.schema(&schema_name) {
                         for table_name in schema.table_names() {
-                            if let Some(table) = schema.table(&table_name).await? {
+                            if let Some(table) =
+                                schema.table(&table_name, TableIntent::Describe).await?
+                            {
                                 for (field_position, field) in
                                     table.schema().fields().iter().enumerate()
                                 {
@@ -585,6 +590,7 @@ impl SchemaProvider for InformationSchemaProvider {
     async fn table(
         &self,
         name: &str,
+        _intent: TableIntent,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
         let config = self.config.clone();
         let table: Arc<dyn PartitionStream> = match name.to_ascii_lowercase().as_str() {
@@ -1592,7 +1598,11 @@ mod tests {
 
         // InformationSchemaConfig::make_tables used this before `table_type`
         // existed but should not, as it may be expensive.
-        async fn table(&self, _: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        async fn table(
+            &self,
+            _: &str,
+            _intent: TableIntent,
+        ) -> Result<Option<Arc<dyn TableProvider>>> {
             panic!(
                 "InformationSchemaConfig::make_tables called SchemaProvider::table instead of table_type"
             )

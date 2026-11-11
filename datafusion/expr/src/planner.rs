@@ -24,8 +24,8 @@ use crate::expr::NullTreatment;
 #[cfg(feature = "sql")]
 use crate::logical_plan::LogicalPlan;
 use crate::{
-    AggregateUDF, Expr, GetFieldAccess, HigherOrderUDF, ScalarUDF, SortExpr, TableSource,
-    WindowFrame, WindowFunctionDefinition, WindowUDF,
+    AggregateUDF, Expr, GetFieldAccess, HigherOrderUDF, ScalarUDF, SortExpr, TableIntent,
+    TableSource, WindowFrame, WindowFunctionDefinition, WindowUDF,
 };
 use arrow::datatypes::{DataType, Field, FieldRef, SchemaRef};
 use datafusion_common::datatype::DataTypeExt;
@@ -42,8 +42,19 @@ use sqlparser::ast::{Expr as SQLExpr, Ident, ObjectName, TableAlias, TableFactor
 ///
 /// [`TableProvider`]: https://docs.rs/datafusion/latest/datafusion/catalog/trait.TableProvider.html
 pub trait ContextProvider {
-    /// Returns a table by reference, if it exists
-    fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>>;
+    /// Resolves a table for an operation before the SQL planner uses its schema.
+    ///
+    /// Implementations must explicitly handle the intent. Forwarding wrappers
+    /// must preserve it, and caches must distinguish both table and intent.
+    /// Identity and the mapping from operations to privileges are application-owned.
+    /// Check authorization even for absent names: `Ok(None)` means the lookup was
+    /// allowed but no table exists. Denials and unresolved cache entries are errors.
+    /// Creation uses this distinction to authorize a new destination.
+    fn get_table_source(
+        &self,
+        name: TableReference,
+        intent: TableIntent,
+    ) -> Result<Option<Arc<dyn TableSource>>>;
 
     /// Return the type of a file based on its extension (e.g. `.parquet`)
     ///

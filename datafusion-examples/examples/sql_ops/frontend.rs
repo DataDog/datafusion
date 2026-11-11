@@ -18,9 +18,10 @@
 //! See `main.rs` for how to run it.
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::{TableReference, plan_err};
+use datafusion::common::TableReference;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
+use datafusion::logical_expr::TableIntent;
 use datafusion::logical_expr::{
     AggregateUDF, Expr, HigherOrderUDF, LogicalPlan, ScalarUDF,
     TableProviderFilterPushDown, TableSource, WindowUDF,
@@ -137,16 +138,20 @@ struct MyContextProvider {
 }
 
 impl ContextProvider for MyContextProvider {
-    fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
+    fn get_table_source(
+        &self,
+        name: TableReference,
+        _intent: TableIntent,
+    ) -> Result<Option<Arc<dyn TableSource>>> {
         if name.table() == "person" {
-            Ok(Arc::new(MyTableSource {
+            Ok(Some(Arc::new(MyTableSource {
                 schema: Arc::new(Schema::new(vec![
                     Field::new("name", DataType::Utf8, false),
                     Field::new("age", DataType::UInt8, false),
                 ])),
-            }))
+            })))
         } else {
-            plan_err!("Table {} not found", name.table())
+            Ok(None)
         }
     }
 
