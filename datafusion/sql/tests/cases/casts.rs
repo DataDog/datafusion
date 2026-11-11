@@ -283,3 +283,15 @@ fn custom_conversion_errors_and_default_fallback() -> Result<()> {
     assert!(plan("INSERT INTO tokens (id) VALUES ('abc')", false).is_err());
     Ok(())
 }
+
+#[test]
+fn invalid_cast_target_is_rejected_before_its_input() {
+    let error =
+        plan("SELECT CAST(no_such_function(1) AS unknown_type)", false).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Unsupported SQL type unknown_type"),
+        "{error}"
+    );
+}

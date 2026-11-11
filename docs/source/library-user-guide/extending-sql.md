@@ -409,7 +409,8 @@ and metadata; expression nullability remains independent of destination NOT NULL
 constraints. Parameters receive nullable type hints. Assignment conversions go
 through `ExprPlanner::plan_cast`. Use `context.plan_assignment` for conversions
 in the custom projection, including assignments from SELECT sources. SELECT
-sources retain normal query type inference.
+sources retain normal query type inference. Destination hints apply only to the
+direct VALUES source; CTEs and nested relations use normal query inference.
 The helper checks source arity and returns a logical plan without collecting data.
 
 Return `InsertPlanning::Planned(input)` to replace the built-in assignment/default

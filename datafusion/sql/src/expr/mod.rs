@@ -1151,9 +1151,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return not_impl_err!("CAST with format is not supported: {format}");
         }
 
+        let field = self.convert_data_type_to_field(data_type)?;
         let raw = RawCastExpr {
             expr: self.sql_expr_to_logical_expr(expr, schema, planner_context)?,
-            field: self.convert_data_type_to_field(data_type)?,
+            field,
             kind: ExprCastKind::Explicit,
         };
         let RawCastExpr {

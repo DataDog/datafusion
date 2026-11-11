@@ -141,6 +141,10 @@ fn insert_source_select_keeps_the_normal_query_plan() -> Result<()> {
         &ctx,
         "INSERT INTO dest(s,n) VALUES ((SELECT 'one' FROM (VALUES (1)) AS v(x)), NULL)",
     )?;
+    plan(
+        &ctx,
+        "INSERT INTO dest(s,n) WITH x AS (VALUES (1)) VALUES ('one', (SELECT * FROM x))",
+    )?;
     Ok(())
 }
 
