@@ -154,6 +154,21 @@ pub trait ContextProvider {
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait ExprPlanner: Debug + Send + Sync {
+    /// Plan an explicit cast or an implicit assignment conversion.
+    ///
+    /// Called before storage-type compatibility and same-type checks, so planners
+    /// can distinguish logical types with identical Arrow storage. The target field
+    /// includes extension metadata, including metadata on nested children. Its
+    /// nullability is a destination constraint; the planned expression must report
+    /// its own output nullability. Return `Original` to use the default conversion.
+    fn plan_cast(
+        &self,
+        expr: RawCastExpr,
+        _schema: &DFSchema,
+    ) -> Result<PlannerResult<RawCastExpr>> {
+        Ok(PlannerResult::Original(expr))
+    }
+
     /// Plan the binary operation between two expressions, returns original
     /// BinaryExpr if not possible
     fn plan_binary_op(
@@ -279,6 +294,28 @@ pub trait ExprPlanner: Debug + Send + Sync {
     fn plan_window(&self, expr: RawWindowExpr) -> Result<PlannerResult<RawWindowExpr>> {
         Ok(PlannerResult::Original(expr))
     }
+}
+
+/// The SQL context in which a conversion is requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CastKind {
+    /// An explicit `CAST`, `::`, or typed literal.
+    Explicit,
+    /// A `TRY_CAST` or `SAFE_CAST` that returns NULL for failed conversions.
+    Try,
+    /// An implicit conversion to an INSERT destination field.
+    Assignment,
+}
+
+/// A conversion offered to [`ExprPlanner::plan_cast`].
+#[derive(Debug, Clone)]
+pub struct RawCastExpr {
+    /// Expression to convert; its source field can be resolved against the schema.
+    pub expr: Expr,
+    /// Destination storage type and logical field metadata.
+    pub field: FieldRef,
+    /// Explicit, fallible, or assignment conversion semantics.
+    pub kind: CastKind,
 }
 
 /// An operator with two arguments to plan

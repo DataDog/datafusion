@@ -46,6 +46,7 @@ use datafusion_expr::dml::{
 use datafusion_expr::expr_rewriter::normalize_col_with_schemas_and_ambiguity_check;
 use datafusion_expr::logical_plan::DdlStatement;
 use datafusion_expr::logical_plan::builder::project;
+use datafusion_expr::planner::{CastKind, PlannerResult, RawCastExpr};
 use datafusion_expr::utils::expr_to_columns;
 use datafusion_expr::{
     Analyze, CreateCatalog, CreateCatalogSchema,
@@ -2940,20 +2941,29 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             .enumerate()
             .map(|(i, value_index)| {
                 let target_field = table_schema.field(i);
-                let expr = match value_index {
-                    Some(v) => {
-                        Expr::Column(Column::from(source.schema().qualified_field(v)))
-                            .cast_to(target_field.data_type(), source.schema())?
+                let (expr, input_schema) = match value_index {
+                    Some(v) => (
+                        Expr::Column(Column::from(source.schema().qualified_field(v))),
+                        source.schema().as_ref(),
+                    ),
+                    None => (
+                        table_source
+                            .get_column_default(target_field.name())
+                            .cloned()
+                            .unwrap_or_else(|| Expr::Literal(ScalarValue::Null, None)),
+                        &DFSchema::empty(),
+                    ),
+                };
+                let raw = RawCastExpr {
+                    expr,
+                    field: Arc::clone(target_field),
+                    kind: CastKind::Assignment,
+                };
+                let expr = match self.plan_cast(raw, input_schema)? {
+                    PlannerResult::Planned(expr) => expr,
+                    PlannerResult::Original(raw) => {
+                        raw.expr.cast_to(raw.field.data_type(), input_schema)?
                     }
-                    // The value is not specified. Fill in the default value for the column.
-                    None => table_source
-                        .get_column_default(target_field.name())
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            // If there is no default for the column, then the default is NULL
-                            Expr::Literal(ScalarValue::Null, None)
-                        })
-                        .cast_to(target_field.data_type(), &DFSchema::empty())?,
                 };
                 Ok(expr.alias(target_field.name()))
             })

@@ -289,7 +289,11 @@ impl LogicalPlanBuilder {
                     );
                 }
             }
-            fields.push(field_type.to_owned(), field_nullable);
+            fields.push_with_metadata(
+                field_type.to_owned(),
+                field_nullable,
+                Some(FieldMetadata::from(schema.field(j).metadata().clone())),
+            );
         }
 
         Self::infer_inner(values, fields, schema)
@@ -1578,10 +1582,6 @@ struct ValuesFields {
 impl ValuesFields {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn push(&mut self, data_type: DataType, nullable: bool) {
-        self.push_with_metadata(data_type, nullable, None);
     }
 
     pub fn push_with_metadata(
@@ -3033,6 +3033,34 @@ mod tests {
                 Some("a:1:1".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn test_values_with_schema_preserves_logical_fields() -> Result<()> {
+        let field = Field::new("token", DataType::Int64, true).with_metadata(
+            [
+                ("ARROW:extension:name".into(), "custom.token".into()),
+                ("ARROW:extension:metadata".into(), "version=1".into()),
+                ("description".into(), "application identifier".into()),
+            ]
+            .into(),
+        );
+        let schema = Arc::new(DFSchema::from_unqualified_fields(
+            vec![field.clone()].into(),
+            HashMap::new(),
+        )?);
+        for values in [
+            vec![vec![lit(7i64)]],
+            vec![vec![Expr::Literal(ScalarValue::Null, None)]],
+        ] {
+            let plan =
+                LogicalPlanBuilder::values_with_schema(values, &schema)?.build()?;
+            assert_eq!(
+                plan.schema().field(0).as_ref(),
+                &field.clone().with_name("column1")
+            );
+        }
+        Ok(())
     }
 
     #[test]

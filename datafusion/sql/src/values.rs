@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_common::{DFSchema, Result, not_impl_err};
+use datafusion_expr::planner::{CastKind, PlannerResult, RawCastExpr};
 use datafusion_expr::{LogicalPlan, LogicalPlanBuilder};
 use sqlparser::ast::Values as SQLValues;
 
@@ -54,6 +55,28 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         if schema.fields().is_empty() {
             LogicalPlanBuilder::values(values)?.build()
         } else {
+            let values = values
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .enumerate()
+                        .map(|(index, expr)| {
+                            let Some(field) = schema.fields().get(index) else {
+                                return Ok(expr);
+                            };
+                            let raw = RawCastExpr {
+                                expr,
+                                field: Arc::clone(field),
+                                kind: CastKind::Assignment,
+                            };
+                            self.plan_cast(raw, &schema).map(|result| match result {
+                                PlannerResult::Planned(expr) => expr,
+                                PlannerResult::Original(raw) => raw.expr,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?;
             LogicalPlanBuilder::values_with_schema(values, &schema)?.build()
         }
     }

@@ -19,7 +19,8 @@ use std::ops::ControlFlow;
 
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion_expr::planner::{
-    PlannerResult, RawBinaryExpr, RawDictionaryExpr, RawFieldAccessExpr,
+    CastKind as ExprCastKind, PlannerResult, RawBinaryExpr, RawCastExpr,
+    RawDictionaryExpr, RawFieldAccessExpr,
 };
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, CastFormat, CastKind, CeilFloorKind,
@@ -372,14 +373,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     return not_impl_err!("CAST with format is not supported: {format}");
                 }
 
-                Ok(Expr::TryCast(TryCast::new_from_field(
-                    Box::new(self.sql_expr_to_logical_expr(
+                let raw = RawCastExpr {
+                    expr: self.sql_expr_to_logical_expr(
                         *expr,
                         schema,
                         planner_context,
-                    )?),
-                    self.convert_data_type_to_field(&data_type)?,
-                )))
+                    )?,
+                    field: self.convert_data_type_to_field(&data_type)?,
+                    kind: ExprCastKind::Try,
+                };
+                match self.plan_cast(raw, schema)? {
+                    PlannerResult::Planned(expr) => Ok(expr),
+                    PlannerResult::Original(raw) => Ok(Expr::TryCast(
+                        TryCast::new_from_field(Box::new(raw.expr), raw.field),
+                    )),
+                }
             }
 
             SQLExpr::TypedString(TypedString {
@@ -394,10 +402,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     }
                 };
 
-                Ok(Expr::Cast(Cast::new_from_field(
-                    Box::new(lit(value)),
-                    self.convert_data_type_to_field(&data_type)?,
-                )))
+                let raw = RawCastExpr {
+                    expr: lit(value),
+                    field: self.convert_data_type_to_field(&data_type)?,
+                    kind: ExprCastKind::Explicit,
+                };
+                match self.plan_cast(raw, schema)? {
+                    PlannerResult::Planned(expr) => Ok(expr),
+                    PlannerResult::Original(raw) => Ok(Expr::Cast(Cast::new_from_field(
+                        Box::new(raw.expr),
+                        raw.field,
+                    ))),
+                }
             }
 
             SQLExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(
@@ -1109,6 +1125,20 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         not_impl_err!("Overlay not supported by ExprPlanner: {overlay_args:?}")
     }
 
+    pub(super) fn plan_cast(
+        &self,
+        mut expr: RawCastExpr,
+        schema: &DFSchema,
+    ) -> Result<PlannerResult<RawCastExpr>> {
+        for planner in self.context_provider.get_expr_planners() {
+            match planner.plan_cast(expr, schema)? {
+                PlannerResult::Planned(expr) => return Ok(PlannerResult::Planned(expr)),
+                PlannerResult::Original(original) => expr = original,
+            }
+        }
+        Ok(PlannerResult::Original(expr))
+    }
+
     fn sql_cast_to_expr(
         &self,
         expr: SQLExpr,
@@ -1121,8 +1151,17 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return not_impl_err!("CAST with format is not supported: {format}");
         }
 
-        let dt = self.convert_data_type_to_field(data_type)?;
-        let expr = self.sql_expr_to_logical_expr(expr, schema, planner_context)?;
+        let raw = RawCastExpr {
+            expr: self.sql_expr_to_logical_expr(expr, schema, planner_context)?,
+            field: self.convert_data_type_to_field(data_type)?,
+            kind: ExprCastKind::Explicit,
+        };
+        let RawCastExpr {
+            expr, field: dt, ..
+        } = match self.plan_cast(raw, schema)? {
+            PlannerResult::Planned(expr) => return Ok(expr),
+            PlannerResult::Original(raw) => raw,
+        };
 
         // numeric constants are treated as seconds (rather as nanoseconds)
         // to align with postgres / duckdb semantics

@@ -55,6 +55,7 @@ impl Display for MockCsvType {
 
 #[derive(Default)]
 pub(crate) struct MockSessionState {
+    table_sources: HashMap<String, Arc<dyn TableSource>>,
     scalar_functions: HashMap<String, Arc<ScalarUDF>>,
     higher_order_functions: HashMap<String, Arc<HigherOrderUDF>>,
     aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
@@ -65,6 +66,11 @@ pub(crate) struct MockSessionState {
 }
 
 impl MockSessionState {
+    pub fn with_table_source(mut self, name: &str, source: Arc<dyn TableSource>) -> Self {
+        self.table_sources.insert(name.to_string(), source);
+        self
+    }
+
     pub fn with_expr_planner(mut self, expr_planner: Arc<dyn ExprPlanner>) -> Self {
         self.expr_planners.push(expr_planner);
         self
@@ -117,6 +123,9 @@ pub(crate) struct MockContextProvider {
 
 impl ContextProvider for MockContextProvider {
     fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
+        if let Some(source) = self.state.table_sources.get(name.table()) {
+            return Ok(Arc::clone(source));
+        }
         let schema = match name.table() {
             "test" => Ok(Schema::new(vec![
                 Field::new("t_date32", DataType::Date32, false),
