@@ -46,7 +46,10 @@ use datafusion_expr::dml::{
 use datafusion_expr::expr_rewriter::normalize_col_with_schemas_and_ambiguity_check;
 use datafusion_expr::logical_plan::DdlStatement;
 use datafusion_expr::logical_plan::builder::project;
-use datafusion_expr::planner::{CastKind, PlannerResult, RawCastExpr};
+use datafusion_expr::planner::{
+    CastKind, InsertPlannerContext, InsertPlanning, PlannerResult, RawCastExpr,
+    ResolvedInsert,
+};
 use datafusion_expr::utils::expr_to_columns;
 use datafusion_expr::{
     Analyze, CreateCatalog, CreateCatalogSchema,
@@ -2887,54 +2890,47 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             (Fields::from(fields), value_indices)
         };
 
-        // infer types for Values clause... other types should be resolvable the regular way
-        let mut prepare_param_data_types = BTreeMap::new();
-        if let SetExpr::Values(ast::Values { rows, .. }) = (*source.body).clone() {
-            for row in rows.iter() {
-                for (idx, val) in row.content.iter().enumerate() {
-                    if let SQLExpr::Value(ValueWithSpan {
-                        value: Value::Placeholder(name),
-                        span: _,
-                    }) = val
-                    {
-                        let index = match name[1..].parse::<usize>().map_err(|_| {
-                            plan_datafusion_err!("Can't parse placeholder: {name}")
-                        })? {
-                            0 => {
-                                return plan_err!(
-                                    "Invalid placeholder, zero is not a valid index: {name}"
-                                );
-                            }
-                            index => index - 1,
-                        };
-                        let field = fields.get(idx).ok_or_else(|| {
-                            plan_datafusion_err!(
-                                "Placeholder ${} refers to a non existent column",
-                                idx + 1
-                            )
-                        })?;
-                        let _ = prepare_param_data_types.insert(index, Arc::clone(field));
-                    }
+        let insert_op = match (overwrite, replace_into) {
+            (false, false) => InsertOp::Append,
+            (true, false) => InsertOp::Overwrite,
+            (false, true) => InsertOp::Replace,
+            (true, true) => plan_err!(
+                "Conflicting insert operations: `overwrite` and `replace_into` cannot both be true"
+            )?,
+        };
+
+        let mut insert = ResolvedInsert {
+            table_name: table_name.clone(),
+            table_source: Arc::clone(&table_source),
+            fields,
+            column_indices: value_indices,
+            source,
+            insert_op,
+        };
+        if let Some(planner) = self.context_provider.get_insert_planner() {
+            let mut context = SqlInsertPlannerContext { planner: self };
+            match planner.plan_input(insert, &mut context)? {
+                InsertPlanning::Original(original) => insert = *original,
+                InsertPlanning::Planned(input) => {
+                    return Ok(LogicalPlan::Dml(DmlStatement::new(
+                        table_name,
+                        table_source,
+                        WriteOp::Insert(insert_op),
+                        Arc::new(*input),
+                    )));
                 }
             }
         }
-        let prepare_param_data_types = {
-            let len = prepare_param_data_types.keys().last().map_or(0, |&k| k + 1);
-            (0..len)
-                .map(|i| prepare_param_data_types.remove(&i))
-                .collect()
-        };
-
-        // Projection
-        let mut planner_context =
-            PlannerContext::new().with_prepare_param_data_types(prepare_param_data_types);
-        planner_context.set_table_schema(Some(DFSchemaRef::new(
-            DFSchema::from_unqualified_fields(fields.clone(), Default::default())?,
-        )));
-        let source = self.query_to_plan(*source, &mut planner_context)?;
-        if fields.len() != source.schema().fields().len() {
-            plan_err!("Column count doesn't match insert query!")?;
-        }
+        let ResolvedInsert {
+            table_name,
+            table_source,
+            fields,
+            column_indices: value_indices,
+            source,
+            insert_op,
+        } = insert;
+        let table_schema = DFSchema::try_from(table_source.schema())?;
+        let source = self.plan_insert_source(*source, &fields, false)?;
 
         let exprs = value_indices
             .into_iter()
@@ -2970,15 +2966,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             .collect::<Result<Vec<Expr>>>()?;
         let source = project(source, exprs)?;
 
-        let insert_op = match (overwrite, replace_into) {
-            (false, false) => InsertOp::Append,
-            (true, false) => InsertOp::Overwrite,
-            (false, true) => InsertOp::Replace,
-            (true, true) => plan_err!(
-                "Conflicting insert operations: `overwrite` and `replace_into` cannot both be true"
-            )?,
-        };
-
         let plan = LogicalPlan::Dml(DmlStatement::new(
             table_name,
             Arc::clone(&table_source),
@@ -2986,6 +2973,72 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             Arc::new(source),
         ));
         Ok(plan)
+    }
+
+    fn plan_insert_source(
+        &self,
+        source: Query,
+        fields: &Fields,
+        infer_nullability: bool,
+    ) -> Result<LogicalPlan> {
+        // infer types for Values clause... other types should be resolvable the regular way
+        let mut prepare_param_data_types = BTreeMap::new();
+        if let SetExpr::Values(ast::Values { rows, .. }) = (*source.body).clone() {
+            for row in rows.iter() {
+                for (idx, val) in row.content.iter().enumerate() {
+                    if let SQLExpr::Value(ValueWithSpan {
+                        value: Value::Placeholder(name),
+                        span: _,
+                    }) = val
+                    {
+                        let index = match name[1..].parse::<usize>().map_err(|_| {
+                            plan_datafusion_err!("Can't parse placeholder: {name}")
+                        })? {
+                            0 => {
+                                return plan_err!(
+                                    "Invalid placeholder, zero is not a valid index: {name}"
+                                );
+                            }
+                            index => index - 1,
+                        };
+                        let field = fields.get(idx).ok_or_else(|| {
+                            plan_datafusion_err!(
+                                "Placeholder ${} refers to a non existent column",
+                                idx + 1
+                            )
+                        })?;
+                        let field = if infer_nullability {
+                            Arc::new(field.as_ref().clone().with_nullable(true))
+                        } else {
+                            Arc::clone(field)
+                        };
+                        let _ = prepare_param_data_types.insert(index, field);
+                    }
+                }
+            }
+        }
+        let prepare_param_data_types = {
+            let len = prepare_param_data_types.keys().last().map_or(0, |&k| k + 1);
+            (0..len)
+                .map(|i| prepare_param_data_types.remove(&i))
+                .collect()
+        };
+
+        // Projection
+        let mut planner_context =
+            PlannerContext::new().with_prepare_param_data_types(prepare_param_data_types);
+        planner_context.infer_values_nullability = infer_nullability;
+        if !infer_nullability || matches!(source.body.as_ref(), SetExpr::Values(_)) {
+            planner_context.set_table_schema(Some(DFSchemaRef::new(
+                DFSchema::from_unqualified_fields(fields.clone(), Default::default())?,
+            )));
+        }
+        let source = self.query_to_plan(source, &mut planner_context)?;
+        if fields.len() != source.schema().fields().len() {
+            plan_err!("Column count doesn't match insert query!")?;
+        }
+
+        Ok(source)
     }
 
     fn show_columns_to_plan(
@@ -3194,6 +3247,42 @@ FROM (
             Some(BeginTransactionKind::Transaction) => Ok(()),
             Some(BeginTransactionKind::Work) | Some(BeginTransactionKind::Tran) => {
                 not_impl_err!("Transaction kind not supported: {kind:?}")
+            }
+        }
+    }
+}
+
+struct SqlInsertPlannerContext<'a, 'b, S: ContextProvider> {
+    planner: &'a SqlToRel<'b, S>,
+}
+
+impl<S: ContextProvider> InsertPlannerContext for SqlInsertPlannerContext<'_, '_, S> {
+    fn context_provider(&self) -> &dyn ContextProvider {
+        self.planner.context_provider
+    }
+
+    fn plan_source(&mut self, source: Query, type_hints: Fields) -> Result<LogicalPlan> {
+        self.planner.plan_insert_source(source, &type_hints, true)
+    }
+
+    fn plan_assignment(
+        &self,
+        expr: Expr,
+        field: FieldRef,
+        schema: &DFSchema,
+    ) -> Result<Expr> {
+        let raw = RawCastExpr {
+            expr,
+            field,
+            kind: CastKind::Assignment,
+        };
+        match self.planner.plan_cast(raw, schema)? {
+            PlannerResult::Planned(expr) => Ok(expr),
+            PlannerResult::Original(raw) => {
+                Ok(Expr::Cast(datafusion_expr::expr::Cast::new_from_field(
+                    Box::new(raw.expr),
+                    raw.field,
+                )))
             }
         }
     }

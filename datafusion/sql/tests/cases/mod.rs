@@ -18,5 +18,6 @@
 mod casts;
 mod collection;
 mod diagnostic;
+mod insert_planner;
 mod params;
 mod plan_to_sql;

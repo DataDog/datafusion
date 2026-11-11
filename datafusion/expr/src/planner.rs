@@ -98,6 +98,12 @@ pub trait ContextProvider {
         &[]
     }
 
+    /// Return an optional extension for INSERT input preparation.
+    #[cfg(feature = "sql")]
+    fn get_insert_planner(&self) -> Option<Arc<dyn InsertPlanner>> {
+        None
+    }
+
     /// Return [`TypePlanner`] extensions for planning data types
     #[cfg(feature = "sql")]
     fn get_type_planner(&self) -> Option<Arc<dyn TypePlanner>> {
@@ -505,4 +511,99 @@ pub trait TypePlanner: Debug + Send + Sync {
             .plan_type(sql_type)?
             .map(|data_type| data_type.into_nullable_field_ref()))
     }
+}
+
+/// An INSERT after resolving the target and validating the column list.
+///
+/// The source has not been planned or padded with defaults. This preserves the
+/// distinction between an omitted column and an explicitly supplied NULL.
+#[cfg(feature = "sql")]
+pub struct ResolvedInsert {
+    /// Resolved target name.
+    pub table_name: TableReference,
+    /// Target table, including its declared schema and default expressions.
+    pub table_source: Arc<dyn TableSource>,
+    /// Destination fields in source-column order, used as source type hints.
+    pub fields: arrow::datatypes::Fields,
+    /// Destination index to source index; `None` identifies an omitted column.
+    pub column_indices: Vec<Option<usize>>,
+    /// Unplanned VALUES or SELECT query, including its WITH/ORDER BY/LIMIT clauses.
+    pub source: Box<sqlparser::ast::Query>,
+    /// Validated insert operation.
+    pub insert_op: crate::dml::InsertOp,
+}
+
+#[cfg(feature = "sql")]
+impl Debug for ResolvedInsert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedInsert")
+            .field("table_name", &self.table_name)
+            .field("target_schema", &self.table_source.schema())
+            .field("fields", &self.fields)
+            .field("column_indices", &self.column_indices)
+            .field("source", &self.source)
+            .field("insert_op", &self.insert_op)
+            .finish()
+    }
+}
+
+/// Result of customizing INSERT input preparation.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub enum InsertPlanning {
+    /// Use the standard INSERT planner with the returned request.
+    Original(Box<ResolvedInsert>),
+    /// Use this input directly, without the standard assignment/default projection.
+    ///
+    /// The plan must satisfy the target provider's insert contract. The extension
+    /// and provider are responsible for assignment conversion, omitted columns,
+    /// defaults, and final constraint enforcement. The normal DML physical planner
+    /// still calls the target's `TableProvider::insert_into` with this input.
+    Planned(Box<LogicalPlan>),
+}
+
+/// Customize INSERT input preparation while retaining standard target resolution,
+/// column-list validation, source-query planning, and DML execution.
+///
+/// Called before VALUES typing or default padding. Return
+/// [`InsertPlanning::Original`] for targets that do not need custom preparation.
+/// This extension does not change SELECT planning or the target's read schema.
+#[cfg(feature = "sql")]
+pub trait InsertPlanner: Debug + Send + Sync {
+    /// Prepare the input relation for the resolved INSERT target.
+    fn plan_input(
+        &self,
+        insert: ResolvedInsert,
+        context: &mut dyn InsertPlannerContext,
+    ) -> Result<InsertPlanning>;
+}
+
+/// Source-query planning services for an [`InsertPlanner`].
+#[cfg(feature = "sql")]
+pub trait InsertPlannerContext {
+    /// Access table/function lookup and session configuration.
+    fn context_provider(&self) -> &dyn ContextProvider;
+
+    /// Plan the complete source query using the normal SQL planner.
+    ///
+    /// For a direct VALUES source, fields supply assignment types and metadata,
+    /// not NOT NULL constraints: output nullability is inferred from expressions.
+    /// Numbered parameters are nullable and retain destination type hints.
+    /// SELECT sources use normal query inference. Source arity must match the
+    /// hints. This does not pad omitted columns or evaluate destination defaults.
+    fn plan_source(
+        &mut self,
+        source: sqlparser::ast::Query,
+        type_hints: arrow::datatypes::Fields,
+    ) -> Result<LogicalPlan>;
+
+    /// Plan an assignment conversion using registered cast extensions, falling
+    /// back to a field-aware cast. Nullability follows the expression; the target
+    /// provider remains responsible for enforcing destination constraints.
+    fn plan_assignment(
+        &self,
+        expr: Expr,
+        field: FieldRef,
+        schema: &DFSchema,
+    ) -> Result<Expr>;
 }

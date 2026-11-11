@@ -26,7 +26,7 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::datatype::DataTypeExt;
 use datafusion_common::file_options::file_type::FileType;
 use datafusion_common::{DFSchema, GetExt, Result, TableReference, plan_err};
-use datafusion_expr::planner::{ExprPlanner, PlannerResult, TypePlanner};
+use datafusion_expr::planner::{ExprPlanner, InsertPlanner, PlannerResult, TypePlanner};
 use datafusion_expr::{
     AggregateUDF, Expr, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF,
 };
@@ -61,6 +61,7 @@ pub(crate) struct MockSessionState {
     aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
     expr_planners: Vec<Arc<dyn ExprPlanner>>,
     type_planner: Option<Arc<dyn TypePlanner>>,
+    insert_planner: Option<Arc<dyn InsertPlanner>>,
     window_functions: HashMap<String, Arc<WindowUDF>>,
     pub config_options: ConfigOptions,
 }
@@ -73,6 +74,11 @@ impl MockSessionState {
 
     pub fn with_expr_planner(mut self, expr_planner: Arc<dyn ExprPlanner>) -> Self {
         self.expr_planners.push(expr_planner);
+        self
+    }
+
+    pub fn with_insert_planner(mut self, planner: Arc<dyn InsertPlanner>) -> Self {
+        self.insert_planner = Some(planner);
         self
     }
 
@@ -353,6 +359,10 @@ impl ContextProvider for MockContextProvider {
 
     fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
         &self.state.expr_planners
+    }
+
+    fn get_insert_planner(&self) -> Option<Arc<dyn InsertPlanner>> {
+        self.state.insert_planner.clone()
     }
 
     fn get_type_planner(&self) -> Option<Arc<dyn TypePlanner>> {

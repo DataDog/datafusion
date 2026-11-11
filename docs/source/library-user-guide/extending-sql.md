@@ -58,18 +58,19 @@ logical plan.
 
 ## Extension Points
 
-DataFusion provides three planner traits for extending SQL:
+DataFusion provides four planner traits for extending SQL:
 
-| Trait               | Purpose                                 | Registration Method                        |
-| ------------------- | --------------------------------------- | ------------------------------------------ |
-| [`ExprPlanner`]     | Custom expressions and operators        | `ctx.register_expr_planner()`              |
-| [`TypePlanner`]     | Custom SQL data types                   | `SessionStateBuilder::with_type_planner()` |
-| [`RelationPlanner`] | Custom FROM clause elements (relations) | `ctx.register_relation_planner()`          |
+| Trait               | Purpose                                 | Registration Method                          |
+| ------------------- | --------------------------------------- | -------------------------------------------- |
+| [`ExprPlanner`]     | Custom expressions and operators        | `ctx.register_expr_planner()`                |
+| [`TypePlanner`]     | Custom SQL data types                   | `SessionStateBuilder::with_type_planner()`   |
+| [`RelationPlanner`] | Custom FROM clause elements (relations) | `ctx.register_relation_planner()`            |
+| [`InsertPlanner`]   | INSERT input preparation                | `SessionStateBuilder::with_insert_planner()` |
 
 **Planner Precedence**: Multiple [`ExprPlanner`]s and [`RelationPlanner`]s can be
 registered; they are invoked in reverse registration order (last registered wins).
 Return `Original(...)` to delegate to the next planner. Only one `TypePlanner`
-can be active at a time.
+can be active at a time. INSERT preparation also has a single optional planner.
 
 ### ExprPlanner: Custom Expressions and Operators
 
@@ -387,3 +388,44 @@ SELECT * FROM sales
 [relation_planner examples]: https://github.com/apache/datafusion/tree/main/datafusion-examples/examples/relation_planner
 [table_sample.rs]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/relation_planner/table_sample.rs
 [pivot_unpivot.rs]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/relation_planner/pivot_unpivot.rs
+
+## Custom INSERT input preparation
+
+Register an `InsertPlanner` with `SessionStateBuilder::with_insert_planner` when
+an embedding engine needs storage-managed defaults, generated columns, or custom
+assignment rules. This hook runs after target resolution and column-list validation,
+but before source typing and default padding. Without an extension, or when it
+returns `InsertPlanning::Original`, standard INSERT behavior is unchanged.
+
+`ResolvedInsert` contains the target, operation, source query, destination fields
+in source order, and a destination-to-source index mapping. A missing index means
+omission; an expression evaluating to NULL still has an index. For
+`INSERT INTO t (b) VALUES (NULL)` with destination columns `(a, b)`, the mapping is
+`[None, Some(0)]`. Extensions do not need to infer presence from NULL values.
+
+Use `InsertPlannerContext::plan_source` to keep normal query planning, including
+CTEs, joins, ordering, and limits. Its field hints supply VALUES assignment types
+and metadata; expression nullability remains independent of destination NOT NULL
+constraints. Parameters receive nullable type hints. Assignment conversions go
+through `ExprPlanner::plan_cast`. Use `context.plan_assignment` for conversions
+in the custom projection, including assignments from SELECT sources. SELECT
+sources retain normal query type inference.
+The helper checks source arity and returns a logical plan without collecting data.
+
+Return `InsertPlanning::Planned(input)` to replace the built-in assignment/default
+projection. The extension and target provider must together implement the write
+contract: column alignment, assignment conversion, defaults, and constraint
+validation before storage. Returning a plan with nullable fields does not waive
+NOT NULL constraints. The normal DML physical planner still invokes the target's
+`TableProvider::insert_into`; SELECT optimization and execution remain shared.
+
+This is a statement-planning hook, not a decoder: formats with different field
+presence per batch or row must preserve that information separately until their
+input preparation runs. No format or database-specific metadata keys are part of
+this API. The target read schema is independent of the intermediate insert schema.
+
+The SQL integration tests in `datafusion/sql/tests/cases/insert_planner.rs` show
+custom source planning, fallback, column mapping, parameter hints, metadata,
+validation, and composition with cast extensions.
+
+[`insertplanner`]: https://docs.rs/datafusion/latest/datafusion/logical_expr/planner/trait.InsertPlanner.html
