@@ -1008,7 +1008,7 @@ impl AggregateExec {
             .filter(|idx| group_by.groups.iter().all(|group| !group[*idx]))
             .collect();
 
-        let input_order_mode = if indices.len() == groupby_exprs.len()
+        let mut input_order_mode = if indices.len() == groupby_exprs.len()
             && !indices.is_empty()
             && group_by.groups.len() == 1
         {
@@ -1018,6 +1018,12 @@ impl AggregateExec {
         } else {
             InputOrderMode::Linear
         };
+
+        // Grouping sets can change group keys. PartialReduce combines intermediate
+        // states without using group boundaries to recognize completed groups.
+        if group_by.has_grouping_set() || mode == AggregateMode::PartialReduce {
+            input_order_mode = InputOrderMode::Linear;
+        }
 
         // construct a map from the input expression to the output expression of the Aggregation group by
         let group_expr_mapping =
