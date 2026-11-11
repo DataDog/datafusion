@@ -1009,12 +1009,23 @@ impl AggregateExec {
             .filter(|idx| group_by.groups.iter().all(|group| !group[*idx]))
             .collect();
 
-        let group_clustering_mode = if indices.len() == groupby_exprs.len()
+        let has_non_constant_groupby_exprs = groupby_exprs
+            .iter()
+            .any(|expr| input_eq_properties.is_expr_constant(expr).is_none());
+        // Grouping sets can change group keys. PartialReduce combines intermediate
+        // states without using group boundaries to recognize completed groups.
+        let group_clustering_mode = if group_by.has_grouping_set()
+            || group_by.groups != [vec![false; group_by.expr.len()]]
+            || mode == AggregateMode::PartialReduce
+        {
+            GroupClusteringMode::None
+        } else if has_non_constant_groupby_exprs
+            && indices.len() == groupby_exprs.len()
             && !indices.is_empty()
             && group_by.groups.len() == 1
         {
             GroupClusteringMode::Full
-        } else if !indices.is_empty() {
+        } else if has_non_constant_groupby_exprs && !indices.is_empty() {
             GroupClusteringMode::Partial(indices)
         } else {
             GroupClusteringMode::None
@@ -3193,7 +3204,7 @@ mod tests {
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
     use datafusion_expr::{
-        Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupsAccumulator,
+        Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupsAccumulator, Operator,
         Signature, Volatility,
     };
     use datafusion_functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf;
@@ -3207,7 +3218,7 @@ mod tests {
     use datafusion_physical_expr::Partitioning;
     use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
-    use datafusion_physical_expr::expressions::{Literal, NotExpr};
+    use datafusion_physical_expr::expressions::{Literal, NotExpr, binary};
 
     use crate::projection::ProjectionExec;
     use crate::repartition::RepartitionExec;
@@ -4429,6 +4440,259 @@ mod tests {
             aggregate.required_input_ordering(),
             vec![Some(OrderingRequirements::new_soft(input_ordering.into()))]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn partial_reduce_does_not_use_group_clustering() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::UInt32, false),
+            Field::new("b", DataType::Float64, false),
+        ]));
+        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(
+            Column::new("a", 0),
+        ))])
+        .unwrap();
+        let ordered_input =
+            TestMemoryExec::try_new(&[vec![]], Arc::clone(&schema), None)?
+                .try_with_sort_information(vec![ordering])?;
+        let grouped_input =
+            TestMemoryExec::try_new(&[vec![]], Arc::clone(&schema), None)?
+                .try_with_grouping_information(vec![vec![col("a", &schema)?]])?;
+
+        for input in [ordered_input, grouped_input] {
+            assert!(
+                input
+                    .properties()
+                    .equivalence_properties()
+                    .grouping_satisfy([col("a", &schema)?])?
+            );
+            let partial_reduce = AggregateExec::try_new(
+                AggregateMode::PartialReduce,
+                PhysicalGroupBy::new_single(vec![(col("a", &schema)?, "a".to_string())]),
+                vec![Arc::new(
+                    AggregateExprBuilder::new(sum_udaf(), vec![col("b", &schema)?])
+                        .schema(Arc::clone(&schema))
+                        .alias("SUM(b)")
+                        .build()?,
+                )],
+                vec![None],
+                Arc::new(input),
+                Arc::clone(&schema),
+            )?;
+
+            assert_eq!(
+                partial_reduce.group_clustering_mode(),
+                &GroupClusteringMode::None
+            );
+            assert_eq!(partial_reduce.maintains_input_order(), vec![false]);
+
+            let stream = partial_reduce.execute_typed(0, &new_migrated_hash_ctx(1024))?;
+            assert!(matches!(stream, StreamType::PartialReduceHash(_)));
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiple_group_masks_do_not_use_group_clustering() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let a = col("a", &schema)?;
+        let b = col("b", &schema)?;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 2, 1])),
+                Arc::new(Int32Array::from(vec![20, 20, 10])),
+                Arc::new(Int64Array::from(vec![10, 20, 40])),
+            ],
+        )?;
+        let input = TestMemoryExec::try_new(&[vec![batch]], Arc::clone(&schema), None)?;
+        let grouped_input = input
+            .clone()
+            .try_with_grouping_information(vec![vec![Arc::clone(&a), Arc::clone(&b)]])?;
+        // Repeating a mask repeats the keys, so input grouping does not prove
+        // contiguity after the masks are expanded.
+        let group_by = PhysicalGroupBy::new(
+            vec![(a, "a".to_string()), (b, "b".to_string())],
+            vec![],
+            vec![vec![false, false]; 2],
+            false,
+        );
+        let aggr_expr = Arc::new(
+            AggregateExprBuilder::new(sum_udaf(), vec![col("value", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("SUM(value)")
+                .build()?,
+        );
+
+        for input in [input, grouped_input] {
+            let aggregate = AggregateExec::try_new(
+                AggregateMode::Single,
+                group_by.clone(),
+                vec![Arc::clone(&aggr_expr)],
+                vec![None],
+                Arc::new(input),
+                Arc::clone(&schema),
+            )?;
+            let output =
+                collect(aggregate.execute(0, new_migrated_hash_ctx(1024))?).await?;
+            allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&output), @r"
+            +---+----+------------+
+            | a | b  | SUM(value) |
+            +---+----+------------+
+            | 1 | 10 | 80         |
+            | 2 | 20 | 60         |
+            +---+----+------------+
+            ");
+            }
+            assert_eq!(
+                aggregate.group_clustering_mode(),
+                &GroupClusteringMode::None
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nulling_group_mask_does_not_use_group_clustering() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let a = col("a", &schema)?;
+        let b = col("b", &schema)?;
+        let batches = [(1, 1, 10), (2, 2, 20), (3, 1, 30)]
+            .into_iter()
+            .map(|(a, b, value)| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int32Array::from(vec![a])),
+                        Arc::new(Int32Array::from(vec![b])),
+                        Arc::new(Int64Array::from(vec![value])),
+                    ],
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let input = TestMemoryExec::try_new(&[batches], Arc::clone(&schema), None)?;
+        let grouped_input = input
+            .clone()
+            .try_with_grouping_information(vec![vec![Arc::clone(&a), Arc::clone(&b)]])?;
+        // Nulling a turns distinct input tuples into (NULL, 1), (NULL, 2),
+        // (NULL, 1), which are no longer contiguous.
+        let group_by = PhysicalGroupBy::new(
+            vec![(a, "a".to_string()), (b, "b".to_string())],
+            vec![
+                (lit(ScalarValue::Int32(None)), "a".to_string()),
+                (lit(ScalarValue::Int32(None)), "b".to_string()),
+            ],
+            vec![vec![true, false]],
+            false,
+        );
+        let aggr_expr = Arc::new(
+            AggregateExprBuilder::new(sum_udaf(), vec![col("value", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("SUM(value)")
+                .build()?,
+        );
+
+        for input in [input, grouped_input] {
+            let aggregate = AggregateExec::try_new(
+                AggregateMode::Single,
+                group_by.clone(),
+                vec![Arc::clone(&aggr_expr)],
+                vec![None],
+                Arc::new(input),
+                Arc::clone(&schema),
+            )?;
+            let output =
+                collect(aggregate.execute(0, new_migrated_hash_ctx(1024))?).await?;
+            allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&output), @r"
+            +---+---+------------+
+            | a | b | SUM(value) |
+            +---+---+------------+
+            |   | 1 | 40         |
+            |   | 2 | 20         |
+            +---+---+------------+
+            ");
+            }
+            assert_eq!(
+                aggregate.group_clustering_mode(),
+                &GroupClusteringMode::None
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn constant_only_grouping_uses_final_emission() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )?;
+        let input = TestMemoryExec::try_new_exec(
+            &[vec![batch.clone(), batch]],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let predicate = binary(col("key", &schema)?, Operator::Eq, lit(1i32), &schema)?;
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExecBuilder::new(predicate, input).build()?);
+
+        // Cover both a literal and a column known to be constant after filtering.
+        for key in [lit(1i32), col("key", &schema)?] {
+            assert!(
+                input
+                    .equivalence_properties()
+                    .grouping_satisfy([Arc::clone(&key)])?
+            );
+            let aggregate = AggregateExec::try_new(
+                AggregateMode::Single,
+                PhysicalGroupBy::new_single(vec![(key, "key".to_string())]),
+                vec![Arc::new(
+                    AggregateExprBuilder::new(sum_udaf(), vec![col("value", &schema)?])
+                        .schema(Arc::clone(&schema))
+                        .alias("SUM(value)")
+                        .build()?,
+                )],
+                vec![None],
+                Arc::clone(&input),
+                Arc::clone(&schema),
+            )?;
+            assert_eq!(
+                aggregate.group_clustering_mode(),
+                &GroupClusteringMode::None
+            );
+            assert_eq!(aggregate.cache().emission_type, EmissionType::Final);
+
+            let stream = aggregate.execute_typed(0, &new_migrated_hash_ctx(1024))?;
+            assert!(matches!(stream, StreamType::SingleHash(_)));
+            let output = collect(stream.into()).await?;
+            allow_duplicates! {
+            assert_snapshot!(batches_to_string(&output), @r"
+            +-----+------------+
+            | key | SUM(value) |
+            +-----+------------+
+            | 1   | 60         |
+            +-----+------------+
+            ");
+            }
+        }
         Ok(())
     }
 
