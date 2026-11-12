@@ -21,18 +21,16 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, UInt64Array, new_empty_array,
-};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, new_empty_array};
 use arrow::buffer::BooleanBuffer;
-use arrow::compute::{filter_record_batch, prep_null_mask_filter, take};
+use arrow::compute::{filter_record_batch, prep_null_mask_filter};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::Result;
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::CastExpr;
 use datafusion_physical_expr_common::physical_expr::is_volatile;
-use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
+use datafusion_physical_expr_common::utils::{evaluate_expressions_to_arrays, scatter};
 
 /// Arguments retain only matching rows. Group keys must still be interned from
 /// the original batch so a group with no matches retains its empty result.
@@ -60,9 +58,8 @@ impl FilteredInput {
     }
 
     pub(super) fn filter(&self) -> Option<&BooleanArray> {
-        // GroupsAccumulator's no-filter fast path assumes every interned group
-        // has seen a row. Keep the filter even for all-true batches: an older
-        // group may still be empty.
+        // Compacted batches omit interned groups. Keep an all-true filter for
+        // those batches so accumulators track groups that have seen no values.
         self.filter.as_ref()
     }
 
@@ -81,19 +78,10 @@ impl FilteredInput {
         let Some(selection) = &self.selection else {
             return Ok((self.arguments.clone(), self.filter.as_ref()));
         };
-        let mut index = 0u64;
-        let indices =
-            UInt64Array::from_iter(selection.mask.values().iter().map(|selected| {
-                selected.then(|| {
-                    let current = index;
-                    index += 1;
-                    current
-                })
-            }));
         let arguments = self
             .arguments
             .iter()
-            .map(|array| take(array.as_ref(), &indices, None).map_err(Into::into))
+            .map(|array| scatter(&selection.mask, array.as_ref()))
             .collect::<Result<_>>()?;
         Ok((arguments, Some(&selection.mask)))
     }
@@ -102,7 +90,7 @@ impl FilteredInput {
 struct FilterScope {
     batch: RecordBatch,
     selection: Option<Arc<Selection>>,
-    filter: BooleanArray,
+    filter: Option<BooleanArray>,
     values: HashMap<Arc<dyn PhysicalExpr>, ColumnarValue>,
 }
 
@@ -171,7 +159,7 @@ impl<'a> FilteredInputEvaluator<'a> {
             };
             let (batch, selection, selected) =
                 if mask.true_count() == self.batch.num_rows() {
-                    (self.batch.clone(), None, mask)
+                    (self.batch.clone(), None, None)
                 } else {
                     let rows: Vec<usize> = mask.values().set_indices().collect();
                     let selected =
@@ -179,7 +167,7 @@ impl<'a> FilteredInputEvaluator<'a> {
                     (
                         filter_record_batch(self.batch, &mask)?,
                         Some(Arc::new(Selection { mask, rows })),
-                        selected,
+                        Some(selected),
                     )
                 };
             self.scopes.insert(
@@ -203,7 +191,7 @@ impl<'a> FilteredInputEvaluator<'a> {
         Ok(FilteredInput {
             arguments,
             selection: scope.selection.clone(),
-            filter: Some(scope.filter.clone()),
+            filter: scope.filter.clone(),
         })
     }
 }
