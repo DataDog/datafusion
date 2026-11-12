@@ -24,12 +24,12 @@ use std::vec;
 use super::order::GroupOrdering;
 use super::skip_partial::SkipAggregationProbe;
 use super::{AggregateExec, format_human_display};
+use crate::aggregates::filtered_input::FilteredInputEvaluator;
 use crate::aggregates::group_values::{GroupByMetrics, GroupValues, new_group_values};
 use crate::aggregates::order::GroupOrderingFull;
 use crate::aggregates::{
     AggregateInputMode, AggregateMode, AggregateOutputMode, PhysicalGroupBy,
-    create_schema, evaluate_group_by, evaluate_many, evaluate_optional, group_id_array,
-    max_duplicate_ordinal,
+    create_schema, evaluate_group_by, group_id_array, max_duplicate_ordinal,
 };
 use crate::metrics::{BaselineMetrics, MetricBuilder, MetricCategory, RecordOutput};
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
@@ -41,8 +41,8 @@ use crate::{RecordBatchStream, SendableRecordBatchStream};
 use arrow::array::*;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::{
-    DataFusionError, Result, assert_eq_or_internal_err, assert_or_internal_err,
-    internal_err, resources_datafusion_err,
+    DataFusionError, Result, assert_eq_or_internal_err, internal_err,
+    resources_datafusion_err,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
@@ -856,21 +856,21 @@ impl GroupedHashAggregateStream {
             _ => None,
         };
 
-        // Evaluate the aggregation expressions.
+        let mut evaluator = FilteredInputEvaluator::new(batch);
         let input_values = if self.spill_state.is_stream_merging {
-            evaluate_many(&self.spill_state.merging_aggregate_arguments, batch)?
+            self.spill_state
+                .merging_aggregate_arguments
+                .iter()
+                .map(|args| evaluator.evaluate(args, None))
+                .collect::<Result<Vec<_>>>()?
         } else {
-            evaluate_many(&self.aggregate_arguments, batch)?
+            self.aggregate_arguments
+                .iter()
+                .zip(self.filter_expressions.iter())
+                .map(|(args, filter)| evaluator.evaluate(args, filter.as_ref()))
+                .collect::<Result<Vec<_>>>()?
         };
         drop(timer);
-
-        // Evaluate the filter expressions, if any, against the inputs
-        let filter_values = if self.spill_state.is_stream_merging {
-            let filter_expressions = vec![None; self.accumulators.len()];
-            evaluate_optional(&filter_expressions, batch)?
-        } else {
-            evaluate_optional(&self.filter_expressions, batch)?
-        };
 
         for group_values in &group_by_values {
             let groups_start_time = Instant::now();
@@ -897,36 +897,19 @@ impl GroupedHashAggregateStream {
                 .time_calculating_group_ids
                 .add_duration(agg_start_time - groups_start_time);
 
-            // Gather the inputs to call the actual accumulator
-            let t = self
-                .accumulators
-                .iter_mut()
-                .zip(input_values.iter())
-                .zip(filter_values.iter());
-
-            for ((acc, values), opt_filter) in t {
-                let opt_filter = opt_filter.as_ref().map(|filter| filter.as_boolean());
-
-                // Call the appropriate method on each aggregator with
-                // the entire input row and the relevant group indexes
+            for (acc, input) in self.accumulators.iter_mut().zip(&input_values) {
                 if self.mode.input_mode() == AggregateInputMode::Raw
                     && !self.spill_state.is_stream_merging
                 {
+                    let indices = input.group_indices(group_indices);
                     acc.update_batch(
-                        values,
-                        group_indices,
-                        opt_filter,
+                        &input.arguments,
+                        &indices,
+                        input.filter(),
                         total_num_groups,
                     )?;
                 } else {
-                    assert_or_internal_err!(
-                        opt_filter.is_none(),
-                        "aggregate filter should be applied in partial stage, there should be no filter in final stage"
-                    );
-
-                    // if aggregation is over intermediate states,
-                    // use merge
-                    acc.merge_batch(values, group_indices, total_num_groups)?;
+                    acc.merge_batch(&input.arguments, group_indices, total_num_groups)?;
                 }
                 self.group_by_metrics
                     .aggregation_time
@@ -1368,9 +1351,7 @@ impl GroupedHashAggregateStream {
     /// Transforms input batch to intermediate aggregate state, without grouping it
     fn transform_to_states(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mut group_values = evaluate_group_by(&self.group_by, batch)?;
-        let input_values = evaluate_many(&self.aggregate_arguments, batch)?;
-        let filter_values = evaluate_optional(&self.filter_expressions, batch)?;
-
+        let mut evaluator = FilteredInputEvaluator::new(batch);
         assert_eq_or_internal_err!(
             group_values.len(),
             1,
@@ -1378,15 +1359,15 @@ impl GroupedHashAggregateStream {
         );
         let mut output = group_values.swap_remove(0);
 
-        let iter = self
+        for ((acc, args), filter) in self
             .accumulators
             .iter()
-            .zip(input_values.iter())
-            .zip(filter_values.iter());
-
-        for ((acc, values), opt_filter) in iter {
-            let opt_filter = opt_filter.as_ref().map(|filter| filter.as_boolean());
-            output.extend(acc.convert_to_state(values, opt_filter)?);
+            .zip(&self.aggregate_arguments)
+            .zip(self.filter_expressions.iter())
+        {
+            let input = evaluator.evaluate(args, filter.as_ref())?;
+            let (values, filter) = input.expanded()?;
+            output.extend(acc.convert_to_state(&values, filter)?);
         }
 
         let states_batch = RecordBatch::try_new(self.schema(), output)?;

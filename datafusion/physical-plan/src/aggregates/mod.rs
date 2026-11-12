@@ -206,6 +206,7 @@ use topk::heap::is_supported_heap_type;
 
 mod aggregate_hash_table;
 mod aggregate_stream;
+mod filtered_input;
 pub mod group_values;
 mod grouped_hash_stream;
 mod grouped_topk_stream;
@@ -2970,22 +2971,6 @@ pub fn evaluate_many(
 ) -> Result<Vec<Vec<ArrayRef>>> {
     expr.iter()
         .map(|expr| evaluate_expressions_to_arrays(expr, batch))
-        .collect()
-}
-
-fn evaluate_optional(
-    expr: &[Option<Arc<dyn PhysicalExpr>>],
-    batch: &RecordBatch,
-) -> Result<Vec<Option<ArrayRef>>> {
-    expr.iter()
-        .map(|expr| {
-            expr.as_ref()
-                .map(|expr| {
-                    expr.evaluate(batch)
-                        .and_then(|v| v.into_array(batch.num_rows()))
-                })
-                .transpose()
-        })
         .collect()
 }
 

@@ -45,3 +45,5 @@ mod insert_operation;
 /// Tests for `StatisticsRequest`s flowing from a custom optimizer rule
 /// through the physical planner into a custom `TableProvider`.
 mod statistics_requests;
+
+mod aggregate_fields_and_filters;

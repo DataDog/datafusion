@@ -651,6 +651,20 @@ impl CSEController for ExprCSEController<'_> {
 
     fn conditional_children(node: &Expr) -> Option<(Vec<&Expr>, Vec<&Expr>)> {
         match node {
+            Expr::AggregateFunction(aggregate) if aggregate.params.filter.is_some() => {
+                let params = &aggregate.params;
+                // Preserve Expr's child traversal order. Arguments precede the
+                // filter, so conservatively keep the filter conditional too.
+                Some((
+                    vec![],
+                    params
+                        .args
+                        .iter()
+                        .chain(params.filter.iter().map(|filter| filter.as_ref()))
+                        .chain(params.order_by.iter().map(|sort| &sort.expr))
+                        .collect(),
+                ))
+            }
             // In case of `ScalarFunction`s and `HigherOrderFunction`s we don't know which children are surely
             // executed so start visiting all children conditionally and stop the
             // recursion with `TreeNodeRecursion::Jump`.

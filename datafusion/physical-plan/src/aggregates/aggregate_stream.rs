@@ -33,15 +33,13 @@ use datafusion_expr::Operator;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{BinaryExpr, lit};
 use futures::stream::BoxStream;
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use super::AggregateExec;
-use crate::filter::batch_filter;
+use super::filtered_input::FilteredInputEvaluator;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::stream::{Stream, StreamExt};
 
 /// stream struct for aggregation without grouping columns
@@ -443,25 +441,14 @@ fn aggregate_batch(
 ) -> Result<usize> {
     let mut allocated = 0usize;
 
-    // 1.1 iterate accumulators and respective expressions together
-    // 1.2 filter the batch if necessary
-    // 1.3 evaluate expressions
-    // 1.4 update / merge accumulators with the expressions' values
-
-    // 1.1
+    let mut evaluator = FilteredInputEvaluator::new(batch);
     accumulators
         .iter_mut()
         .zip(expressions)
         .zip(filters)
         .try_for_each(|((accum, expr), filter)| {
-            // 1.2
-            let batch = match filter {
-                Some(filter) => Cow::Owned(batch_filter(batch, filter)?),
-                None => Cow::Borrowed(batch),
-            };
-
-            // 1.3
-            let values = evaluate_expressions_to_arrays(expr, batch.as_ref())?;
+            let input = evaluator.evaluate(expr, filter.as_ref())?;
+            let values = input.arguments;
 
             // 1.4
             let size_pre = accum.size();

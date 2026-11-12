@@ -513,8 +513,8 @@ fn agg_exprs_evaluation_result_on_empty_batch(
             .clone()
             .transform_up(|expr| {
                 let new_expr = if let Expr::AggregateFunction(agg) = &expr {
-                    let return_type = expr.get_type(schema.as_ref())?;
-                    let default_value = agg.func.default_value(&return_type)?;
+                    let (_, field) = expr.to_field(schema.as_ref())?;
+                    let default_value = agg.func.default_value_for_field(&field)?;
                     Transformed::yes(Expr::Literal(default_value, None))
                 } else {
                     Transformed::no(expr)
