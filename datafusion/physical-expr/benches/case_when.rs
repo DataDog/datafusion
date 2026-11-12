@@ -94,6 +94,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     run_benchmarks(c, &make_batch(8192, 100));
 
     benchmark_lookup_table_case_when(c, 8192);
+    benchmark_literal_when_expressions(c);
     benchmark_divide_by_zero_protection(c, 8192);
 }
 
@@ -599,3 +600,51 @@ fn benchmark_divide_by_zero_protection(c: &mut Criterion, batch_size: usize) {
 
 criterion_group!(benches, criterion_benchmark);
 criterion_main!(benches);
+
+fn benchmark_literal_when_expressions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("literal_when_expressions");
+    for branches in [2, 8, 16, 32, 128] {
+        for distribution in [
+            "uniform",
+            "first",
+            "first_two",
+            "mostly_first",
+            "miss_constant",
+            "miss_varied",
+        ] {
+            let keys: ArrayRef = Arc::new(Int32Array::from_iter_values((0..8192).map(
+                |i| match distribution {
+                    "first" => 0,
+                    "first_two" => i % 2,
+                    "mostly_first" if i % 16 != 0 => 0,
+                    "mostly_first" => (i / 16) % branches,
+                    "miss_constant" => branches,
+                    "miss_varied" => branches + i,
+                    _ => i % branches,
+                },
+            )));
+            let values: ArrayRef = Arc::new(Int32Array::from_iter_values(0..8192));
+            let batch =
+                RecordBatch::try_from_iter(vec![("category", keys), ("value", values)])
+                    .unwrap();
+            let key = col("category", &batch.schema()).unwrap();
+            let value = col("value", &batch.schema()).unwrap();
+            let expr = case(
+                Some(key),
+                (0..branches)
+                    .map(|i| (lit(i), make_x_cmp_y(&value, Operator::Gt, i)))
+                    .collect(),
+                Some(lit(false)),
+            )
+            .unwrap();
+            group.bench_with_input(
+                BenchmarkId::new(distribution, branches),
+                &batch,
+                |b, batch| {
+                    b.iter(|| black_box(expr.evaluate(black_box(batch)).unwrap()));
+                },
+            );
+        }
+    }
+    group.finish();
+}
