@@ -270,6 +270,8 @@ pub struct PlannerContext {
     outer_from_schema: Option<DFSchemaRef>,
     /// The query schema defined by the table
     create_table_schema: Option<DFSchemaRef>,
+    /// Treat VALUES destination fields as assignment hints, not constraints.
+    pub(crate) infer_values_nullability: bool,
     /// When planning non-first queries in a set expression
     /// (UNION/INTERSECT/EXCEPT), holds the schema of the left-most query.
     /// Used to alias duplicate expressions to match the left side's field names.
@@ -293,6 +295,7 @@ impl PlannerContext {
             outer_queries_schemas_stack: vec![],
             outer_from_schema: None,
             create_table_schema: None,
+            infer_values_nullability: false,
             set_expr_left_schema: None,
             lambda_parameters: HashMap::new(),
         }

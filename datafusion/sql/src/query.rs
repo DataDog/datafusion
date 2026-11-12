@@ -63,7 +63,16 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         }
 
         if let Some(with) = with {
+            // INSERT assignment hints describe the source relation, not its CTEs.
+            let assignment_schema = if planner_context.infer_values_nullability {
+                planner_context.set_table_schema(None)
+            } else {
+                None
+            };
             self.plan_with_clause(with, planner_context)?;
+            if let Some(schema) = assignment_schema {
+                planner_context.set_table_schema(Some(schema));
+            }
         }
 
         let set_expr = *body;

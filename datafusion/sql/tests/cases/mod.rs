@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod casts;
 mod collection;
 mod diagnostic;
+mod insert_planner;
 mod params;
 mod plan_to_sql;

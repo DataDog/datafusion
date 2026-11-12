@@ -58,7 +58,7 @@ use datafusion_expr::expr_rewriter::FunctionRewrite;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::planner::ExprPlanner;
 #[cfg(feature = "sql")]
-use datafusion_expr::planner::{RelationPlanner, TypePlanner};
+use datafusion_expr::planner::{InsertPlanner, RelationPlanner, TypePlanner};
 use datafusion_expr::registry::{
     ExtensionTypeRegistryRef, FunctionRegistry, MemoryExtensionTypeRegistry,
     SerializerRegistry,
@@ -150,6 +150,8 @@ pub struct SessionState {
     /// Provides support for customizing the SQL type planning
     #[cfg(feature = "sql")]
     type_planner: Option<Arc<dyn TypePlanner>>,
+    #[cfg(feature = "sql")]
+    insert_planner: Option<Arc<dyn InsertPlanner>>,
     /// Responsible for optimizing a logical plan
     optimizer: Optimizer,
     /// Responsible for optimizing a physical execution plan
@@ -242,7 +244,9 @@ impl Debug for SessionState {
         let ret = ret.field("relation_planners", &self.relation_planners);
 
         #[cfg(feature = "sql")]
-        let ret = ret.field("type_planner", &self.type_planner);
+        let ret = ret
+            .field("type_planner", &self.type_planner)
+            .field("insert_planner", &self.insert_planner);
 
         ret.field("query_planners", &self.query_planner)
             .field("analyzer", &self.analyzer)
@@ -1058,6 +1062,8 @@ pub struct SessionStateBuilder {
     relation_planners: Option<Vec<Arc<dyn RelationPlanner>>>,
     #[cfg(feature = "sql")]
     type_planner: Option<Arc<dyn TypePlanner>>,
+    #[cfg(feature = "sql")]
+    insert_planner: Option<Arc<dyn InsertPlanner>>,
     optimizer: Option<Optimizer>,
     physical_optimizers: Option<PhysicalOptimizer>,
     query_planner: Option<Arc<dyn QueryPlanner + Send + Sync>>,
@@ -1101,6 +1107,8 @@ impl SessionStateBuilder {
             relation_planners: None,
             #[cfg(feature = "sql")]
             type_planner: None,
+            #[cfg(feature = "sql")]
+            insert_planner: None,
             optimizer: None,
             physical_optimizers: None,
             query_planner: None,
@@ -1157,6 +1165,8 @@ impl SessionStateBuilder {
             relation_planners: Some(existing.relation_planners),
             #[cfg(feature = "sql")]
             type_planner: existing.type_planner,
+            #[cfg(feature = "sql")]
+            insert_planner: existing.insert_planner,
             optimizer: Some(existing.optimizer),
             physical_optimizers: Some(existing.physical_optimizers),
             query_planner: Some(existing.query_planner),
@@ -1324,6 +1334,16 @@ impl SessionStateBuilder {
     #[cfg(feature = "sql")]
     pub fn with_type_planner(mut self, type_planner: Arc<dyn TypePlanner>) -> Self {
         self.type_planner = Some(type_planner);
+        self
+    }
+
+    /// Set the extension for INSERT input preparation.
+    ///
+    /// The default is no extension: standard INSERT planning is unchanged.
+    /// The extension is retained when rebuilding from an existing session state.
+    #[cfg(feature = "sql")]
+    pub fn with_insert_planner(mut self, planner: Arc<dyn InsertPlanner>) -> Self {
+        self.insert_planner = Some(planner);
         self
     }
 
@@ -1574,6 +1594,8 @@ impl SessionStateBuilder {
             relation_planners,
             #[cfg(feature = "sql")]
             type_planner,
+            #[cfg(feature = "sql")]
+            insert_planner,
             optimizer,
             physical_optimizers,
             query_planner,
@@ -1610,6 +1632,8 @@ impl SessionStateBuilder {
             relation_planners: relation_planners.unwrap_or_default(),
             #[cfg(feature = "sql")]
             type_planner,
+            #[cfg(feature = "sql")]
+            insert_planner,
             optimizer: optimizer.unwrap_or_default(),
             physical_optimizers: physical_optimizers.unwrap_or_default(),
             query_planner: query_planner
@@ -1923,7 +1947,9 @@ impl Debug for SessionStateBuilder {
             .field("cache_factory", &self.cache_factory)
             .field("expr_planners", &self.expr_planners);
         #[cfg(feature = "sql")]
-        let ret = ret.field("type_planner", &self.type_planner);
+        let ret = ret
+            .field("type_planner", &self.type_planner)
+            .field("insert_planner", &self.insert_planner);
         ret.field("query_planners", &self.query_planner)
             .field("analyzer_rules", &self.analyzer_rules)
             .field("analyzer", &self.analyzer)
@@ -1970,6 +1996,10 @@ impl ContextProvider for SessionContextProvider<'_> {
 
     fn get_relation_planners(&self) -> &[Arc<dyn RelationPlanner>] {
         self.state.relation_planners()
+    }
+
+    fn get_insert_planner(&self) -> Option<Arc<dyn InsertPlanner>> {
+        self.state.insert_planner.clone()
     }
 
     fn get_type_planner(&self) -> Option<Arc<dyn TypePlanner>> {
@@ -2600,6 +2630,51 @@ mod tests {
             .build();
         assert!(session_state.table_factories().get("test").is_some());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn insert_planner_survives_session_rebuild() -> Result<()> {
+        use crate::prelude::SessionContext;
+        use datafusion_expr::LogicalPlan;
+        use datafusion_expr::planner::{
+            InsertPlanner, InsertPlannerContext, InsertPlanning, ResolvedInsert,
+        };
+        #[derive(Debug)]
+        struct PrepareInput;
+        impl InsertPlanner for PrepareInput {
+            fn plan_input(
+                &self,
+                insert: ResolvedInsert,
+                context: &mut dyn InsertPlannerContext,
+            ) -> Result<InsertPlanning> {
+                Ok(InsertPlanning::Planned(Box::new(
+                    context.plan_source(*insert.source, insert.fields)?,
+                )))
+            }
+        }
+        let state = SessionStateBuilder::new_with_default_features()
+            .with_insert_planner(Arc::new(PrepareInput))
+            .build();
+        let state = SessionStateBuilder::new_from_existing(state).build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(
+            "dest",
+            Arc::new(EmptyTable::new(Arc::new(Schema::new(vec![Field::new(
+                "n",
+                DataType::Int64,
+                false,
+            )])))),
+        )?;
+        let plan = ctx
+            .state()
+            .create_logical_plan("INSERT INTO dest VALUES (NULL)")
+            .await?;
+        let LogicalPlan::Dml(dml) = plan else {
+            panic!("expected DML")
+        };
+        assert!(dml.input.schema().field(0).is_nullable());
+        assert!(!dml.target.schema().field(0).is_nullable());
         Ok(())
     }
 

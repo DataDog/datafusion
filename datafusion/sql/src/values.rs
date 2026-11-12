@@ -18,8 +18,9 @@
 use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
-use datafusion_common::{DFSchema, Result, not_impl_err};
-use datafusion_expr::{LogicalPlan, LogicalPlanBuilder};
+use datafusion_common::{DFSchema, Result, not_impl_err, plan_err};
+use datafusion_expr::planner::{CastKind, PlannerResult, RawCastExpr};
+use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
 use sqlparser::ast::Values as SQLValues;
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
@@ -40,6 +41,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         }
 
         let empty_schema = Arc::new(DFSchema::empty());
+        // Assignment hints belong to this VALUES relation, not to subqueries
+        // inside its expressions. The standard planner keeps its legacy schema path.
+        let hints = if planner_context.infer_values_nullability {
+            planner_context.set_table_schema(None)
+        } else {
+            planner_context.table_schema()
+        };
         let values = rows
             .into_iter()
             .map(|row| {
@@ -50,11 +58,52 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let schema = planner_context.table_schema().unwrap_or(empty_schema);
+        let schema = hints.unwrap_or(empty_schema);
         if schema.fields().is_empty() {
             LogicalPlanBuilder::values(values)?.build()
         } else {
-            LogicalPlanBuilder::values_with_schema(values, &schema)?.build()
+            let values = values
+                .into_iter()
+                .map(|row| {
+                    if planner_context.infer_values_nullability
+                        && row.len() != schema.fields().len()
+                    {
+                        return plan_err!("Column count doesn't match insert query!");
+                    }
+                    row.into_iter()
+                        .enumerate()
+                        .map(|(index, expr)| {
+                            let Some(field) = schema.fields().get(index) else {
+                                return Ok(expr);
+                            };
+                            let raw = RawCastExpr {
+                                expr,
+                                field: Arc::clone(field),
+                                kind: CastKind::Assignment,
+                            };
+                            self.plan_cast(raw, &schema).map(|result| match result {
+                                PlannerResult::Planned(expr) => expr,
+                                PlannerResult::Original(raw)
+                                    if planner_context.infer_values_nullability =>
+                                {
+                                    Expr::Cast(
+                                        datafusion_expr::expr::Cast::new_from_field(
+                                            Box::new(raw.expr),
+                                            raw.field,
+                                        ),
+                                    )
+                                }
+                                PlannerResult::Original(raw) => raw.expr,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if planner_context.infer_values_nullability {
+                LogicalPlanBuilder::values(values)?.build()
+            } else {
+                LogicalPlanBuilder::values_with_schema(values, &schema)?.build()
+            }
         }
     }
 }
