@@ -2057,6 +2057,7 @@ impl RepartitionExec {
         // When there are more than one input partitions, they will be fused at the output.
         // Therefore, remove per partition constants.
         if input.output_partitioning().partition_count() > 1 {
+            eq_properties.clear_groupings();
             eq_properties.clear_per_partition_constants();
         }
         eq_properties
@@ -2490,6 +2491,38 @@ mod tests {
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_physical_expr::{PhysicalSortExpr, RangePartitioning, SplitPoint};
     use insta::assert_snapshot;
+
+    #[test]
+    fn grouping_is_cleared_only_when_input_partitions_are_merged() -> Result<()> {
+        let input = crate::test::mem_exec(2);
+        let grouping = col("i", &input.schema())?;
+        let input: Arc<dyn ExecutionPlan> = Arc::new(
+            input.try_with_grouping_information(vec![vec![Arc::clone(&grouping)]])?,
+        );
+        assert!(
+            input
+                .equivalence_properties()
+                .grouping_satisfy([Arc::clone(&grouping)])?
+        );
+        let repartition =
+            RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(2))?;
+        let properties = repartition.properties().equivalence_properties();
+        assert!(properties.geq_class().is_empty());
+        assert!(!properties.grouping_satisfy([grouping])?);
+
+        // Splitting one stream preserves contiguity in each output subsequence.
+        let input = crate::test::mem_exec(1);
+        let grouping = col("i", &input.schema())?;
+        let input: Arc<dyn ExecutionPlan> = Arc::new(
+            input.try_with_grouping_information(vec![vec![Arc::clone(&grouping)]])?,
+        );
+        let repartition =
+            RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(2))?;
+        let properties = repartition.properties().equivalence_properties();
+        assert_eq!(properties.geq_class().len(), 1);
+        assert!(properties.grouping_satisfy([grouping])?);
+        Ok(())
+    }
 
     #[derive(Debug)]
     struct UnboundedTestPartition {
