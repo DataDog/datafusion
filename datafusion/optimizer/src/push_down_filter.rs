@@ -1208,14 +1208,19 @@ impl OptimizerRule for PushDownFilter {
                 // determine if we can push any predicates down past the extension node
 
                 // each element is true for push, false to keep
+                //
+                // A volatile predicate must stay above the extension node:
+                // pushing it into the inputs evaluates it once per input row
+                // (or once per input) instead of once for the filtered result.
                 let predicate_push_or_keep: Vec<bool> =
                     split_conjunction(&filter.predicate)
                         .iter()
                         .map(|expr| {
-                            !expr
-                                .column_refs()
-                                .iter()
-                                .any(|c| prevent_cols.contains(&c.name))
+                            !expr.is_volatile()
+                                && !expr
+                                    .column_refs()
+                                    .iter()
+                                    .any(|c| prevent_cols.contains(&c.name))
                         })
                         .collect();
 
@@ -1439,7 +1444,7 @@ mod tests {
     use std::cmp::Ordering;
     use std::fmt::{Debug, Formatter};
 
-    use arrow::datatypes::{Field, Schema, SchemaRef};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use async_trait::async_trait;
 
     use datafusion_common::{DFSchemaRef, DataFusionError, ScalarValue};
@@ -2185,6 +2190,203 @@ mod tests {
           NoopPlan
             TableScan: test, full_filters=[test.a = Int64(1)]
             TableScan: test, full_filters=[test.a = Int64(1)]
+        "
+        )
+    }
+
+    /// returns a "random" function that is marked volatile (aka each invocation
+    /// returns a different value)
+    ///
+    /// Does not use datafusion_functions::rand to avoid introducing a
+    /// dependency on that crate.
+    fn rand_func() -> ScalarUDF {
+        ScalarUDF::new_from_impl(RandomStub::new())
+    }
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct RandomStub {
+        signature: Signature,
+    }
+
+    impl RandomStub {
+        fn new() -> Self {
+            Self {
+                signature: Signature::exact(vec![], Volatility::Volatile),
+            }
+        }
+    }
+    impl ScalarUDFImpl for RandomStub {
+        fn name(&self) -> &str {
+            "random"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Float64)
+        }
+
+        fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            panic!("dummy - not implemented")
+        }
+    }
+
+    #[test]
+    fn user_defined_plan_volatile_filters() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        let rand = rand_func().call(vec![]);
+
+        // A volatile predicate that references no column stays above the
+        // extension node: pushing it into the inputs would evaluate it one
+        // extra time per input.
+        let custom_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(NoopPlan {
+                input: vec![table_scan.clone()],
+                schema: Arc::clone(table_scan.schema()),
+            }),
+        });
+        let plan = LogicalPlanBuilder::from(custom_plan)
+            .filter(rand.clone().lt(lit(0.5f64)))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: random() < Float64(0.5)
+          NoopPlan
+            TableScan: test
+        "
+        )?;
+
+        // A volatile predicate on a column that would otherwise be pushable
+        // also stays above the extension node.
+        let custom_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(NoopPlan {
+                input: vec![table_scan.clone()],
+                schema: Arc::clone(table_scan.schema()),
+            }),
+        });
+        let plan = LogicalPlanBuilder::from(custom_plan)
+            .filter(col("a").eq(rand.clone()))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test.a = random()
+          NoopPlan
+            TableScan: test
+        "
+        )?;
+
+        // Mixed conjunction: the deterministic predicate is pushed below the
+        // NoopPlan while the volatile predicate is kept above it.
+        let custom_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(NoopPlan {
+                input: vec![table_scan.clone()],
+                schema: Arc::clone(table_scan.schema()),
+            }),
+        });
+        let plan = LogicalPlanBuilder::from(custom_plan)
+            .filter(col("a").eq(lit(1i64)).and(rand.clone().lt(lit(0.5f64))))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: random() < Float64(0.5)
+          NoopPlan
+            TableScan: test, full_filters=[test.a = Int64(1)]
+        "
+        )?;
+
+        // Deterministic control: a predicate on a pushable column is still
+        // pushed below the NoopPlan.
+        let custom_plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(NoopPlan {
+                input: vec![table_scan.clone()],
+                schema: Arc::clone(table_scan.schema()),
+            }),
+        });
+        let plan = LogicalPlanBuilder::from(custom_plan)
+            .filter(col("a").eq(lit(1i64)))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        NoopPlan
+          TableScan: test, full_filters=[test.a = Int64(1)]
+        "
+        )
+    }
+
+    #[test]
+    fn aggregate_volatile_filters() -> Result<()> {
+        let rand = rand_func().call(vec![]);
+
+        // A volatile predicate that references no column stays above the
+        // aggregate: evaluating it per input row changes which rows each group
+        // aggregates instead of selecting whole groups.
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .aggregate(vec![col("a")], vec![sum(col("c"))])?
+            .filter(rand.clone().lt(lit(0.5f64)))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: random() < Float64(0.5)
+          Aggregate: groupBy=[[test.a]], aggr=[[sum(test.c)]]
+            TableScan: test
+        "
+        )?;
+
+        // A volatile predicate on a grouping key stays above the aggregate.
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .aggregate(vec![col("a")], vec![sum(col("c"))])?
+            .filter(col("a").eq(rand.clone()))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test.a = random()
+          Aggregate: groupBy=[[test.a]], aggr=[[sum(test.c)]]
+            TableScan: test
+        "
+        )?;
+
+        // Mixed conjunction: the deterministic predicate on the grouping key
+        // is pushed below the aggregate, the volatile predicate is kept above.
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .aggregate(vec![col("a")], vec![sum(col("c"))])?
+            .filter(col("a").eq(lit(1i64)).and(rand.clone().lt(lit(0.5f64))))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: random() < Float64(0.5)
+          Aggregate: groupBy=[[test.a]], aggr=[[sum(test.c)]]
+            TableScan: test, full_filters=[test.a = Int64(1)]
+        "
+        )?;
+
+        // Deterministic control: a predicate on the grouping key is still
+        // pushed below the aggregate.
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .aggregate(vec![col("a")], vec![sum(col("c"))])?
+            .filter(col("a").eq(lit(1i64)))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Aggregate: groupBy=[[test.a]], aggr=[[sum(test.c)]]
+          TableScan: test, full_filters=[test.a = Int64(1)]
         "
         )
     }
