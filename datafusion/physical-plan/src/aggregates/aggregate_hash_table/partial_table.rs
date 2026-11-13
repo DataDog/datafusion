@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, new_null_array};
+use arrow::array::{ArrayRef, new_null_array};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, assert_eq_or_internal_err};
@@ -169,14 +169,12 @@ impl AggregateHashTable<PartialMarker> {
 
         if any_interned {
             let total_groups = state.group_values.len();
-            let false_filter = BooleanArray::from(vec![false]);
             for acc in state.accumulators.iter_mut() {
                 let null_args = acc.null_arguments(&self.input_schema)?;
-                let values = EvaluatedAccumulatorArgs {
-                    arguments: null_args,
-                    filter: Some(Arc::new(false_filter.clone())),
-                };
-                acc.update_batch(&values, &[0], total_groups)?;
+                let values = EvaluatedAccumulatorArgs::empty(
+                    null_args.iter().map(|arg| arg.slice(0, 0)).collect(),
+                );
+                acc.update_batch(&values, &[], total_groups)?;
             }
         }
 

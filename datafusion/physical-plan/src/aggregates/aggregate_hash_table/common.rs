@@ -18,7 +18,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, AsArray, new_null_array};
+use arrow::array::{ArrayRef, new_null_array};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, internal_err};
@@ -27,6 +27,7 @@ use datafusion_expr::{EmitTo, GroupsAccumulator};
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 
 use crate::PhysicalExpr;
+use crate::aggregates::filtered_input::{FilteredInput, FilteredInputEvaluator};
 use crate::aggregates::group_values::{GroupByMetrics, GroupValues, new_group_values};
 use crate::aggregates::grouped_hash_stream::create_group_accumulator;
 use crate::aggregates::order::GroupOrdering;
@@ -164,12 +165,13 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
 
         let timer = self.group_by_metrics.aggregate_arguments_time.timer();
         // The evaluated args for each accumulator
+        let mut evaluator = FilteredInputEvaluator::new(batch);
         let accumulator_args = self
             .state
             .building()
             .accumulators
             .iter()
-            .map(|acc| acc.evaluate_acc_args(batch))
+            .map(|acc| acc.evaluate_acc_args(&mut evaluator))
             .collect::<Result<Vec<_>>>()?;
         drop(timer);
 
@@ -400,18 +402,8 @@ pub(super) type AggregateBatchFn = fn(
 pub(super) type MaterializeAccumulatorFn =
     fn(&mut AggregateAccumulator, EmitTo) -> Result<Vec<ArrayRef>>;
 
-/// Evaluated aggregate arguments and filter for one input batch.
-///
-/// For example, `AVG(x + 1) FILTER (WHERE x > 0)` evaluates both `x + 1`
-/// and `x > 0`.
-///
-/// These arrays can be passed directly to [`GroupsAccumulator`].
-pub(super) struct EvaluatedAccumulatorArgs {
-    /// Evaluated argument arrays. Some aggregate functions take multiple arguments.
-    pub(super) arguments: Vec<ArrayRef>,
-    /// Evaluated filter array, `Some` if the aggregate has a `FILTER` expression.
-    pub(super) filter: Option<ArrayRef>,
-}
+/// Evaluated aggregate arguments and their selection of original batch rows.
+pub(super) type EvaluatedAccumulatorArgs = FilteredInput;
 
 /// Evaluated all group by keys and accumulator args.
 ///
@@ -529,36 +521,11 @@ impl HashAggregateAccumulator {
         ))
     }
 
-    /// Evaluate aggregate arguments and filter for one input batch.
-    ///
-    /// For example, `AVG(x + 1) FILTER (WHERE x > 0)` evaluates both `x + 1`
-    /// and `x > 0`.
-    ///
-    /// These arrays can be passed directly to [`GroupsAccumulator`] next.
     pub(super) fn evaluate_acc_args(
         &self,
-        batch: &RecordBatch,
-    ) -> Result<EvaluatedAccumulatorArgs> {
-        let arguments = self
-            .arguments
-            .iter()
-            .map(|expr| {
-                expr.evaluate(batch)
-                    .and_then(|value| value.into_array(batch.num_rows()))
-            })
-            .collect::<Result<_>>()?;
-
-        let filter = self
-            .filter
-            .as_ref()
-            .map(|filter| {
-                filter
-                    .evaluate(batch)
-                    .and_then(|value| value.into_array(batch.num_rows()))
-            })
-            .transpose()?;
-
-        Ok(EvaluatedAccumulatorArgs { arguments, filter })
+        evaluator: &mut FilteredInputEvaluator<'_>,
+    ) -> Result<FilteredInput> {
+        evaluator.evaluate(&self.arguments, self.filter.as_ref())
     }
 
     pub(super) fn size(&self) -> usize {
@@ -571,11 +538,11 @@ impl HashAggregateAccumulator {
         group_indices: &[usize],
         total_num_groups: usize,
     ) -> Result<()> {
-        let filter = values.filter.as_ref().map(|filter| filter.as_boolean());
+        let indices = values.group_indices(group_indices);
         self.accumulator.update_batch(
             &values.arguments,
-            group_indices,
-            filter,
+            &indices,
+            values.filter(),
             total_num_groups,
         )
     }
@@ -586,7 +553,6 @@ impl HashAggregateAccumulator {
         group_indices: &[usize],
         total_num_groups: usize,
     ) -> Result<()> {
-        debug_assert!(values.filter.is_none());
         self.accumulator
             .merge_batch(&values.arguments, group_indices, total_num_groups)
     }
@@ -616,9 +582,8 @@ impl HashAggregateAccumulator {
         &mut self,
         values: &EvaluatedAccumulatorArgs,
     ) -> Result<Vec<ArrayRef>> {
-        let opt_filter = values.filter.as_ref().map(|filter| filter.as_boolean());
-        self.accumulator
-            .convert_to_state(&values.arguments, opt_filter)
+        let (arguments, filter) = values.expanded()?;
+        self.accumulator.convert_to_state(&arguments, filter)
     }
 
     pub(super) fn null_arguments(

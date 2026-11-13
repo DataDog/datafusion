@@ -294,6 +294,11 @@ fn routing_extract(
     input_column_sets: &[std::collections::HashSet<ColumnReference>],
 ) -> Result<Transformed<Expr>> {
     expr.transform_down(|e| {
+        // FILTER arguments are conditional: extracting even a cheap expression
+        // below the aggregate would evaluate it on excluded rows.
+        if matches!(&e, Expr::AggregateFunction(agg) if agg.params.filter.is_some()) {
+            return Ok(Transformed::new(e, false, TreeNodeRecursion::Jump));
+        }
         // Skip expressions already aliased with extracted expression pattern
         if let Expr::Alias(alias) = &e
             && alias.name.starts_with(EXTRACTED_EXPR_PREFIX)

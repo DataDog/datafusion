@@ -1071,6 +1071,11 @@ impl AggregateFunctionExpr {
         self.fun.default_value(data_type)
     }
 
+    /// Returns the empty-input result using the resolved aggregate field.
+    pub fn default_value_for_field(&self) -> Result<ScalarValue> {
+        self.fun.default_value_for_field(self.field().as_ref())
+    }
+
     /// Indicates whether the aggregation function is monotonic as a set
     /// function. See [`SetMonotonicity`] for details.
     pub fn set_monotonicity(&self) -> SetMonotonicity {

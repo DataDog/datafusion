@@ -340,6 +340,11 @@ impl AggregateUDF {
         self.inner.default_value(data_type)
     }
 
+    /// Returns the empty-input result for the aggregate's resolved output field.
+    pub fn default_value_for_field(&self, field: &Field) -> Result<ScalarValue> {
+        self.inner.default_value_for_field(field)
+    }
+
     /// See [`AggregateUDFImpl::supports_null_handling_clause`] for more details.
     pub fn supports_null_handling_clause(&self) -> bool {
         self.inner.supports_null_handling_clause()
@@ -827,6 +832,16 @@ pub trait AggregateUDFImpl: Debug + DynEq + DynHash + Send + Sync + Any {
     /// while `count` returns 0 if input is Null
     fn default_value(&self, data_type: &DataType) -> Result<ScalarValue> {
         ScalarValue::try_from(data_type)
+    }
+
+    /// Returns the empty-input result using the aggregate's resolved output field.
+    ///
+    /// Unlike [`Self::default_value`], this hook can distinguish nullable results
+    /// from non-nullable results of the same data type. The field must describe
+    /// the aggregate itself, before an outer join makes its output nullable.
+    /// Existing implementations retain their type-based default.
+    fn default_value_for_field(&self, field: &Field) -> Result<ScalarValue> {
+        self.default_value(field.data_type())
     }
 
     /// If this function supports `[IGNORE NULLS | RESPECT NULLS]` SQL clause,
@@ -1376,6 +1391,10 @@ impl AggregateUDFImpl for AliasedAggregateUDFImpl {
 
     fn default_value(&self, data_type: &DataType) -> Result<ScalarValue> {
         self.inner.default_value(data_type)
+    }
+
+    fn default_value_for_field(&self, field: &Field) -> Result<ScalarValue> {
+        self.inner.default_value_for_field(field)
     }
 
     fn supports_null_handling_clause(&self) -> bool {
