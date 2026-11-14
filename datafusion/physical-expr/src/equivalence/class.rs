@@ -665,14 +665,7 @@ impl EquivalenceGroup {
         mapping: &ProjectionMapping,
         expr: &Arc<dyn PhysicalExpr>,
     ) -> Option<Arc<dyn PhysicalExpr>> {
-        if let Some(targets) = mapping.get(expr) {
-            // If we match the source, we can project directly:
-            let (target, _) = targets.first();
-            Some(Arc::clone(target))
-        } else {
-            let aug_mapping = self.augment_projection_mapping(mapping);
-            Self::project_expr_indirect(&aug_mapping, expr)
-        }
+        self.project_expr_sharing(mapping, &mut None, expr)
     }
 
     /// Projects `expressions` according to the given projection mapping.
@@ -685,25 +678,50 @@ impl EquivalenceGroup {
         expressions: impl IntoIterator<Item = &'a Arc<dyn PhysicalExpr>> + 'a,
     ) -> impl Iterator<Item = Option<Arc<dyn PhysicalExpr>>> + 'a {
         let mut aug_mapping = None;
-        expressions.into_iter().map(move |expr| {
-            if let Some(targets) = mapping.get(expr) {
-                // If we match the source, we can project directly:
-                let (target, _) = targets.first();
-                Some(Arc::clone(target))
-            } else {
-                let aug_mapping = aug_mapping
-                    .get_or_insert_with(|| self.augment_projection_mapping(mapping));
-                Self::project_expr_indirect(aug_mapping, expr)
-            }
-        })
+        expressions
+            .into_iter()
+            .map(move |expr| self.project_expr_sharing(mapping, &mut aug_mapping, expr))
+    }
+
+    /// Projects `expr` like [`Self::project_expr`], building the augmented
+    /// mapping into `aug_mapping` only when an indirect projection needs it.
+    ///
+    /// Building that mapping looks up every source expression of `mapping`, so
+    /// callers that project many expressions share one across all of them.
+    fn project_expr_sharing<'a>(
+        &'a self,
+        mapping: &'a ProjectionMapping,
+        aug_mapping: &mut Option<AugmentedMapping<'a>>,
+        expr: &Arc<dyn PhysicalExpr>,
+    ) -> Option<Arc<dyn PhysicalExpr>> {
+        if let Some(targets) = mapping.get(expr) {
+            // If we match the source, we can project directly:
+            let (target, _) = targets.first();
+            return Some(Arc::clone(target));
+        }
+        // Literals don't need to be projected
+        if expr.downcast_ref::<Literal>().is_some() {
+            return Some(Arc::clone(expr));
+        }
+        let aug_mapping =
+            aug_mapping.get_or_insert_with(|| self.augment_projection_mapping(mapping));
+        Self::project_expr_indirect(aug_mapping, expr)
     }
 
     /// Projects this equivalence group according to the given projection mapping.
     pub fn project(&self, mapping: &ProjectionMapping) -> Self {
-        let projected_classes = self.iter().map(|cls| {
-            let new_exprs = self.project_expressions(mapping, cls.iter());
-            EquivalenceClass::new(new_exprs.flatten())
-        });
+        // One augmented mapping serves every class. Building it per class made
+        // projecting a group with many classes quadratic.
+        let mut aug_mapping = None;
+        let projected_classes = self
+            .iter()
+            .map(|cls| {
+                let new_exprs = cls.iter().filter_map(|expr| {
+                    self.project_expr_sharing(mapping, &mut aug_mapping, expr)
+                });
+                EquivalenceClass::new(new_exprs)
+            })
+            .collect::<Vec<_>>();
 
         // The key is the source expression, and the value is the equivalence
         // class that contains the corresponding target expression.
@@ -731,6 +749,7 @@ impl EquivalenceGroup {
 
         // Union projected classes with new classes to make up the result:
         let classes = projected_classes
+            .into_iter()
             .chain(new_classes.into_values())
             .filter(|cls| !cls.is_trivial());
         let mut result = Self::new(classes);
@@ -935,7 +954,7 @@ mod tests {
     use super::*;
     use crate::equivalence::tests::create_test_params;
     use crate::expressions::{BinaryExpr, Column, binary, col, lit};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
     use datafusion_expr::Operator;
 
@@ -1253,6 +1272,67 @@ mod tests {
         let second_normalized = projected.normalize_expr(col("b+c", &projected_schema)?);
 
         assert!(first_normalized.eq(&second_normalized));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_classes_needing_indirect_projection() -> Result<()> {
+        // - columns: [a, b].
+        // - classes: `a + b == a + 1` and `b + 1 == a * b`.
+        // - projection: [a as x, b as y].
+        // No class member is a source of the projection, so every member is
+        // projected through its children: the classes become `x + y == x + 1`
+        // and `y + 1 == x * y`.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let projected_schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+        ]));
+        let exprs = |left: &str, right: &str, schema: &SchemaRef| -> Result<_> {
+            let (l, r) = (col(left, schema)?, col(right, schema)?);
+            Ok([
+                binary(Arc::clone(&l), Operator::Plus, Arc::clone(&r), schema)?,
+                binary(Arc::clone(&l), Operator::Plus, lit(1), schema)?,
+                binary(Arc::clone(&r), Operator::Plus, lit(1), schema)?,
+                binary(l, Operator::Multiply, r, schema)?,
+            ])
+        };
+        let [sum, left_plus_1, right_plus_1, product] = exprs("a", "b", &schema)?;
+        let mut group = EquivalenceGroup::default();
+        group.add_equal_conditions(sum, left_plus_1);
+        group.add_equal_conditions(right_plus_1, product);
+        let mapping = [
+            (
+                col("a", &schema)?,
+                vec![(col("x", &projected_schema)?, 0)].into(),
+            ),
+            (
+                col("b", &schema)?,
+                vec![(col("y", &projected_schema)?, 1)].into(),
+            ),
+        ]
+        .into_iter()
+        .collect::<ProjectionMapping>();
+
+        let projected = group.project(&mapping);
+
+        let [sum, left_plus_1, right_plus_1, product] =
+            exprs("x", "y", &projected_schema)?;
+        assert_eq!(projected.len(), 2);
+        assert!(
+            projected
+                .normalize_expr(sum)
+                .eq(&projected.normalize_expr(left_plus_1))
+        );
+        assert!(
+            projected
+                .normalize_expr(right_plus_1)
+                .eq(&projected.normalize_expr(product))
+        );
 
         Ok(())
     }
