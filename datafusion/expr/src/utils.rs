@@ -1424,13 +1424,7 @@ pub fn merge_schema(inputs: &[&LogicalPlan]) -> DFSchema {
     if inputs.len() == 1 {
         inputs[0].schema().as_ref().clone()
     } else {
-        inputs.iter().map(|input| input.schema()).fold(
-            DFSchema::empty(),
-            |mut lhs, rhs| {
-                lhs.merge(rhs);
-                lhs
-            },
-        )
+        DFSchema::merge_all(inputs.iter().map(|input| input.schema().as_ref()))
     }
 }
 

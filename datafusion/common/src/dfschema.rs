@@ -359,6 +359,49 @@ impl DFSchema {
         self.field_qualifiers.extend(qualifiers);
     }
 
+    /// Merges `schemas` in order, with the same result as starting from an empty schema and
+    /// calling [`Self::merge`] with each one.
+    ///
+    /// [`Self::merge`] rebuilds its duplicate lookup sets and copies every field it already has
+    /// on each call, so folding many schemas costs time quadratic in the total field count. This
+    /// keeps the lookup sets across schemas and builds the result once.
+    pub fn merge_all<'a>(schemas: impl IntoIterator<Item = &'a DFSchema>) -> DFSchema {
+        let mut fields: Vec<FieldRef> = vec![];
+        let mut qualifiers: Vec<Option<TableReference>> = vec![];
+        let mut metadata = HashMap::new();
+        let mut seen_fields: HashSet<(Option<&'a TableReference>, &'a FieldRef)> =
+            HashSet::new();
+        let mut seen_names: HashSet<&'a str> = HashSet::new();
+        for schema in schemas {
+            if schema.inner.fields.is_empty() {
+                continue;
+            }
+            // Like `merge`, fields of one schema are only checked against earlier schemas.
+            let mut added = vec![];
+            for (qualifier, field) in schema.iter() {
+                let duplicated_field = match qualifier {
+                    Some(q) => seen_fields.contains(&(Some(q), field)),
+                    None => seen_names.contains(field.name().as_str()),
+                };
+                if !duplicated_field {
+                    fields.push(Arc::clone(field));
+                    qualifiers.push(qualifier.cloned());
+                    added.push((qualifier, field));
+                }
+            }
+            for (qualifier, field) in added {
+                seen_fields.insert((qualifier, field));
+                seen_names.insert(field.name().as_str());
+            }
+            metadata.extend(schema.inner.metadata.clone());
+        }
+        DFSchema {
+            inner: Arc::new(Schema::new_with_metadata(fields, metadata)),
+            field_qualifiers: qualifiers,
+            functional_dependencies: FunctionalDependencies::empty(),
+        }
+    }
+
     /// Get a list of fields for this schema
     pub fn fields(&self) -> &Fields {
         &self.inner.fields
@@ -1381,6 +1424,56 @@ mod tests {
     use crate::assert_contains;
 
     use super::*;
+
+    #[test]
+    fn merge_all_matches_repeated_merge() -> Result<()> {
+        let field = |name: &str, data_type: DataType| Field::new(name, data_type, true);
+        let qualified = |q: &str, fields: Vec<Field>| {
+            DFSchema::try_from_qualified_schema(q, &Schema::new(fields))
+        };
+        let with_metadata = |schema: DFSchema, key: &str| {
+            let metadata = HashMap::from([(key.to_string(), "v".to_string())]);
+            let inner = schema.inner.as_ref().clone().with_metadata(metadata);
+            DFSchema::from_field_specific_qualified_schema(
+                schema.field_qualifiers.clone(),
+                &Arc::new(inner),
+            )
+        };
+        let schemas = vec![
+            qualified(
+                "t1",
+                vec![field("a", DataType::Int32), field("b", DataType::Utf8)],
+            )?,
+            // Same qualified column, and the same name with another type.
+            qualified(
+                "t1",
+                vec![field("a", DataType::Int32), field("b", DataType::Int64)],
+            )?,
+            with_metadata(
+                qualified(
+                    "t2",
+                    vec![field("a", DataType::Int32), field("d", DataType::Int32)],
+                )?,
+                "k2",
+            )?,
+            // Unqualified columns are duplicates when only the name matches.
+            DFSchema::try_from(Schema::new(vec![
+                field("a", DataType::Int32),
+                field("c", DataType::Int32),
+            ]))?,
+            DFSchema::empty(),
+            DFSchema::try_from(Schema::new(vec![field("c", DataType::Int32)]))?,
+        ];
+
+        let mut expected = DFSchema::empty();
+        for schema in &schemas {
+            expected.merge(schema);
+        }
+        let merged = DFSchema::merge_all(&schemas);
+        assert_eq!(merged.inner, expected.inner);
+        assert_eq!(merged.field_qualifiers, expected.field_qualifiers);
+        Ok(())
+    }
 
     /// `qualified_name` doesn't use `TableReference::Display` for performance
     /// reasons, but check that the output is consistent.
