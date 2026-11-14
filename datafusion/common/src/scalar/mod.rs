@@ -562,7 +562,9 @@ impl PartialEq for ScalarValue {
             (ListView(_), _) => false,
             (LargeListView(v1), LargeListView(v2)) => v1.eq(v2),
             (LargeListView(_), _) => false,
-            (Struct(v1), Struct(v2)) => v1.eq(v2),
+            (Struct(v1), Struct(v2)) => {
+                null_structs_eq(v1, v2).unwrap_or_else(|| v1.eq(v2))
+            }
             (Struct(_), _) => false,
             (Map(v1), Map(v2)) => v1.eq(v2),
             (Map(_), _) => false,
@@ -729,6 +731,9 @@ impl PartialOrd for ScalarValue {
             | (ListView(_), _)
             | (LargeListView(_), _) => None,
             (Struct(struct_arr1), Struct(struct_arr2)) => {
+                if null_structs_eq(struct_arr1, struct_arr2) == Some(true) {
+                    return Some(Ordering::Equal);
+                }
                 partial_cmp_struct(struct_arr1.as_ref(), struct_arr2.as_ref())
             }
             (Struct(_), _) => None,
@@ -877,6 +882,17 @@ fn flatten<'a>(array: &'a StructArray, columns: &mut Vec<&'a ArrayRef>) {
     }
 }
 
+/// When both scalars are a null struct, returns whether they are equal, which for Arrow means
+/// they have the same type. Returns `None` when the full comparison is needed.
+///
+/// Null structs are common in plans that pad union inputs with typed nulls. Comparing them
+/// through Arrow kernels converts every child array, so planning that compares statistics or
+/// literals pays for each child field.
+fn null_structs_eq(s1: &StructArray, s2: &StructArray) -> Option<bool> {
+    let both_null = s1.len() == 1 && s2.len() == 1 && s1.is_null(0) && s2.is_null(0);
+    both_null.then(|| s1.data_type() == s2.data_type())
+}
+
 pub fn partial_cmp_struct(s1: &StructArray, s2: &StructArray) -> Option<Ordering> {
     if s1.len() != s2.len() {
         return None;
@@ -1018,7 +1034,13 @@ impl Hash for ScalarValue {
                 hash_nested_array(arr.to_owned() as ArrayRef, state);
             }
             Struct(arr) => {
-                hash_nested_array(arr.to_owned() as ArrayRef, state);
+                // A null struct only equals other null structs, so a fixed value keeps `Hash`
+                // consistent with `PartialEq` without hashing every child array.
+                if arr.len() == 1 && arr.is_null(0) {
+                    hash_data_type_shallow(arr.data_type(), state);
+                } else {
+                    hash_nested_array(arr.to_owned() as ArrayRef, state);
+                }
             }
             Map(arr) => {
                 hash_nested_array(arr.to_owned() as ArrayRef, state);
@@ -1056,6 +1078,20 @@ impl Hash for ScalarValue {
             }
             // stable hash for Null value
             Null => 1.hash(state),
+        }
+    }
+}
+
+/// Hashes the kind of a data type and, for structs, the top-level field names.
+///
+/// Hashing a full [`DataType`] walks every nested field and sorts each field's metadata. Hashing a
+/// subset is still consistent with equality: equal types always hash equal.
+pub fn hash_data_type_shallow<H: Hasher>(data_type: &DataType, state: &mut H) {
+    std::mem::discriminant(data_type).hash(state);
+    if let DataType::Struct(fields) = data_type {
+        fields.len().hash(state);
+        for field in fields {
+            field.name().hash(state);
         }
     }
 }
@@ -8145,6 +8181,35 @@ mod tests {
         assert_eq!(scalar, ScalarValue::Utf8(Some("foo".to_string())));
         let scalar = ScalarValue::from_str("foo").unwrap();
         assert_eq!(scalar, ScalarValue::Utf8(Some("foo".to_string())));
+    }
+
+    #[test]
+    fn null_struct_comparisons_and_hash() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let hash = |v: &ScalarValue| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+        let a = Fields::from(vec![Field::new("a", DataType::Int32, true)]);
+        let b = Fields::from(vec![Field::new("b", DataType::Utf8, true)]);
+        let null_a1 = ScalarStructBuilder::new_null(a.clone());
+        let null_a2 = ScalarStructBuilder::new_null(a.clone());
+        let null_b = ScalarStructBuilder::new_null(b);
+        let value_a = ScalarStructBuilder::new()
+            .with_scalar(
+                Field::new("a", DataType::Int32, true),
+                ScalarValue::Int32(Some(1)),
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(null_a1, null_a2);
+        assert_eq!(hash(&null_a1), hash(&null_a2));
+        assert_eq!(null_a1.partial_cmp(&null_a2), Some(Ordering::Equal));
+        assert_ne!(null_a1, null_b);
+        assert_ne!(null_a1, value_a);
+        assert_ne!(value_a, null_a1);
     }
 
     #[test]

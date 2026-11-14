@@ -77,7 +77,13 @@ impl PartialEq for CastExpr {
 impl Hash for CastExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.expr.hash(state);
-        self.target_field.hash(state);
+        // Hashing the whole target field walks nested types and sorts field metadata on every
+        // call. Equal casts have equal target types, so a shallow hash of the type keeps `Hash`
+        // consistent with `PartialEq`.
+        datafusion_common::scalar::hash_data_type_shallow(
+            self.target_field.data_type(),
+            state,
+        );
         self.cast_options.hash(state);
     }
 }
