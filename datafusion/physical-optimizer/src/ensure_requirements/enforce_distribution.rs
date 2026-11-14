@@ -1453,12 +1453,6 @@ pub fn ensure_distribution_with_stats(
                  maintains_input_order,
                  requirement,
              }| {
-                let streaming_benefit = if context.data {
-                    preserving_order_enables_streaming(&plan, &context.plan)?
-                } else {
-                    false
-                };
-
                 // There is an ordering requirement of the operator:
                 if let Some(required_input_ordering) = required_input_ordering {
                     // Either:
@@ -1470,9 +1464,11 @@ pub fn ensure_distribution_with_stats(
                         .equivalence_properties()
                         .ordering_satisfy_requirement(sort_req.clone())?;
 
+                    // Checking for a streaming benefit rebuilds the parent twice, so do it
+                    // only when the answer decides whether to drop order preserving variants.
                     if (!ordering_satisfied || !order_preserving_variants_desirable)
-                        && !streaming_benefit
                         && context.data
+                        && !preserving_order_enables_streaming(&plan, &context.plan)?
                     {
                         context = replace_order_preserving_variants(context)?;
                         // If ordering requirements were satisfied before repartitioning,
@@ -1501,7 +1497,9 @@ pub fn ensure_distribution_with_stats(
                             // ordering is pointless. However, if it does maintain
                             // input order, we keep order-preserving variants so
                             // ordering can flow through to ancestors that need it.
-                            if !maintains_input_order && !streaming_benefit {
+                            // Preserving order cannot enable streaming when the parent
+                            // does not maintain input order, so no streaming check is needed.
+                            if !maintains_input_order {
                                 context = replace_order_preserving_variants(context)?;
                             }
                         }
