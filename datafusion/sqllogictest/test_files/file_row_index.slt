@@ -54,6 +54,34 @@ ORDER BY column1
 3 4 40
 4 5 50
 
+# The row index must reach the scan even when the output alias looks generated.
+query I
+SELECT file_row_index() + 1 AS __datafusion_extracted_1
+FROM (SELECT column1 FROM parquet_table ORDER BY column1 DESC LIMIT 1);
+----
+5
+
+# The UNION must read the index from each scan and match its branches by position.
+# The outer projection reuses an input name while another column still reads it.
+query IBI rowsort
+SELECT i, __datafusion_extracted_19 >= 1, original FROM (
+  SELECT file_row_index() AS i, s.v AS __datafusion_extracted_19,
+         __datafusion_extracted_19 AS original
+  FROM (
+    SELECT named_struct('v', random()) AS s, column1 AS __datafusion_extracted_19
+    FROM parquet_table
+    UNION ALL
+    (SELECT named_struct('v', CAST(column1 AS DOUBLE)) AS s, column1
+     FROM parquet_table ORDER BY column1 DESC LIMIT 1)
+  )
+);
+----
+0 false 10
+1 false 20
+2 false 30
+3 false 40
+4 false 50
+4 true 50
 
 query II
 SELECT file_row_index(), column1
