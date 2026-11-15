@@ -20,7 +20,7 @@
 //! of a projection on table `t1` where the expressions `a`, `b`, and `a+b` are the
 //! projection expressions. `SELECT` without `FROM` will only evaluate expressions.
 
-use super::expressions::Column;
+use super::expressions::{CastExpr, Column, with_new_schema};
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use super::{
     DisplayAs, ExecutionPlanProperties, PlanProperties, RecordBatchStream,
@@ -34,7 +34,7 @@ use crate::filter_pushdown::{
 use crate::joins::utils::{ColumnIndex, JoinFilter, JoinOn, JoinOnRef};
 use crate::statistics::{ChildStats, StatisticsArgs};
 use crate::{
-    ChildrenPropertiesMode, DisplayFormatType, ExecutionPlan, PhysicalExpr,
+    ChildrenPropertiesMode, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr,
     ReplaceChildrenOptions, validate_child_count,
 };
 use std::collections::HashMap;
@@ -177,14 +177,20 @@ impl ProjectionExec {
         projector: Projector,
         input: Arc<dyn ExecutionPlan>,
     ) -> Result<Self> {
-        // Construct a map from the input expressions to the output expression of the Projection
-        let projection_mapping =
-            projector.projection().projection_mapping(&input.schema())?;
-        let cache = Self::compute_properties(
+        let output_schema = Arc::clone(projector.output_schema());
+        let cache = match Self::relabeled_properties(
+            projector.projection(),
             &input,
-            &projection_mapping,
-            Arc::clone(projector.output_schema()),
-        )?;
+            &output_schema,
+        )? {
+            Some(cache) => cache,
+            None => {
+                // Construct a map from the input expressions to the output expression of the Projection
+                let projection_mapping =
+                    projector.projection().projection_mapping(&input.schema())?;
+                Self::compute_properties(&input, &projection_mapping, output_schema)?
+            }
+        };
         Ok(Self {
             projector,
             input,
@@ -206,6 +212,64 @@ impl ProjectionExec {
     /// The input plan
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
+    }
+
+    /// Returns the plan properties of a projection that keeps every input column at its
+    /// position and only changes its name or field metadata, or `None` for any other
+    /// projection.
+    ///
+    /// `UnionExec` adds such a projection to every input whose fields differ from the
+    /// union schema only in name, nullability or metadata. With many inputs, projecting
+    /// each input's equivalence properties dominates planning time, while the result is
+    /// just the input's properties rewritten for the new schema.
+    fn relabeled_properties(
+        projection: &ProjectionExprs,
+        input: &Arc<dyn ExecutionPlan>,
+        schema: &SchemaRef,
+    ) -> Result<Option<PlanProperties>> {
+        let input_schema = input.schema();
+        let exprs = projection.as_ref();
+        if exprs.len() != input_schema.fields().len() {
+            return Ok(None);
+        }
+        let keeps_columns_in_place = exprs
+            .iter()
+            .zip(input_schema.fields())
+            .enumerate()
+            .all(|(index, (projected, field))| {
+                let expr = match projected.expr.downcast_ref::<CastExpr>() {
+                    Some(cast) if cast.cast_type() == field.data_type() => cast.expr(),
+                    Some(_) => return false,
+                    None => &projected.expr,
+                };
+                expr.downcast_ref::<Column>()
+                    .is_some_and(|column| column.index() == index)
+            });
+        if !keeps_columns_in_place {
+            return Ok(None);
+        }
+        let output_partitioning = match input.output_partitioning() {
+            Partitioning::Hash(exprs, partition_count) => Partitioning::Hash(
+                exprs
+                    .iter()
+                    .map(|expr| with_new_schema(Arc::clone(expr), schema))
+                    .collect::<Result<_>>()?,
+                *partition_count,
+            ),
+            partitioning @ (Partitioning::RoundRobinBatch(_)
+            | Partitioning::UnknownPartitioning(_)) => partitioning.clone(),
+            Partitioning::Range(_) => return Ok(None),
+        };
+        let eq_properties = input
+            .equivalence_properties()
+            .clone()
+            .with_new_schema(Arc::clone(schema))?;
+        Ok(Some(PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            input.pipeline_behavior(),
+            input.boundedness(),
+        )))
     }
 
     /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
@@ -2322,6 +2386,175 @@ mod tests {
             "DynamicFilter [ b@0 - 1 > 5 ]"
         );
 
+        Ok(())
+    }
+
+    /// Builds a sorted, hash partitioned input over columns `a` and `b`.
+    fn sorted_hash_partitioned_input() -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]));
+        let ordering: LexOrdering =
+            [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into();
+        let source = test::TestMemoryExec::try_new(&[vec![]], Arc::clone(&schema), None)?
+            .try_with_sort_information(vec![ordering])?;
+        let source: Arc<dyn ExecutionPlan> =
+            Arc::new(test::TestMemoryExec::update_cache(&Arc::new(source)));
+        let hash = Partitioning::Hash(vec![Arc::new(Column::new("b", 1))], 4);
+        Ok(Arc::new(
+            crate::repartition::RepartitionExec::try_new(source, hash)?
+                .with_preserve_order(),
+        ))
+    }
+
+    /// Computes the properties of `projection` through the general projection path.
+    fn general_properties(projection: &ProjectionExec) -> Result<PlanProperties> {
+        let mapping = projection
+            .projection_expr()
+            .projection_mapping(&projection.input().schema())?;
+        ProjectionExec::compute_properties(
+            projection.input(),
+            &mapping,
+            projection.schema(),
+        )
+    }
+
+    fn assert_same_properties(actual: &PlanProperties, expected: &PlanProperties) {
+        assert_eq!(
+            actual.eq_properties.to_string(),
+            expected.eq_properties.to_string()
+        );
+        assert_eq!(
+            actual.output_partitioning().to_string(),
+            expected.output_partitioning().to_string()
+        );
+        assert_eq!(actual.emission_type, expected.emission_type);
+        assert_eq!(actual.boundedness, expected.boundedness);
+    }
+
+    fn relabel_projection(
+        input: &Arc<dyn ExecutionPlan>,
+        b_expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<ProjectionExec> {
+        let metadata = HashMap::from([("key".to_string(), "value".to_string())]);
+        let schema = Schema::new(vec![
+            Field::new("x", DataType::Int32, true).with_metadata(metadata),
+            Field::new("y", DataType::Int32, true),
+        ]);
+        let projection = ProjectionExec::try_new_with_schema_metadata(
+            [
+                ProjectionExpr::new(Arc::new(Column::new("a", 0)), "x"),
+                ProjectionExpr::new(b_expr, "y"),
+            ],
+            Arc::clone(input),
+            &schema,
+        )?;
+        assert!(
+            ProjectionExec::relabeled_properties(
+                projection.projection_expr(),
+                input,
+                &projection.schema(),
+            )?
+            .is_some()
+        );
+        Ok(projection)
+    }
+
+    #[test]
+    fn test_relabel_projection_keeps_input_properties() -> Result<()> {
+        let input = sorted_hash_partitioned_input()?;
+        let projection = relabel_projection(&input, Arc::new(Column::new("b", 1)))?;
+
+        let properties = projection.properties();
+        assert_eq!(
+            properties
+                .output_ordering()
+                .map(|ordering| ordering.to_string()),
+            Some("x@0 ASC".to_string())
+        );
+        assert_eq!(
+            properties.output_partitioning().to_string(),
+            "Hash([y@1], 4)"
+        );
+        assert_same_properties(properties, &general_properties(&projection)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_same_type_cast_keeps_hash_partitioning() -> Result<()> {
+        let input = sorted_hash_partitioned_input()?;
+        let cast = CastExpr::new(Arc::new(Column::new("b", 1)), DataType::Int32, None);
+        let projection = relabel_projection(&input, Arc::new(cast))?;
+
+        let properties = projection.properties();
+        assert_eq!(
+            properties
+                .output_ordering()
+                .map(|ordering| ordering.to_string()),
+            Some("x@0 ASC".to_string())
+        );
+        // A cast to the same type keeps every value, so the output stays hash
+        // partitioned on the relabeled column.
+        assert_eq!(
+            properties.output_partitioning().to_string(),
+            "Hash([y@1], 4)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_reordering_projection_is_not_a_relabel() -> Result<()> {
+        let input = sorted_hash_partitioned_input()?;
+        let projection = ProjectionExec::try_new(
+            [
+                ProjectionExpr::new(Arc::new(Column::new("b", 1)), "b"),
+                ProjectionExpr::new(Arc::new(Column::new("a", 0)), "a"),
+            ],
+            Arc::clone(&input),
+        )?;
+        let projection_schema = projection.schema();
+        assert!(
+            ProjectionExec::relabeled_properties(
+                projection.projection_expr(),
+                &input,
+                &projection_schema,
+            )?
+            .is_none()
+        );
+        assert_same_properties(
+            projection.properties(),
+            &general_properties(&projection)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_type_changing_cast_is_not_a_relabel() -> Result<()> {
+        let input = sorted_hash_partitioned_input()?;
+        let projection = ProjectionExec::try_new(
+            [
+                ProjectionExpr::new(
+                    Arc::new(CastExpr::new(
+                        Arc::new(Column::new("a", 0)),
+                        DataType::Int64,
+                        None,
+                    )),
+                    "a",
+                ),
+                ProjectionExpr::new(Arc::new(Column::new("b", 1)), "b"),
+            ],
+            Arc::clone(&input),
+        )?;
+        let projection_schema = projection.schema();
+        assert!(
+            ProjectionExec::relabeled_properties(
+                projection.projection_expr(),
+                &input,
+                &projection_schema,
+            )?
+            .is_none()
+        );
         Ok(())
     }
 }
