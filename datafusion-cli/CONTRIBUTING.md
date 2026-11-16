@@ -35,7 +35,7 @@ cargo test --all-targets
 
 ## Running Storage Integration Tests
 
-By default, storage integration tests are not run. These tests use the `testcontainers` crate to start up a local MinIO server using Docker on port 9000.
+Storage integration tests are off by default. They use `testcontainers` to start a local [RustFS](https://github.com/rustfs/rustfs) server on a dynamically assigned host port.
 
 To run them you will need to set `TEST_STORAGE_INTEGRATION`:
 
@@ -47,8 +47,7 @@ For some of the tests, [snapshots](https://datafusion.apache.org/contributor-gui
 
 ### AWS
 
-S3 integration is tested against [Minio](https://github.com/minio/minio) with [TestContainers](https://github.com/testcontainers/testcontainers-rs)
-This requires Docker to be running on your machine and port 9000 to be free.
+S3 integration tests require Docker.
 
 If you see an error mentioning "failed to load IMDS session token" such as
 
