@@ -31,6 +31,7 @@ use crate::push_decoder::{
 };
 use crate::row_filter::RowFilterGenerator;
 use crate::row_group_filter::RowGroupAccessPlanFilter;
+use crate::source::PreloadedParquetMetadata;
 use crate::{
     BloomFilterStatistics, Int96Coercer, ParquetAccessPlan, ParquetFileReaderFactory,
     ParquetMetricSet, ParquetRowSelection, ParquetVirtualColumn,
@@ -252,8 +253,8 @@ pub(super) struct ParquetMorselizer {
     pub metadata_size_hint: Option<usize>,
     /// Registry used to create metric sets.
     pub metrics: ExecutionPlanMetricsSet,
-    /// Shared metric set in compact mode; absent in verbose mode.
-    pub compact_metric_set: Option<ParquetMetricSet>,
+    /// Metric set supplied by a partition or file preparation context.
+    pub prepared_metric_set: Option<ParquetMetricSet>,
     /// Factory for instantiating parquet reader
     pub parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
     /// Should the filters be evaluated during the parquet scan using
@@ -298,6 +299,8 @@ pub(super) struct ParquetMorselizer {
     pub reverse_row_groups: bool,
     /// Optional sort order used to reorder row groups by their min/max statistics.
     pub sort_order_for_reorder: Option<LexOrdering>,
+    /// Runtime identity shared by configured clones of the source.
+    pub(crate) runtime_identity: Arc<()>,
     /// Per-scan virtual-column state (validation already performed). `None`
     /// when no virtual columns are requested — the common path.
     pub(crate) virtual_state: Option<Arc<VirtualColumnsState>>,
@@ -457,6 +460,7 @@ struct PreparedParquetOpen {
     reverse_row_groups: bool,
     sort_order_for_reorder: Option<LexOrdering>,
     preserve_order: bool,
+    runtime_identity: Arc<()>,
     #[cfg(feature = "parquet_encryption")]
     file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
 }
@@ -716,7 +720,7 @@ impl MorselPlanner for ParquetMorselPlanner {
 
 impl ParquetMorselizer {
     fn metric_set_for_file(&self, file: &PartitionedFile) -> ParquetMetricSet {
-        self.compact_metric_set.clone().unwrap_or_else(|| {
+        self.prepared_metric_set.clone().unwrap_or_else(|| {
             ParquetMetricSet::new(
                 self.partition_index,
                 file.object_meta.location.as_ref(),
@@ -851,6 +855,7 @@ impl ParquetMorselizer {
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             preserve_order: self.preserve_order,
+            runtime_identity: Arc::clone(&self.runtime_identity),
             #[cfg(feature = "parquet_encryption")]
             file_decryption_properties: None,
         })
@@ -910,16 +915,35 @@ impl PreparedParquetOpen {
             options = options.with_file_decryption_properties(Arc::clone(fd_val));
         }
 
-        let mut metadata_timer = self.metric_set.metadata_load_time.timer();
-        // Begin by loading the metadata from the underlying reader (note
-        // the returned metadata may actually include page indexes as some
-        // readers may return page indexes even when not requested -- for
-        // example when they are cached)
-        let reader_metadata =
-            ArrowReaderMetadata::load_async(&mut self.async_file_reader, options.clone())
-                .await?;
-        metadata_timer.stop();
-        drop(metadata_timer);
+        // Cached readers may return page indexes even under `Skip`. Metadata
+        // preloaded for this exact source and object version is reconstructed
+        // with the opener's current options without charging its completed fetch
+        // a second time.
+        let reader_metadata = if let Some(preloaded) =
+            self.extensions.get::<PreloadedParquetMetadata>()
+        {
+            if !Arc::ptr_eq(&preloaded.runtime_identity, &self.runtime_identity)
+                || preloaded.object_meta != self.partitioned_file.object_meta
+                || preloaded.arrow_schema != self.partitioned_file.arrow_schema
+            {
+                return internal_err!(
+                    "Preloaded Parquet metadata does not match the source, object version, and Arrow schema"
+                );
+            }
+            ArrowReaderMetadata::try_new(
+                Arc::clone(&preloaded.metadata),
+                options.clone(),
+            )?
+        } else {
+            let mut metadata_timer = self.metric_set.metadata_load_time.timer();
+            let reader_metadata = ArrowReaderMetadata::load_async(
+                &mut self.async_file_reader,
+                options.clone(),
+            )
+            .await?;
+            metadata_timer.stop();
+            reader_metadata
+        };
 
         Ok(MetadataLoadedParquetOpen {
             prepared: self,
@@ -1744,6 +1768,7 @@ mod test {
         ColumnStatistics, ScalarValue, Statistics, assert_contains,
         config::MetricsCardinality, internal_err, stats::Precision,
     };
+    use datafusion_datasource::file::{FileSource, FileSourceArgs};
     use datafusion_datasource::morsel::{Morsel, Morselizer};
     use datafusion_datasource::{PartitionedFile, TableSchema, TableSchemaBuilder};
     use datafusion_execution::cache::cache_manager::{
@@ -1763,6 +1788,7 @@ mod test {
     use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricValue};
     use datafusion_pruning::MAX_IN_LIST_SIZE;
     use futures::StreamExt;
+    use futures::future::BoxFuture;
     use futures::stream::BoxStream;
     use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
     use parquet::arrow::{ArrowSchemaConverter, ArrowWriter};
@@ -1770,7 +1796,9 @@ mod test {
     use parquet::file::properties::WriterProperties;
     use parquet::schema::types::SchemaDescPtr;
     use std::collections::VecDeque;
-    use std::sync::Arc;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// Builder for creating [`ParquetMorselizer`] instances with sensible defaults for tests.
     /// This helps reduce code duplication and makes it clear what differs between test cases.
@@ -1791,6 +1819,118 @@ mod test {
                 metadata_size_hint,
                 metrics,
             )
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum MetadataBehavior {
+        Read,
+        Error,
+        Pending,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ReaderFactoryCall {
+        partition: usize,
+        location: String,
+        metadata_size_hint: Option<usize>,
+    }
+
+    #[derive(Debug)]
+    struct RecordingReaderFactory {
+        inner: DefaultParquetFileReaderFactory,
+        behavior: MetadataBehavior,
+        calls: Arc<Mutex<Vec<ReaderFactoryCall>>>,
+        metadata_calls: Arc<AtomicUsize>,
+        metadata_options: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingReaderFactory {
+        fn new(store: Arc<dyn ObjectStore>, behavior: MetadataBehavior) -> Self {
+            Self {
+                inner: DefaultParquetFileReaderFactory::new(store),
+                behavior,
+                calls: Arc::new(Mutex::new(Vec::new())),
+                metadata_calls: Arc::new(AtomicUsize::new(0)),
+                metadata_options: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn calls(&self) -> Vec<ReaderFactoryCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ParquetFileReaderFactory for RecordingReaderFactory {
+        fn create_reader(
+            &self,
+            partition_index: usize,
+            partitioned_file: PartitionedFile,
+            metadata_size_hint: Option<usize>,
+            metrics: ParquetMetricSet,
+        ) -> Result<Box<dyn AsyncFileReader + Send>> {
+            self.calls.lock().unwrap().push(ReaderFactoryCall {
+                partition: partition_index,
+                location: partitioned_file.object_meta.location.to_string(),
+                metadata_size_hint,
+            });
+            let inner = self.inner.create_reader(
+                partition_index,
+                partitioned_file,
+                metadata_size_hint,
+                metrics,
+            )?;
+            Ok(Box::new(RecordingAsyncFileReader {
+                inner,
+                behavior: self.behavior,
+                metadata_calls: Arc::clone(&self.metadata_calls),
+                metadata_options: Arc::clone(&self.metadata_options),
+            }))
+        }
+    }
+
+    struct RecordingAsyncFileReader {
+        inner: Box<dyn AsyncFileReader + Send>,
+        behavior: MetadataBehavior,
+        metadata_calls: Arc<AtomicUsize>,
+        metadata_options: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl AsyncFileReader for RecordingAsyncFileReader {
+        fn get_bytes(
+            &mut self,
+            range: Range<u64>,
+        ) -> BoxFuture<'_, parquet::errors::Result<bytes::Bytes>> {
+            self.inner.get_bytes(range)
+        }
+
+        fn get_byte_ranges(
+            &mut self,
+            ranges: Vec<Range<u64>>,
+        ) -> BoxFuture<'_, parquet::errors::Result<Vec<bytes::Bytes>>> {
+            self.inner.get_byte_ranges(ranges)
+        }
+
+        fn get_metadata<'a>(
+            &'a mut self,
+            options: Option<&'a ArrowReaderOptions>,
+        ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+            self.metadata_calls.fetch_add(1, Ordering::Relaxed);
+            self.metadata_options.lock().unwrap().push(
+                options
+                    .map(|options| format!("{:?}", options.column_index_policy()))
+                    .unwrap_or_else(|| "None".to_string()),
+            );
+            match self.behavior {
+                MetadataBehavior::Read => self.inner.get_metadata(options),
+                MetadataBehavior::Error => Box::pin(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    Err(parquet::errors::ParquetError::General(
+                        "injected metadata failure".to_string(),
+                    ))
+                }),
+                MetadataBehavior::Pending => Box::pin(futures::future::pending()),
+            }
         }
     }
 
@@ -2182,7 +2322,7 @@ mod test {
             )?;
 
             let metrics = self.metrics;
-            let compact_metric_set = (self.metrics_cardinality
+            let prepared_metric_set = (self.metrics_cardinality
                 == MetricsCardinality::Compact)
                 .then(|| ParquetMetricSet::new_compact(self.partition_index, &metrics));
 
@@ -2196,7 +2336,7 @@ mod test {
                 table_schema,
                 metadata_size_hint: self.metadata_size_hint,
                 metrics,
-                compact_metric_set,
+                prepared_metric_set,
                 parquet_file_reader_factory: self
                     .parquet_file_reader_factory
                     .unwrap_or_else(|| {
@@ -2222,6 +2362,7 @@ mod test {
                 max_in_list_size: self.max_in_list_size,
                 reverse_row_groups: self.reverse_row_groups,
                 sort_order_for_reorder: None,
+                runtime_identity: Arc::new(()),
                 virtual_state,
             })
         }
@@ -2234,7 +2375,7 @@ mod test {
     /// plans CPU work, awaits any discovered I/O futures, and feeds the planner
     /// back into the ready queue until a stream morsel is ready.
     async fn open_file(
-        morselizer: &ParquetMorselizer,
+        morselizer: &dyn Morselizer,
         file: PartitionedFile,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let mut planners = VecDeque::from([morselizer.plan_file(file)?]);
@@ -2263,6 +2404,329 @@ mod test {
                 }
             }
         }
+    }
+
+    fn source_metric_sum(source: &crate::source::ParquetSource, name: &str) -> usize {
+        source
+            .metrics()
+            .clone_inner()
+            .iter()
+            .filter(|metric| metric.value().name() == name)
+            .map(|metric| metric.value().as_usize())
+            .sum()
+    }
+
+    async fn preload_file_metadata(
+        file_context: &crate::source::ParquetFileContext,
+        source: &crate::source::ParquetSource,
+        partition: usize,
+        file: PartitionedFile,
+    ) -> Result<(ArrowReaderMetadata, PartitionedFile)> {
+        let metric_set = file_context.file_metrics(source)?;
+        let mut metadata_timer = metric_set.metadata_load_time.timer();
+        let factory = source.parquet_file_reader_factory().ok_or_else(|| {
+            datafusion_common::DataFusionError::Internal(
+                "test source has no reader factory".to_string(),
+            )
+        })?;
+        let mut reader = factory.create_reader(
+            partition,
+            file.clone(),
+            file_context.metadata_size_hint(),
+            metric_set.clone(),
+        )?;
+        let mut options =
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
+        if let Some(schema) = &file.arrow_schema {
+            options = options.with_schema(Arc::clone(schema));
+        }
+        let metadata = reader.get_metadata(Some(&options)).await?;
+        let reader_metadata = ArrowReaderMetadata::try_new(metadata, options)?;
+        metadata_timer.stop();
+        let seeded = file_context.with_file_metadata(
+            source,
+            file,
+            Arc::clone(reader_metadata.metadata()),
+        )?;
+        Ok((reader_metadata, seeded))
+    }
+
+    #[tokio::test]
+    async fn context_preload_uses_effective_hint_and_seeds_the_actual_opener() {
+        use crate::source::ParquetSource;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let size =
+            write_parquet(Arc::clone(&store), "seeded.parquet", batch.clone()).await;
+        let factory = Arc::new(RecordingReaderFactory::new(
+            Arc::clone(&store),
+            MetadataBehavior::Read,
+        ));
+        let source = ParquetSource::new(batch.schema())
+            .with_metadata_size_hint(4096)
+            .with_parquet_file_reader_factory(factory.clone());
+        let args = FileSourceArgs::new(store, 1024)
+            .with_metrics_cardinality(MetricsCardinality::Compact);
+        let context = source.create_morselizer_context(&args, 7).unwrap();
+        let file = PartitionedFile::new("seeded.parquet", size as u64)
+            .with_metadata_size_hint(2048);
+        let file_context = context.prepare_file(&source, &file).unwrap();
+
+        let (preloaded, seeded_file) =
+            preload_file_metadata(&file_context, &source, 7, file.clone())
+                .await
+                .unwrap();
+        assert_eq!(preloaded.metadata().num_row_groups(), 1);
+        let mut different_version = file.clone();
+        different_version.object_meta.version = Some("different-version".to_string());
+        assert!(
+            file_context
+                .with_file_metadata(
+                    &source,
+                    different_version,
+                    Arc::clone(preloaded.metadata()),
+                )
+                .is_err()
+        );
+        assert_eq!(factory.metadata_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            factory.metadata_options.lock().unwrap().as_slice(),
+            ["Skip"]
+        );
+        assert_eq!(
+            factory.calls(),
+            vec![ReaderFactoryCall {
+                partition: 7,
+                location: "seeded.parquet".to_string(),
+                metadata_size_hint: Some(2048),
+            }]
+        );
+        let timed_preload = source_metric_sum(&source, "metadata_load_time");
+        assert!(timed_preload > 0);
+
+        let morselizer = file_context.create_morselizer(&source).unwrap();
+        let mut stream = open_file(morselizer.as_ref(), seeded_file).await.unwrap();
+        let mut rows = 0;
+        while let Some(result) = stream.next().await {
+            rows += result.unwrap().num_rows();
+        }
+        assert_eq!(rows, 3);
+        assert_eq!(factory.metadata_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            source_metric_sum(&source, "metadata_load_time"),
+            timed_preload
+        );
+        assert_eq!(factory.calls().len(), 2);
+
+        let fallback_morselizer = file_context.create_morselizer(&source).unwrap();
+        let mut fallback_stream =
+            open_file(fallback_morselizer.as_ref(), file).await.unwrap();
+        while let Some(result) = fallback_stream.next().await {
+            result.unwrap();
+        }
+        assert_eq!(factory.metadata_calls.load(Ordering::Relaxed), 2);
+        assert!(
+            source_metric_sum(&source, "metadata_load_time") > timed_preload,
+            "a genuinely separate fallback fetch must add metadata-load time"
+        );
+        assert_eq!(factory.calls().len(), 3);
+        assert!(factory.calls().iter().all(|call| {
+            call.partition == 7
+                && call.location == "seeded.parquet"
+                && call.metadata_size_hint == Some(2048)
+        }));
+    }
+
+    #[tokio::test]
+    async fn context_preload_falls_back_to_source_hint_at_actual_factory_call() {
+        use crate::source::ParquetSource;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch = record_batch!(("a", Int32, vec![Some(1)])).unwrap();
+        let size =
+            write_parquet(Arc::clone(&store), "fallback.parquet", batch.clone()).await;
+        let factory = Arc::new(RecordingReaderFactory::new(
+            Arc::clone(&store),
+            MetadataBehavior::Read,
+        ));
+        let source = ParquetSource::new(batch.schema())
+            .with_metadata_size_hint(4096)
+            .with_parquet_file_reader_factory(factory.clone());
+        let args = FileSourceArgs::new(store, 1024);
+        let context = source.create_morselizer_context(&args, 3).unwrap();
+        let file = PartitionedFile::new("fallback.parquet", size as u64);
+        let file_context = context.prepare_file(&source, &file).unwrap();
+
+        let (preloaded, _) = preload_file_metadata(&file_context, &source, 3, file)
+            .await
+            .unwrap();
+        assert_eq!(preloaded.metadata().num_row_groups(), 1);
+        assert_eq!(factory.calls()[0].metadata_size_hint, Some(4096));
+    }
+
+    #[tokio::test]
+    async fn context_preload_metadata_timer_accounts_for_error_and_drop() {
+        use crate::source::ParquetSource;
+
+        for behavior in [MetadataBehavior::Error, MetadataBehavior::Pending] {
+            let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let batch = record_batch!(("a", Int32, vec![Some(1)])).unwrap();
+            let size =
+                write_parquet(Arc::clone(&store), "timed.parquet", batch.clone()).await;
+            let factory =
+                Arc::new(RecordingReaderFactory::new(Arc::clone(&store), behavior));
+            let source = ParquetSource::new(batch.schema())
+                .with_parquet_file_reader_factory(factory.clone());
+            let args = FileSourceArgs::new(store, 1024);
+            let context = source.create_morselizer_context(&args, 0).unwrap();
+            let file = PartitionedFile::new("timed.parquet", size as u64);
+            let file_context = context.prepare_file(&source, &file).unwrap();
+
+            match behavior {
+                MetadataBehavior::Error => {
+                    let error = preload_file_metadata(&file_context, &source, 0, file)
+                        .await
+                        .unwrap_err();
+                    assert!(error.to_string().contains("injected metadata failure"));
+                }
+                MetadataBehavior::Pending => {
+                    {
+                        let preload =
+                            preload_file_metadata(&file_context, &source, 0, file);
+                        tokio::pin!(preload);
+                        assert!(
+                            tokio::time::timeout(
+                                std::time::Duration::from_millis(10),
+                                &mut preload
+                            )
+                            .await
+                            .is_err()
+                        );
+                    }
+                    tokio::task::yield_now().await;
+                }
+                MetadataBehavior::Read => unreachable!(),
+            }
+            assert_eq!(factory.metadata_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(factory.calls().len(), 1);
+            assert!(source_metric_sum(&source, "metadata_load_time") > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_unseeded_reader_loads_metadata_once() {
+        use crate::source::ParquetSource;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2)])).unwrap();
+        let size =
+            write_parquet(Arc::clone(&store), "ordinary.parquet", batch.clone()).await;
+        let factory = Arc::new(RecordingReaderFactory::new(
+            Arc::clone(&store),
+            MetadataBehavior::Read,
+        ));
+        let source = ParquetSource::new(batch.schema())
+            .with_metadata_size_hint(1024)
+            .with_parquet_file_reader_factory(factory.clone());
+        let args = FileSourceArgs::new(store, 1024);
+        let file = PartitionedFile::new("ordinary.parquet", size as u64);
+        let morselizer = source.create_morselizer(&args, 0).unwrap();
+
+        let mut stream = open_file(morselizer.as_ref(), file).await.unwrap();
+        let mut rows = 0;
+        while let Some(result) = stream.next().await {
+            rows += result.unwrap().num_rows();
+        }
+        assert_eq!(rows, 2);
+        assert_eq!(factory.metadata_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(factory.calls().len(), 1);
+        assert_eq!(factory.calls()[0].metadata_size_hint, Some(1024));
+        assert!(source_metric_sum(&source, "metadata_load_time") > 0);
+    }
+
+    #[tokio::test]
+    async fn seeded_metadata_rejects_mismatched_source_object_and_schema_at_consumption()
+    {
+        use crate::source::ParquetSource;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let size =
+            write_parquet(Arc::clone(&store), "seeded.parquet", batch.clone()).await;
+        let factory = Arc::new(RecordingReaderFactory::new(
+            Arc::clone(&store),
+            MetadataBehavior::Read,
+        ));
+        let source = ParquetSource::new(batch.schema())
+            .with_parquet_file_reader_factory(factory.clone());
+        let args = FileSourceArgs::new(store, 1024);
+        let context = source.create_morselizer_context(&args, 0).unwrap();
+        let file = PartitionedFile::new("seeded.parquet", size as u64);
+        let file_context = context.prepare_file(&source, &file).unwrap();
+
+        // Attach public metadata through the public path.
+        let (_, seeded_file) =
+            preload_file_metadata(&file_context, &source, 0, file.clone())
+                .await
+                .unwrap();
+        assert_eq!(factory.metadata_calls.load(Ordering::Relaxed), 1);
+
+        // A valid seeded file opens without an extra metadata fetch (success control).
+        let morselizer = file_context.create_morselizer(&source).unwrap();
+        let mut stream = open_file(morselizer.as_ref(), seeded_file.clone())
+            .await
+            .unwrap();
+        while let Some(result) = stream.next().await {
+            result.unwrap();
+        }
+        assert_eq!(factory.metadata_calls.load(Ordering::Relaxed), 1);
+
+        // A changed object version is rejected at consumption without a fallback fetch.
+        let mut wrong_version = seeded_file.clone();
+        wrong_version.object_meta.version = Some("wrong-version".to_string());
+        let morselizer = file_context.create_morselizer(&source).unwrap();
+        let err = open_file(morselizer.as_ref(), wrong_version)
+            .await
+            .err()
+            .unwrap();
+        assert_contains!(
+            err.to_string(),
+            "Preloaded Parquet metadata does not match the source, object version, and Arrow schema"
+        );
+        assert_eq!(factory.metadata_calls.load(Ordering::Relaxed), 1);
+
+        // A changed Arrow schema is rejected at consumption without a fallback fetch.
+        let mut wrong_schema = seeded_file.clone();
+        wrong_schema.arrow_schema = Some(Arc::new(Schema::new(vec![Field::new(
+            "x",
+            DataType::Int32,
+            false,
+        )])));
+        let morselizer = file_context.create_morselizer(&source).unwrap();
+        let err = open_file(morselizer.as_ref(), wrong_schema)
+            .await
+            .err()
+            .unwrap();
+        assert_contains!(
+            err.to_string(),
+            "Preloaded Parquet metadata does not match the source, object version, and Arrow schema"
+        );
+        assert_eq!(factory.metadata_calls.load(Ordering::Relaxed), 1);
+
+        // A different source family's ordinary morselizer rejects the seeded file.
+        let other_source = ParquetSource::new(batch.schema())
+            .with_parquet_file_reader_factory(factory.clone());
+        let other_morselizer = other_source.create_morselizer(&args, 0).unwrap();
+        let err = open_file(other_morselizer.as_ref(), seeded_file.clone())
+            .await
+            .err()
+            .unwrap();
+        assert_contains!(
+            err.to_string(),
+            "Preloaded Parquet metadata does not match the source, object version, and Arrow schema"
+        );
+        assert_eq!(factory.metadata_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
