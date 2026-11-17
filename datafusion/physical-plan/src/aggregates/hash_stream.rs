@@ -44,9 +44,10 @@ use super::AggregateExec;
 use super::aggregate_hash_table::{
     AggregateHashTable, FinalMarker, PartialMarker, PartialSkipMarker,
 };
+use super::clustered_final_stream::ClusteredFinalAggregateStream;
 use super::group_values::GroupByMetrics;
-use super::ordered_final_stream::OrderedFinalAggregateStream;
 use super::skip_partial::SkipAggregationProbe;
+use crate::aggregates::GroupClusteringMode;
 use crate::metrics::{
     BaselineMetrics, MetricBuilder, MetricCategory, RecordOutput, SpillMetrics,
 };
@@ -54,7 +55,7 @@ use crate::sorts::IncrementalSortIterator;
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::EmptyRecordBatchStream;
-use crate::{InputOrderMode, RecordBatchStream, SendableRecordBatchStream, metrics};
+use crate::{RecordBatchStream, SendableRecordBatchStream, metrics};
 
 /// Hash aggregation is implemented in two stages: partial and final. This
 /// stream implements the partial stage.
@@ -137,7 +138,7 @@ use crate::{InputOrderMode, RecordBatchStream, SendableRecordBatchStream, metric
 /// 3. Perform a sort-preserving merge of all spill files and feed the merged output
 ///    into an ordered streaming aggregation, which ensures bounded memory usage and
 ///    evaluates the final result.
-///    - [`OrderedFinalAggregateStream`] is reused for the streaming aggregation.
+///    - [`ClusteredFinalAggregateStream`] is reused for the streaming aggregation.
 pub(crate) struct PartialHashAggregateStream {
     /// Output schema: group columns followed by partial aggregate state columns.
     schema: SchemaRef,
@@ -325,7 +326,7 @@ impl FinalSpillContext {
         .with_compression_type(context.session_config().spill_compression());
 
         let mut final_agg = agg.clone();
-        final_agg.input_order_mode = InputOrderMode::Sorted;
+        final_agg.group_clustering_mode = GroupClusteringMode::Full;
 
         Ok(Self {
             final_agg,
@@ -378,7 +379,7 @@ impl FinalSpillContext {
     }
 
     /// Merges every sorted run, and do the aggregate evaluation with
-    /// [`OrderedFinalAggregateStream`]
+    /// [`ClusteredFinalAggregateStream`]
     fn into_replay_stream(
         self,
         baseline_metrics: &BaselineMetrics,
@@ -409,12 +410,12 @@ impl FinalSpillContext {
             .with_batch_size(batch_size)
             .with_reservation(merge_reservation)
             .build()?;
-        let replay = OrderedFinalAggregateStream::new_with_input_and_metrics(
+        let replay = ClusteredFinalAggregateStream::new_with_input_and_metrics(
             &final_agg,
             &context,
             partition,
             merged,
-            &InputOrderMode::Sorted,
+            &GroupClusteringMode::Full,
             baseline_metrics.clone(),
             group_by_metrics,
             None,
@@ -431,7 +432,7 @@ impl PartialHashAggregateStream {
         partition: usize,
     ) -> Result<Self> {
         debug_assert_eq!(agg.mode, super::AggregateMode::Partial);
-        debug_assert_eq!(agg.input_order_mode, InputOrderMode::Linear);
+        debug_assert_eq!(agg.group_clustering_mode, GroupClusteringMode::None);
 
         let schema = Arc::clone(&agg.schema);
         let input = agg.input.execute(partition, Arc::clone(context))?;
@@ -1017,7 +1018,7 @@ impl FinalHashAggregateStream {
             agg.mode,
             super::AggregateMode::Final | super::AggregateMode::FinalPartitioned
         ));
-        debug_assert_eq!(agg.input_order_mode, InputOrderMode::Linear);
+        debug_assert_eq!(agg.group_clustering_mode, GroupClusteringMode::None);
 
         let schema = Arc::clone(&agg.schema);
         let input = agg.input.execute(partition, Arc::clone(context))?;

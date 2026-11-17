@@ -50,9 +50,9 @@ FROM generate_series(20000) AS t1(v1)
 GROUP BY v1
 ----
 Plan with Metrics
-01)AggregateExec: mode=FinalPartitioned,<slt:ignore>ordering_mode=Sorted, metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
+01)AggregateExec: mode=FinalPartitioned,<slt:ignore>group_clustering_mode=Full, metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
 02)--RepartitionExec:<slt:ignore>preserve_order=true<slt:ignore>
-03)----AggregateExec: mode=Partial,<slt:ignore>ordering_mode=Sorted, metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
+03)----AggregateExec: mode=Partial,<slt:ignore>group_clustering_mode=Full, metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
 <slt:ignore>
 
 query II rowsort
@@ -95,9 +95,9 @@ FROM generate_series(20000) AS t1(v1)
 GROUP BY round(v1, -4), v1 % 5000
 ----
 Plan with Metrics
-01)AggregateExec: mode=FinalPartitioned,<slt:ignore>aggr=[sum(t1.v1 * Int64(2))], ordering_mode=PartiallySorted([0]), metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
+01)AggregateExec: mode=FinalPartitioned,<slt:ignore>aggr=[sum(t1.v1 * Int64(2))], group_clustering_mode=Partial([0]), metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
 02)--RepartitionExec:<slt:ignore>input_partitions=1, maintains_sort_order=true<slt:ignore>
-03)----AggregateExec: mode=Partial,<slt:ignore>ordering_mode=PartiallySorted([0]), metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
+03)----AggregateExec: mode=Partial,<slt:ignore>group_clustering_mode=Partial([0]), metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
 <slt:ignore>
 
 # All rounds should have the same result hash
@@ -119,9 +119,9 @@ FROM generate_series(20000) AS t1(v1)
 GROUP BY round(v1, -4), v1 % 5000
 ----
 Plan with Metrics
-01)AggregateExec: mode=FinalPartitioned,<slt:ignore>aggr=[sum(t1.v1 * Int64(2))], ordering_mode=PartiallySorted([0]), metrics=[<slt:ignore>spilled_bytes=<slt:ignore> KB,<slt:ignore>]
+01)AggregateExec: mode=FinalPartitioned,<slt:ignore>aggr=[sum(t1.v1 * Int64(2))], group_clustering_mode=Partial([0]), metrics=[<slt:ignore>spilled_bytes=<slt:ignore> KB,<slt:ignore>]
 02)--RepartitionExec:<slt:ignore>input_partitions=1, maintains_sort_order=true<slt:ignore>
-03)----AggregateExec: mode=Partial,<slt:ignore>ordering_mode=PartiallySorted([0]), metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
+03)----AggregateExec: mode=Partial,<slt:ignore>group_clustering_mode=Partial([0]), metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
 <slt:ignore>
 
 # All rounds should have the same result hash
@@ -143,9 +143,9 @@ FROM generate_series(20000) AS t1(v1)
 GROUP BY round(v1, -4), v1 % 5000
 ----
 Plan with Metrics
-01)AggregateExec: mode=FinalPartitioned,<slt:ignore>aggr=[sum(t1.v1 * Int64(2))], ordering_mode=PartiallySorted([0]), metrics=[<slt:ignore>spilled_bytes=<slt:ignore> KB,<slt:ignore>]
+01)AggregateExec: mode=FinalPartitioned,<slt:ignore>aggr=[sum(t1.v1 * Int64(2))], group_clustering_mode=Partial([0]), metrics=[<slt:ignore>spilled_bytes=<slt:ignore> KB,<slt:ignore>]
 02)--RepartitionExec:<slt:ignore>input_partitions=1, maintains_sort_order=true<slt:ignore>
-03)----AggregateExec: mode=Partial,<slt:ignore>ordering_mode=PartiallySorted([0]), metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
+03)----AggregateExec: mode=Partial,<slt:ignore>group_clustering_mode=Partial([0]), metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
 <slt:ignore>
 
 # All rounds should have the same result hash
@@ -171,9 +171,9 @@ FROM generate_series(20000) AS t1(v1)
 GROUP BY round(v1, -4), v1 % 5000
 ----
 Plan with Metrics
-01)AggregateExec: mode=FinalPartitioned,<slt:ignore>aggr=[sum(t1.v1 * Int64(2)), min(t1.v1 % Int64(2))], ordering_mode=PartiallySorted([0]), metrics=[<slt:ignore>spilled_bytes=<slt:ignore>KB,<slt:ignore>]
+01)AggregateExec: mode=FinalPartitioned,<slt:ignore>aggr=[sum(t1.v1 * Int64(2)), min(t1.v1 % Int64(2))], group_clustering_mode=Partial([0]), metrics=[<slt:ignore>spilled_bytes=<slt:ignore>KB,<slt:ignore>]
 02)--RepartitionExec:<slt:ignore>input_partitions=1, maintains_sort_order=true<slt:ignore>
-03)----AggregateExec: mode=Partial,<slt:ignore>aggr=[sum(t1.v1 * Int64(2)), min(t1.v1 % Int64(2))], ordering_mode=PartiallySorted([0]), metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
+03)----AggregateExec: mode=Partial,<slt:ignore>aggr=[sum(t1.v1 * Int64(2)), min(t1.v1 % Int64(2))], group_clustering_mode=Partial([0]), metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
 <slt:ignore>
 
 # ==================================================================================
@@ -196,7 +196,7 @@ FROM generate_series(20000) AS t1(v1)
 GROUP BY round(v1, -4), v1 % 5000
 ----
 Plan with Metrics
-01)AggregateExec: mode=Single,<slt:ignore>aggr=[min(t1.v1 * Int64(2)), avg(t1.v1)], ordering_mode=PartiallySorted([0]), metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
+01)AggregateExec: mode=Single,<slt:ignore>aggr=[min(t1.v1 * Int64(2)), avg(t1.v1)], group_clustering_mode=Partial([0]), metrics=[<slt:ignore>spill_count=0,<slt:ignore>]
 <slt:ignore>
 
 query IIIR rowsort
@@ -217,7 +217,7 @@ FROM generate_series(20000) AS t1(v1)
 GROUP BY round(v1, -4), v1 % 5000
 ----
 Plan with Metrics
-01)AggregateExec: mode=Single,<slt:ignore>aggr=[min(t1.v1 * Int64(2)), avg(t1.v1)], ordering_mode=PartiallySorted([0]), metrics=[<slt:ignore>spilled_bytes=<slt:ignore> KB,<slt:ignore>]
+01)AggregateExec: mode=Single,<slt:ignore>aggr=[min(t1.v1 * Int64(2)), avg(t1.v1)], group_clustering_mode=Partial([0]), metrics=[<slt:ignore>spilled_bytes=<slt:ignore> KB,<slt:ignore>]
 <slt:ignore>
 
 # Same result hash as the no-spill round above

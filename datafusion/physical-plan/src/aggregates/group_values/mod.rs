@@ -43,7 +43,7 @@ use crate::aggregates::{
         boolean::GroupValuesBoolean, bytes::GroupValuesBytes,
         bytes_view::GroupValuesBytesView, primitive::GroupValuesPrimitive,
     },
-    order::GroupOrdering,
+    order::GroupClustering,
 };
 
 mod metrics;
@@ -135,7 +135,7 @@ pub trait GroupValues: Send {
 /// `GroupValuesRows`: crate::aggregates::group_values::GroupValuesRows
 pub fn new_group_values(
     schema: SchemaRef,
-    group_ordering: &GroupOrdering,
+    group_clustering: &GroupClustering,
 ) -> Result<Box<dyn GroupValues>> {
     if schema.fields.len() == 1 {
         let d = schema.fields[0].data_type();
@@ -203,7 +203,7 @@ pub fn new_group_values(
     }
 
     if multi_group_by::supported_schema(schema.as_ref()) {
-        if matches!(group_ordering, GroupOrdering::None) {
+        if matches!(group_clustering, GroupClustering::None) {
             Ok(Box::new(GroupValuesColumn::<false>::try_new(schema)?))
         } else {
             Ok(Box::new(GroupValuesColumn::<true>::try_new(schema)?))

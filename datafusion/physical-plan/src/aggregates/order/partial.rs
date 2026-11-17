@@ -63,7 +63,7 @@ use datafusion_expr::EmitTo;
 ///      order)                                    recent group index
 /// ```
 #[derive(Debug)]
-pub struct GroupOrderingPartial {
+pub struct GroupClusteringPartial {
     /// State machine
     state: State,
 
@@ -115,7 +115,7 @@ impl State {
     }
 }
 
-impl GroupOrderingPartial {
+impl GroupClusteringPartial {
     /// TODO: Remove unnecessary `input_schema` parameter.
     pub fn try_new(order_indices: Vec<usize>) -> Result<Self> {
         debug_assert!(!order_indices.is_empty());
@@ -210,7 +210,7 @@ impl GroupOrderingPartial {
     }
 
     /// Called when new groups are added in a batch. See documentation
-    /// on [`super::GroupOrdering::new_groups`]
+    /// on [`super::GroupClustering::new_groups`]
     pub fn new_groups(
         &mut self,
         batch_group_values: &[ArrayRef],
@@ -280,10 +280,10 @@ mod tests {
     use arrow::array::Int32Array;
 
     #[test]
-    fn test_group_ordering_partial() -> Result<()> {
+    fn test_group_clustering_partial() -> Result<()> {
         // Ordered on column a
         let order_indices = vec![0];
-        let mut group_ordering = GroupOrderingPartial::try_new(order_indices)?;
+        let mut group_clustering = GroupClusteringPartial::try_new(order_indices)?;
 
         let batch_group_values: Vec<ArrayRef> = vec![
             Arc::new(Int32Array::from(vec![1, 2, 3])),
@@ -293,14 +293,14 @@ mod tests {
         let group_indices = vec![0, 1, 2];
         let total_num_groups = 3;
 
-        group_ordering.new_groups(
+        group_clustering.new_groups(
             &batch_group_values,
             &group_indices,
             total_num_groups,
         )?;
 
         assert_eq!(
-            group_ordering.state,
+            group_clustering.state,
             State::InProgress {
                 current_sort: 2,
                 sort_key: vec![ScalarValue::Int32(Some(3))],
@@ -316,14 +316,14 @@ mod tests {
         let group_indices = vec![3, 4, 5];
         let total_num_groups = 6;
 
-        group_ordering.new_groups(
+        group_clustering.new_groups(
             &batch_group_values,
             &group_indices,
             total_num_groups,
         )?;
 
         assert_eq!(
-            group_ordering.state,
+            group_clustering.state,
             State::InProgress {
                 current_sort: 2,
                 sort_key: vec![ScalarValue::Int32(Some(3))],
@@ -339,13 +339,13 @@ mod tests {
         let group_indices = vec![6, 7, 8];
         let total_num_groups = 9;
 
-        group_ordering.new_groups(
+        group_clustering.new_groups(
             &batch_group_values,
             &group_indices,
             total_num_groups,
         )?;
         assert_eq!(
-            group_ordering.state,
+            group_clustering.state,
             State::InProgress {
                 current_sort: 6,
                 sort_key: vec![ScalarValue::Int32(Some(4))],
