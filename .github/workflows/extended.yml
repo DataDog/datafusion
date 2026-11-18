@@ -145,6 +145,13 @@ jobs:
           - name: Install protobuf compiler
             run: |
               apt-get update && apt-get install -y protobuf-compiler
+      - name: Check out datafusion-testing
+        # Marked update = none in .gitmodules so git dependents skip fetching it, but
+        # the sqlite test suite reads it. Git commands in this container also need
+        # safe.directory (https://github.com/actions/checkout/issues/766).
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --checkout --depth 1 datafusion-testing
       - name: Run sqllogictest
         run: |
           cargo test --features backtrace,parquet_encryption --profile ci-optimized --test sqllogictests -- --include-sqlite
