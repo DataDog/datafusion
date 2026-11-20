@@ -1031,6 +1031,46 @@ fn build_join(
     }
     let left = projected_left.as_ref().unwrap_or(left);
 
+    // Unqualified outer columns would be ambiguous with the subquery's qualified fields.
+    let outer_alias = format!("{alias}_outer");
+    let outer_fields = left
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect::<std::collections::HashSet<_>>();
+    let unqualified_outer =
+        !outer_fields.is_empty() && left.schema().iter().all(|(q, _)| q.is_none());
+    let aliased_outer;
+    let left = if unqualified_outer {
+        aliased_outer = LogicalPlanBuilder::from(left.clone())
+            .alias(outer_alias.clone())?
+            .build()?;
+        &aliased_outer
+    } else {
+        left
+    };
+    let qualify_outer = |expr: Expr| -> Result<Expr> {
+        if !unqualified_outer {
+            return Ok(expr);
+        }
+        Ok(expr
+            .transform(|e| match e {
+                Expr::Column(c)
+                    if c.relation.is_none() && outer_fields.contains(&c.name) =>
+                {
+                    let column = c.with_relation(outer_alias.clone().into());
+                    Ok(Transformed::yes(Expr::Column(column)))
+                }
+                _ => Ok(Transformed::no(e)),
+            })?
+            .data)
+    };
+    for in_value in &mut in_values {
+        in_value.value = qualify_outer(in_value.value.clone())?;
+    }
+    let join_filter_opt = join_filter_opt.map(qualify_outer).transpose()?;
+
     let join_filter = match (in_values.is_empty(), join_filter_opt) {
         (false, correlation_opt) => in_join_filter(&in_values, correlation_opt)?,
         (true, Some(correlation)) => correlation,
