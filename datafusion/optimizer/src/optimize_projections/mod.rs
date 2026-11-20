@@ -24,7 +24,7 @@ use crate::{OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
 
 use datafusion_common::{
-    Column, DFSchema, HashMap, JoinType, Result, assert_eq_or_internal_err,
+    DFSchema, JoinType, Result, assert_eq_or_internal_err,
     get_required_group_by_exprs_indices, internal_datafusion_err, internal_err,
 };
 use datafusion_expr::expr::Alias;
@@ -35,7 +35,7 @@ use datafusion_expr::{
 };
 
 use crate::optimize_projections::required_indices::RequiredIndices;
-use crate::utils::NamePreserver;
+use crate::utils::{NamePreserver, for_each_referenced_index};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeContainer};
 
 /// Optimizer rule to prune unnecessary columns from intermediate schemas
@@ -559,9 +559,9 @@ fn merge_consecutive_projections_one_level(
         return Projection::try_new_with_schema(expr, input, schema).map(Transformed::no);
     };
 
-    // A fast path: if the previous projection is same as the current projection
-    // we can directly remove the current projection and return child projection.
-    if prev_projection.expr == expr {
+    // Identical column lists can collapse directly. An outer computation can
+    // read the inner result even when both expressions are identical.
+    if expr.iter().all(|e| matches!(e, Expr::Column(_))) && prev_projection.expr == expr {
         return Projection::try_new_with_schema(
             expr,
             Arc::clone(&prev_projection.input),
@@ -570,20 +570,23 @@ fn merge_consecutive_projections_one_level(
         .map(Transformed::yes);
     }
 
-    // Count usages (referrals) of each projection expression in its input fields:
-    let mut column_referral_map = HashMap::<&Column, usize>::new();
-    expr.iter()
-        .for_each(|expr| expr.add_column_ref_counts(&mut column_referral_map));
+    // Count uses by field so qualified and bare references share one count.
+    let mut uses = vec![0usize; prev_projection.expr.len()];
+    for e in &expr {
+        for_each_referenced_index(e, &prev_projection.schema, |index| uses[index] += 1)?;
+    }
 
-    // If an expression is non-trivial (KeepInPlace) and appears more than once, do not merge
-    // them as consecutive projections will benefit from a compute-once approach.
-    // For details, see: https://github.com/apache/datafusion/issues/8296
-    if column_referral_map.into_iter().any(|(col, usage)| {
-        usage > 1
-            && !prev_projection.expr[prev_projection.schema.index_of_column(col).unwrap()]
-                .placement()
-                .should_push_to_leaves()
-    }) {
+    // Keep a shared definition when inlining it would repeat a volatile or
+    // costly computation.
+    if uses
+        .iter()
+        .zip(&prev_projection.expr)
+        .any(|(&count, definition)| {
+            count > 1
+                && (!definition.placement().should_push_to_leaves()
+                    || definition.is_volatile())
+        })
+    {
         // no change
         return Projection::try_new_with_schema(expr, input, schema).map(Transformed::no);
     }
@@ -1192,6 +1195,30 @@ mod tests {
           TableScan: test projection=[a]
         "
         )
+    }
+
+    #[test]
+    fn preserve_shared_volatile_definition_with_leaf_placement() -> Result<()> {
+        use crate::test::udfs::PlacementTestUDF;
+        use datafusion_expr::{ScalarUDF, Volatility};
+
+        let udf = ScalarUDF::new_from_impl(
+            PlacementTestUDF::new().with_volatility(Volatility::Volatile),
+        );
+        let input = LogicalPlanBuilder::from(test_table_scan()?)
+            .project(vec![
+                udf.call(vec![col("a")]).alias_qualified(Some("q"), "v"),
+            ])?
+            .build()?;
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![col("v").alias("x"), col("q.v").alias("y")],
+            Arc::new(input),
+        )?);
+        assert_optimized_plan_equal!(plan, @r"
+        Projection: v AS x, q.v AS y
+          Projection: leaf_udf(test.a) AS v
+            TableScan: test projection=[a]
+        ")
     }
 
     #[test]

@@ -1487,6 +1487,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn volatile_higher_order_call_in_projection_expr() {
+        let udf = HigherOrderUDF::new_from_impl(TestHigherOrderUDF {
+            name: "volatile_hof",
+            field: "a",
+            signature: HigherOrderSignature::variadic_any(Volatility::Volatile),
+        });
+        let call = Expr::HigherOrderFunction(HigherOrderFunction::new(
+            Arc::new(udf),
+            vec![col("a")],
+        ));
+        assert!(call.alias("result").is_volatile());
+    }
+
     // PartialEq and Hash must be consistent, and also PartialEq and PartialOrd
     // must be consistent, so they are tested together.
     #[test]

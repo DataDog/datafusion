@@ -20,17 +20,20 @@ use std::process::Command;
 use rstest::rstest;
 
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use insta::internals::SettingsBindDropGuard;
 use insta::{Settings, glob};
 use insta_cmd::{assert_cmd_snapshot, get_cargo_bin};
+use object_store::{
+    ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, local::LocalFileSystem,
+};
 use std::path::PathBuf;
 use std::{env, fs};
-use testcontainers_modules::minio;
-use testcontainers_modules::testcontainers::core::{CmdWaitFor, ExecCommand, Mount};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{
-    ContainerAsync, ImageExt, TestcontainersError,
+use testcontainers_modules::testcontainers::core::{
+    CmdWaitFor, ExecCommand, IntoContainerPort,
 };
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 fn cli() -> Command {
     Command::new(get_cargo_bin("datafusion-cli"))
@@ -45,79 +48,96 @@ fn make_settings() -> Settings {
     settings
 }
 
-async fn setup_minio_container() -> Result<ContainerAsync<minio::MinIO>, String> {
-    const MINIO_ROOT_USER: &str = "TEST-DataFusionLogin";
-    const MINIO_ROOT_PASSWORD: &str = "TEST-DataFusionPassword";
+const RUSTFS_ACCESS_KEY: &str = "TEST-DataFusionLogin";
+const RUSTFS_SECRET_KEY: &str = "TEST-DataFusionPassword";
 
-    let data_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../datafusion/core/tests/data");
+async fn start_rustfs_or_skip() -> Option<ContainerAsync<GenericImage>> {
+    if env::var("TEST_STORAGE_INTEGRATION").is_err() {
+        eprintln!("Skipping external storages integration tests");
+        return None;
+    }
 
-    let absolute_data_path = data_path
-        .canonicalize()
-        .expect("Failed to get absolute path for test data");
-
-    let container = minio::MinIO::default()
-        .with_env_var("MINIO_ROOT_USER", MINIO_ROOT_USER)
-        .with_env_var("MINIO_ROOT_PASSWORD", MINIO_ROOT_PASSWORD)
-        .with_mount(Mount::bind_mount(
-            absolute_data_path.to_str().unwrap(),
-            "/source",
-        ))
+    let container = GenericImage::new("docker.io/rustfs/rustfs", "1.0.0")
+        .with_exposed_port(9000.tcp())
+        .with_env_var("RUSTFS_ACCESS_KEY", RUSTFS_ACCESS_KEY)
+        .with_env_var("RUSTFS_SECRET_KEY", RUSTFS_SECRET_KEY)
+        .with_env_var("RUSTFS_CONSOLE_ENABLE", "false")
         .start()
         .await;
-
-    match container {
-        Ok(container) => {
-            // We wait for MinIO to be healthy and prepare test files. We do it via CLI to avoid s3 dependency
-            let commands = [
-                ExecCommand::new(["/usr/bin/mc", "ready", "local"]),
-                ExecCommand::new([
-                    "/usr/bin/mc",
-                    "alias",
-                    "set",
-                    "localminio",
-                    "http://localhost:9000",
-                    MINIO_ROOT_USER,
-                    MINIO_ROOT_PASSWORD,
-                ]),
-                ExecCommand::new(["/usr/bin/mc", "mb", "localminio/data"]),
-                ExecCommand::new([
-                    "/usr/bin/mc",
-                    "cp",
-                    "-r",
-                    "/source/",
-                    "localminio/data/",
-                ]),
-            ];
-
-            for command in commands {
-                let command =
-                    command.with_cmd_ready_condition(CmdWaitFor::Exit { code: Some(0) });
-
-                let cmd_ref = format!("{command:?}");
-
-                if let Err(e) = container.exec(command).await {
-                    let stdout = container.stdout_to_vec().await.unwrap_or_default();
-                    let stderr = container.stderr_to_vec().await.unwrap_or_default();
-
-                    return Err(format!(
-                        "Failed to execute command: {}\nError: {}\nStdout: {:?}\nStderr: {:?}",
-                        cmd_ref,
-                        e,
-                        String::from_utf8_lossy(&stdout),
-                        String::from_utf8_lossy(&stderr)
-                    ));
-                }
-            }
-
-            Ok(container)
+    let container = match container {
+        Ok(container) => container,
+        Err(e) if e.to_string().contains("toomanyrequests") => {
+            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
+            return None;
         }
+        Err(e) => panic!("Failed to start RustFS container: {e}"),
+    };
+    provision_rustfs_container(&container)
+        .await
+        .expect("Failed to provision RustFS test data");
+    Some(container)
+}
 
-        Err(TestcontainersError::Client(e)) => Err(format!(
-            "Failed to start MinIO container. Ensure Docker is running and accessible: {e}"
-        )),
-        Err(e) => Err(format!("Failed to start MinIO container: {e}")),
+async fn provision_rustfs_container(
+    container: &ContainerAsync<GenericImage>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The object_store client can upload the fixtures but cannot create the bucket.
+    let credentials = format!("{RUSTFS_ACCESS_KEY}:{RUSTFS_SECRET_KEY}");
+    let commands = [
+        ExecCommand::new([
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--retry",
+            "60",
+            "--retry-delay",
+            "1",
+            "--retry-all-errors",
+            "--max-time",
+            "5",
+            "http://localhost:9000/health/ready",
+        ]),
+        ExecCommand::new([
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--aws-sigv4",
+            "aws:amz:us-east-1:s3",
+            "--user",
+            &credentials,
+            "--request",
+            "PUT",
+            "http://localhost:9000/data",
+        ]),
+    ];
+
+    for command in commands {
+        let command =
+            command.with_cmd_ready_condition(CmdWaitFor::Exit { code: Some(0) });
+        container.exec(command).await?;
     }
+
+    let port = container.get_host_port_ipv4(9000).await?;
+    let store = AmazonS3Builder::new()
+        .with_bucket_name("data")
+        .with_region("us-east-1")
+        .with_access_key_id(RUSTFS_ACCESS_KEY)
+        .with_secret_access_key(RUSTFS_SECRET_KEY)
+        .with_endpoint(format!("http://localhost:{port}"))
+        .with_allow_http(true)
+        .build()?;
+    let data_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../datafusion/core/tests/data");
+    let source = LocalFileSystem::new_with_prefix(data_path)?;
+    let mut files = source.list(None);
+    while let Some(file) = files.try_next().await? {
+        let data = source.get(&file.location).await?.bytes().await?;
+        store.put(&file.location, data.into()).await?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -522,18 +542,8 @@ fn test_cli_wide_result_set_no_crash() {
 
 #[tokio::test]
 async fn test_cli() {
-    if env::var("TEST_STORAGE_INTEGRATION").is_err() {
-        eprintln!("Skipping external storages integration tests");
+    let Some(container) = start_rustfs_or_skip().await else {
         return;
-    }
-
-    let container = match setup_minio_container().await {
-        Ok(c) => c,
-        Err(e) if e.contains("toomanyrequests") => {
-            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
-            return;
-        }
-        e @ Err(_) => e.unwrap(),
     };
 
     let settings = make_settings();
@@ -546,8 +556,8 @@ async fn test_cli() {
         assert_cmd_snapshot!(
             cli()
                 .env_clear()
-                .env("AWS_ACCESS_KEY_ID", "TEST-DataFusionLogin")
-                .env("AWS_SECRET_ACCESS_KEY", "TEST-DataFusionPassword")
+                .env("AWS_ACCESS_KEY_ID", RUSTFS_ACCESS_KEY)
+                .env("AWS_SECRET_ACCESS_KEY", RUSTFS_SECRET_KEY)
                 .env("AWS_ENDPOINT", format!("http://localhost:{port}"))
                 .env("AWS_ALLOW_HTTP", "true")
                 .pass_stdin(input)
@@ -559,22 +569,13 @@ async fn test_cli() {
 async fn test_aws_options() {
     // Separate test is needed to pass aws as options in sql and not via env
 
-    if env::var("TEST_STORAGE_INTEGRATION").is_err() {
-        eprintln!("Skipping external storages integration tests");
+    let Some(container) = start_rustfs_or_skip().await else {
         return;
-    }
+    };
 
     let settings = make_settings();
     let _bound = settings.bind_to_scope();
 
-    let container = match setup_minio_container().await {
-        Ok(c) => c,
-        Err(e) if e.contains("toomanyrequests") => {
-            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
-            return;
-        }
-        e @ Err(_) => e.unwrap(),
-    };
     let port = container.get_host_port_ipv4(9000).await.unwrap();
 
     let input = format!(
@@ -582,8 +583,8 @@ async fn test_aws_options() {
 STORED AS CSV
 LOCATION 's3://data/cars.csv'
 OPTIONS(
-    'aws.access_key_id' 'TEST-DataFusionLogin',
-    'aws.secret_access_key' 'TEST-DataFusionPassword',
+    'aws.access_key_id' '{RUSTFS_ACCESS_KEY}',
+    'aws.secret_access_key' '{RUSTFS_SECRET_KEY}',
     'aws.endpoint' 'http://localhost:{port}',
     'aws.allow_http' 'true'
 );
@@ -658,18 +659,8 @@ fn test_backtrace_output(#[case] query: &str) {
 
 #[tokio::test]
 async fn test_s3_url_fallback() {
-    if env::var("TEST_STORAGE_INTEGRATION").is_err() {
-        eprintln!("Skipping external storages integration tests");
+    let Some(container) = start_rustfs_or_skip().await else {
         return;
-    }
-
-    let container = match setup_minio_container().await {
-        Ok(c) => c,
-        Err(e) if e.contains("toomanyrequests") => {
-            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
-            return;
-        }
-        e @ Err(_) => e.unwrap(),
     };
 
     let mut settings = make_settings();
@@ -689,25 +680,16 @@ OPTIONS (
 SELECT * FROM partitioned_data ORDER BY column_1, column_2 LIMIT 5;
 "#;
 
-    assert_cmd_snapshot!(cli().with_minio(&container).await.pass_stdin(input));
+    assert_cmd_snapshot!(cli().with_rustfs(&container).await.pass_stdin(input));
 }
 
 /// Validate object store profiling output
 #[tokio::test]
 async fn test_object_store_profiling() {
-    if env::var("TEST_STORAGE_INTEGRATION").is_err() {
-        eprintln!("Skipping external storages integration tests");
+    let Some(container) = start_rustfs_or_skip().await else {
         return;
-    }
-
-    let container = match setup_minio_container().await {
-        Ok(c) => c,
-        Err(e) if e.contains("toomanyrequests") => {
-            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
-            return;
-        }
-        e @ Err(_) => e.unwrap(),
     };
+
     let mut settings = make_settings();
 
     // as the object store profiling contains timestamps and durations, we must
@@ -750,27 +732,29 @@ SELECT * from CARS LIMIT 1;
 SELECT * from CARS LIMIT 1;
 "#;
 
-    assert_cmd_snapshot!(cli().with_minio(&container).await.pass_stdin(input));
+    assert_cmd_snapshot!(cli().with_rustfs(&container).await.pass_stdin(input));
 }
 
-/// Extension trait to Add the minio connection information to a Command
+/// Add the RustFS connection information to a Command.
 #[async_trait]
-trait MinioCommandExt {
-    async fn with_minio(&mut self, container: &ContainerAsync<minio::MinIO>)
-    -> &mut Self;
-}
-
-#[async_trait]
-impl MinioCommandExt for Command {
-    async fn with_minio(
+trait RustfsCommandExt {
+    async fn with_rustfs(
         &mut self,
-        container: &ContainerAsync<minio::MinIO>,
+        container: &ContainerAsync<GenericImage>,
+    ) -> &mut Self;
+}
+
+#[async_trait]
+impl RustfsCommandExt for Command {
+    async fn with_rustfs(
+        &mut self,
+        container: &ContainerAsync<GenericImage>,
     ) -> &mut Self {
         let port = container.get_host_port_ipv4(9000).await.unwrap();
 
         self.env_clear()
-            .env("AWS_ACCESS_KEY_ID", "TEST-DataFusionLogin")
-            .env("AWS_SECRET_ACCESS_KEY", "TEST-DataFusionPassword")
+            .env("AWS_ACCESS_KEY_ID", RUSTFS_ACCESS_KEY)
+            .env("AWS_SECRET_ACCESS_KEY", RUSTFS_SECRET_KEY)
             .env("AWS_ENDPOINT", format!("http://localhost:{port}"))
             .env("AWS_ALLOW_HTTP", "true")
     }

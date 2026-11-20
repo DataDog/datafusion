@@ -487,6 +487,57 @@ async fn test_user_defined_functions_with_alias() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn shared_volatile_leaf_udf_is_evaluated_once() -> Result<()> {
+    use datafusion_expr::ExpressionPlacement;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct BatchId(Signature);
+
+    impl ScalarUDFImpl for BatchId {
+        fn name(&self) -> &str {
+            "batch_id"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.0
+        }
+
+        fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+            Ok(DataType::UInt64)
+        }
+
+        fn placement(&self, _: &[ExpressionPlacement]) -> ExpressionPlacement {
+            ExpressionPlacement::MoveTowardsLeafNodes
+        }
+
+        fn invoke_with_args(&self, _: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            Ok(ScalarValue::UInt64(Some(NEXT_ID.fetch_add(1, Ordering::Relaxed))).into())
+        }
+    }
+
+    let ctx = SessionContext::new();
+    ctx.register_udf(ScalarUDF::from(BatchId(Signature::nullary(
+        Volatility::Volatile,
+    ))));
+    let batches =
+        plan_and_collect(&ctx, "SELECT v AS a, v AS b FROM (SELECT batch_id() AS v)")
+            .await?;
+    assert_batches_eq!(
+        [
+            "+---+---+",
+            "| a | b |",
+            "+---+---+",
+            "| 0 | 0 |",
+            "+---+---+"
+        ],
+        &batches
+    );
+    Ok(())
+}
+
 /// Volatile UDF that should append a different value to each row
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct AddIndexToStringVolatileScalarUDF {
