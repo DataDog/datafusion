@@ -28,8 +28,9 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_common::Result;
 use datafusion_proto::physical_plan::{
-    DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
+    AsExecutionPlan, DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
 };
+use datafusion_proto::protobuf::PhysicalPlanNode;
 use std::sync::Arc;
 use std::vec;
 
@@ -67,6 +68,46 @@ fn roundtrip_filter_with_fetch() -> Result<()> {
         .build()?;
     assert_eq!(filter.fetch(), Some(10));
     roundtrip_test(Arc::new(filter))
+}
+
+/// `FilterExec` carries its `fetch` in a `uint32` field. The largest
+/// representable value must round-trip exactly, and the first value above it
+/// must be a named encode error rather than wrap to a different limit.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn filter_fetch_across_the_wire_range() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Boolean, false)]));
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let proto_converter = DefaultPhysicalProtoConverter {};
+
+    let filter = FilterExecBuilder::new(
+        col("a", &schema)?,
+        Arc::new(EmptyExec::new(Arc::clone(&schema))),
+    )
+    .with_fetch(Some(u32::MAX as usize))
+    .build()?;
+    let decoded =
+        roundtrip_test_and_return(Arc::new(filter), &ctx, &codec, &proto_converter)?;
+    let decoded = decoded.downcast_ref::<FilterExec>().unwrap();
+    assert_eq!(decoded.fetch(), Some(u32::MAX as usize));
+
+    let filter = FilterExecBuilder::new(
+        col("a", &schema)?,
+        Arc::new(EmptyExec::new(Arc::clone(&schema))),
+    )
+    .with_fetch(Some(u32::MAX as usize + 1))
+    .build()?;
+    let err =
+        PhysicalPlanNode::try_from_physical_plan(Arc::new(filter), &codec).unwrap_err();
+    assert!(
+        err.to_string().contains(&format!(
+            "FilterExec: fetch value {} is out of range for the plan wire format",
+            u32::MAX as usize + 1
+        )),
+        "unexpected error: {err}"
+    );
+    Ok(())
 }
 
 #[test]
