@@ -1253,6 +1253,15 @@ impl SortExec {
         self.fetch
     }
 
+    /// The leading sort expressions that the input is already sorted on.
+    ///
+    /// When non-empty and `fetch` is set, the TopK stops reading its input as
+    /// soon as it sees a row that sorts after its current top `fetch` rows on
+    /// this prefix.
+    pub fn common_sort_prefix(&self) -> &[PhysicalSortExpr] {
+        &self.common_sort_prefix
+    }
+
     /// Returns the dynamic filter expression for this sort (TopK), if set.
     #[deprecated(
         since = "55.0.0",

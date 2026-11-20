@@ -318,6 +318,25 @@ physical_plan
 01)SortExec: TopK(fetch=3), expr=[number@0 DESC, letter@1 ASC NULLS LAST, age@2 DESC], preserve_partitioning=[false], sort_prefix=[number@0 DESC, letter@1 ASC NULLS LAST]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/topk/partial_sorted/1.parquet]]}, projection=[number, letter, age], output_ordering=[number@0 DESC, letter@1 ASC NULLS LAST], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
 
+# A filter between the sorted input and a TopK with a sort prefix passes its output
+# through without coalescing, so that the TopK can stop reading its input early.
+query TT
+explain select number, letter, age from partial_sorted where age > 50 order by number desc, letter asc, age desc limit 3;
+----
+physical_plan
+01)SortPreservingMergeExec: [number@0 DESC, letter@1 ASC NULLS LAST, age@2 DESC], fetch=3
+02)--SortExec: TopK(fetch=3), expr=[number@0 DESC, letter@1 ASC NULLS LAST, age@2 DESC], preserve_partitioning=[true], sort_prefix=[number@0 DESC, letter@1 ASC NULLS LAST]
+03)----FilterExec: age@2 > 50, coalesce_batches=false
+04)------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true
+05)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/topk/partial_sorted/1.parquet]]}, projection=[number, letter, age], output_ordering=[number@0 DESC, letter@1 ASC NULLS LAST], file_type=parquet, predicate=age@2 > 50 AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible, pruning_predicate=age_null_count@1 != row_count@2 AND age_max@0 > 50, required_guarantees=[]
+
+query ITI
+select number, letter, age from partial_sorted where age > 50 order by number desc, letter asc, age desc limit 3;
+----
+3 A 60
+3 E 90
+2 C 70
+
 
 # Explain variations of the above query with different orderings, and different sort prefixes.
 # The "sort_prefix" in the  SortExec node should only be present if the TopK's ordering starts with either (number DESC, letter ASC) or just (number DESC).
