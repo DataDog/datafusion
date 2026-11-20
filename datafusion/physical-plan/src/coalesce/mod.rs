@@ -68,6 +68,19 @@ impl LimitedBatchCoalescer {
         }
     }
 
+    /// Set whether small batches are buffered until `target_batch_size` rows
+    /// are available (the default).
+    ///
+    /// When `false`, every non-empty batch is emitted as soon as it is pushed,
+    /// without being copied. Empty batches are still dropped and `fetch` is
+    /// still enforced.
+    pub fn with_coalesce_batches(mut self, coalesce_batches: bool) -> Self {
+        if !coalesce_batches {
+            self.inner.set_biggest_coalesce_batch_size(Some(0));
+        }
+        self
+    }
+
     /// Return the schema of the output batches
     pub fn schema(&self) -> SchemaRef {
         self.inner.schema()
@@ -225,6 +238,33 @@ mod tests {
             .run()
     }
 
+    #[test]
+    fn test_no_coalesce() {
+        Test::new()
+            .with_batches([
+                uint32_batch(0..8),
+                uint32_batch(8..8),
+                uint32_batch(8..11),
+                uint32_batch(11..40),
+            ])
+            .with_target_batch_size(21)
+            .without_coalescing()
+            .with_expected_output_sizes(vec![8, 3, 29])
+            .run()
+    }
+
+    #[test]
+    fn test_no_coalesce_with_fetch() {
+        let batch = uint32_batch(0..8);
+        Test::new()
+            .with_batches(std::iter::repeat_n(batch, 10))
+            .with_target_batch_size(21)
+            .with_fetch(Some(20))
+            .without_coalescing()
+            .with_expected_output_sizes(vec![8, 8, 4])
+            .run()
+    }
+
     /// Test for [`LimitedBatchCoalescer`]
     ///
     /// Pushes the input batches to the coalescer and verifies that the resulting
@@ -240,11 +280,19 @@ mod tests {
         target_batch_size: usize,
         /// Fetch (limit)
         fetch: Option<usize>,
+        /// Pass batches through instead of coalescing them
+        no_coalesce: bool,
     }
 
     impl Test {
         fn new() -> Self {
             Self::default()
+        }
+
+        /// Disable coalescing
+        fn without_coalescing(mut self) -> Self {
+            self.no_coalesce = true;
+            self
         }
 
         /// Set the target batch size
@@ -290,6 +338,7 @@ mod tests {
                 target_batch_size,
                 fetch,
                 expected_output_sizes,
+                no_coalesce,
             } = self;
 
             let schema = input_batches[0].schema();
@@ -298,7 +347,8 @@ mod tests {
             let single_input_batch = concat_batches(&schema, &input_batches).unwrap();
 
             let mut coalescer =
-                LimitedBatchCoalescer::new(Arc::clone(&schema), target_batch_size, fetch);
+                LimitedBatchCoalescer::new(Arc::clone(&schema), target_batch_size, fetch)
+                    .with_coalesce_batches(!no_coalesce);
 
             let mut output_batches = vec![];
             for batch in input_batches {

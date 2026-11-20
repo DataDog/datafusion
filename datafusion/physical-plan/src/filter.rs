@@ -100,6 +100,8 @@ pub struct FilterExec {
     batch_size: usize,
     /// Number of rows to fetch
     fetch: Option<usize>,
+    /// Whether output batches are coalesced up to `batch_size` rows
+    coalesce_batches: bool,
 }
 
 /// Builder for [`FilterExec`] to set optional parameters
@@ -110,6 +112,7 @@ pub struct FilterExecBuilder {
     default_selectivity: u8,
     batch_size: usize,
     fetch: Option<usize>,
+    coalesce_batches: bool,
 }
 
 impl FilterExecBuilder {
@@ -122,6 +125,7 @@ impl FilterExecBuilder {
             default_selectivity: FILTER_EXEC_DEFAULT_SELECTIVITY,
             batch_size: FILTER_EXEC_DEFAULT_BATCH_SIZE,
             fetch: None,
+            coalesce_batches: true,
         }
     }
 
@@ -180,6 +184,17 @@ impl FilterExecBuilder {
         self
     }
 
+    /// Set whether output batches are coalesced up to the batch size.
+    ///
+    /// Defaults to `true`. When `false`, the filtered rows of each input batch
+    /// are emitted as soon as they are produced, which lets a downstream
+    /// operator that can stop early (such as a TopK on sorted input) see them
+    /// without waiting for `batch_size` matching rows.
+    pub fn with_coalesce_batches(mut self, coalesce_batches: bool) -> Self {
+        self.coalesce_batches = coalesce_batches;
+        self
+    }
+
     /// Build the FilterExec, computing properties once with all configured parameters
     pub fn build(self) -> Result<FilterExec> {
         // Validate predicate type
@@ -219,6 +234,7 @@ impl FilterExecBuilder {
             projection: self.projection,
             batch_size: self.batch_size,
             fetch: self.fetch,
+            coalesce_batches: self.coalesce_batches,
         })
     }
 }
@@ -232,6 +248,7 @@ impl From<&FilterExec> for FilterExecBuilder {
             default_selectivity: exec.default_selectivity,
             batch_size: exec.batch_size,
             fetch: exec.fetch,
+            coalesce_batches: exec.coalesce_batches,
             // We could cache / copy over PlanProperties
             // here but that would require invalidating them in FilterExecBuilder::apply_projection, etc.
             // and currently every call to this method ends up invalidating them anyway.
@@ -252,6 +269,13 @@ impl FilterExec {
     /// Get a batch size
     pub fn batch_size(&self) -> usize {
         self.batch_size
+    }
+
+    /// Whether output batches are coalesced up to the batch size.
+    ///
+    /// See [`FilterExecBuilder::with_coalesce_batches`].
+    pub fn coalesce_batches(&self) -> bool {
+        self.coalesce_batches
     }
 
     /// Set the default selectivity
@@ -281,6 +305,16 @@ impl FilterExec {
         builder.apply_projection(projection)?.build()
     }
 
+    /// Set whether output batches are coalesced up to the batch size.
+    ///
+    /// See [`FilterExecBuilder::with_coalesce_batches`].
+    pub fn with_coalesce_batches(&self, coalesce_batches: bool) -> Self {
+        Self {
+            coalesce_batches,
+            ..self.clone()
+        }
+    }
+
     /// Set the batch size
     pub fn with_batch_size(&self, batch_size: usize) -> Result<Self> {
         Ok(Self {
@@ -292,6 +326,7 @@ impl FilterExec {
             projection: self.projection.clone(),
             batch_size,
             fetch: self.fetch,
+            coalesce_batches: self.coalesce_batches,
         })
     }
 
@@ -534,15 +569,23 @@ impl DisplayAs for FilterExec {
                 let fetch = self
                     .fetch
                     .map_or_else(|| "".to_string(), |f| format!(", fetch={f}"));
+                let coalesce_batches = if self.coalesce_batches {
+                    ""
+                } else {
+                    ", coalesce_batches=false"
+                };
                 write!(
                     f,
-                    "FilterExec: {}{}{}",
-                    self.predicate, display_projections, fetch
+                    "FilterExec: {}{}{}{}",
+                    self.predicate, display_projections, fetch, coalesce_batches
                 )
             }
             DisplayFormatType::TreeRender => {
                 if let Some(fetch) = self.fetch {
                     writeln!(f, "fetch={fetch}")?;
+                }
+                if !self.coalesce_batches {
+                    writeln!(f, "coalesce_batches=false")?;
                 }
                 write!(f, "predicate={}", fmt_sql(self.predicate.as_ref()))
             }
@@ -640,7 +683,8 @@ impl ExecutionPlan for FilterExec {
                 self.schema(),
                 self.batch_size,
                 self.fetch,
-            ),
+            )
+            .with_coalesce_batches(self.coalesce_batches),
         }))
     }
 
@@ -839,6 +883,7 @@ impl ExecutionPlan for FilterExec {
                 projection: self.projection.clone(),
                 batch_size: self.batch_size,
                 fetch: self.fetch,
+                coalesce_batches: self.coalesce_batches,
             };
             Some(Arc::new(new) as _)
         };
@@ -863,6 +908,7 @@ impl ExecutionPlan for FilterExec {
             projection: self.projection.clone(),
             batch_size: self.batch_size,
             fetch,
+            coalesce_batches: self.coalesce_batches,
         }))
     }
 
@@ -1448,8 +1494,12 @@ mod tests {
     use crate::expressions::*;
     use crate::statistics::{StatisticsArgs, StatisticsContext};
     use crate::test;
+    use crate::test::TestMemoryExec;
     use crate::test::exec::StatisticsExec;
-    use arrow::datatypes::{Field, Schema, UnionFields, UnionMode};
+    use crate::{collect, sorts::sort::SortExec};
+    use arrow::array::{ArrayRef, AsArray, Int64Array};
+    use arrow::datatypes::{Field, Int64Type, Schema, UnionFields, UnionMode};
+    use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 
     #[tokio::test]
     async fn collect_columns_predicates() -> Result<()> {
@@ -3936,6 +3986,97 @@ mod tests {
             statistics.column_statistics[0].distinct_count,
             Precision::Inexact(20)
         );
+        Ok(())
+    }
+
+    /// 50 batches of 100 rows, sorted on `a DESC`, where `c = 1` matches 10
+    /// rows per batch.
+    fn sorted_selective_input() -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+        let batches = (0..50)
+            .map(|i| {
+                let a = (0..100).map(|j| 5000 - (i * 100 + j)).collect::<Vec<i64>>();
+                let c = a.iter().map(|a| i64::from(a % 10 == 0)).collect::<Vec<_>>();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(a)) as ArrayRef,
+                        Arc::new(Int64Array::from(c)),
+                    ],
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let ordering = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(col("a", &schema)?).desc(),
+        ])
+        .unwrap();
+        let source = TestMemoryExec::try_new(&[batches], schema, None)?
+            .try_with_sort_information(vec![ordering])?;
+        Ok(Arc::new(TestMemoryExec::update_cache(&Arc::new(source))))
+    }
+
+    fn selective_filter(coalesce_batches: bool) -> Result<Arc<FilterExec>> {
+        let input = sorted_selective_input()?;
+        let predicate = binary(
+            col("c", &input.schema())?,
+            Operator::Eq,
+            lit(1i64),
+            &input.schema(),
+        )?;
+        Ok(Arc::new(
+            FilterExecBuilder::new(predicate, input)
+                .with_coalesce_batches(coalesce_batches)
+                .build()?,
+        ))
+    }
+
+    #[tokio::test]
+    async fn filter_without_coalescing_emits_each_input_batch() -> Result<()> {
+        let task_ctx = Arc::new(TaskContext::default());
+
+        let filter = selective_filter(true)?;
+        let batches = collect(filter, Arc::clone(&task_ctx)).await?;
+        let sizes = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
+        assert_eq!(sizes, vec![500]);
+
+        let filter = selective_filter(false)?;
+        let batches = collect(filter, task_ctx).await?;
+        let sizes = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
+        assert_eq!(sizes, vec![10; 50]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn filter_without_coalescing_lets_topk_finish_early() -> Result<()> {
+        for (coalesce_batches, expected_filter_output_rows) in [(true, 500), (false, 20)]
+        {
+            let filter = selective_filter(coalesce_batches)?;
+            let schema = filter.schema();
+            let ordering = LexOrdering::new(vec![
+                PhysicalSortExpr::new_default(col("a", &schema)?).desc(),
+                PhysicalSortExpr::new_default(col("c", &schema)?),
+            ])
+            .unwrap();
+            let topk = Arc::new(
+                SortExec::new(ordering, Arc::clone(&filter) as _).with_fetch(Some(15)),
+            );
+            assert!(!topk.common_sort_prefix().is_empty());
+
+            let batches = collect(topk, Arc::new(TaskContext::default())).await?;
+            let a = batches
+                .iter()
+                .flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(a, (0..15).map(|i| 5000 - i * 10).collect::<Vec<_>>());
+            assert_eq!(
+                filter.metrics().unwrap().output_rows(),
+                Some(expected_filter_output_rows),
+                "coalesce_batches={coalesce_batches}"
+            );
+        }
         Ok(())
     }
 }
