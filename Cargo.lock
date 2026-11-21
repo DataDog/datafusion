@@ -2193,6 +2193,7 @@ name = "datafusion-expr-common"
 version = "55.2.0"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "datafusion-common",
  "indexmap 2.14.0",
  "insta",
