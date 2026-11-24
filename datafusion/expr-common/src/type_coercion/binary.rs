@@ -947,8 +947,14 @@ fn merge_struct_fields(structs: &[&Fields], common_fields: &Fields) -> Result<Fi
                     }
                 })
                 .collect::<Vec<_>>();
-            let metadata =
-                coerced_fields_metadata(coerced.iter().map(|field| field.as_ref()))?;
+            // Untyped NULL children defer to typed contributors. A child that is
+            // NULL in every input has none, so it keeps the NULL inputs' metadata.
+            let metadata = if coerced.is_empty() {
+                null_fields_metadata(&inputs)
+            } else {
+                coerced_fields_metadata(coerced.iter().map(|field| field.as_ref()))?
+                    .to_hashmap()
+            };
             let nullable = inputs.iter().any(|field| field.is_nullable());
             let field = inputs
                 .iter()
@@ -960,10 +966,33 @@ fn merge_struct_fields(structs: &[&Fields], common_fields: &Fields) -> Result<Fi
                     .clone()
                     .with_data_type(data_type)
                     .with_nullable(nullable)
-                    .with_metadata(metadata.to_hashmap()),
+                    .with_metadata(metadata),
             ))
         })
         .collect()
+}
+
+/// Merge metadata from untyped NULL fields, with earlier fields taking
+/// precedence. The extension name and its metadata are taken together from the
+/// first field that declares an extension type.
+fn null_fields_metadata(fields: &[&Field]) -> HashMap<String, String> {
+    let mut merged = HashMap::new();
+    if let Some(field) = fields
+        .iter()
+        .find(|field| field.metadata().contains_key(EXTENSION_TYPE_NAME_KEY))
+    {
+        for key in [EXTENSION_TYPE_NAME_KEY, EXTENSION_TYPE_METADATA_KEY] {
+            if let Some(value) = field.metadata().get(key) {
+                merged.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    for (key, value) in fields.iter().flat_map(|field| field.metadata()) {
+        if key != EXTENSION_TYPE_NAME_KEY && key != EXTENSION_TYPE_METADATA_KEY {
+            merged.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    merged
 }
 
 /// Coerce `lhs_type` and `rhs_type` to a common type for type unification
