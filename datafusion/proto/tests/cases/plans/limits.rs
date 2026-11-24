@@ -38,13 +38,17 @@ use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions::{PhysicalSortExpr, col};
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
-use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions,
+};
 use datafusion::prelude::SessionContext;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
+use datafusion_proto::bytes::physical_plan_to_bytes_with_proto_converter;
 use datafusion_proto::physical_plan::{
-    DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
+    AsExecutionPlan, DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
 };
+use datafusion_proto::protobuf::PhysicalPlanNode;
 use std::sync::Arc;
 use std::vec;
 
@@ -72,6 +76,254 @@ fn roundtrip_global_skip_no_limit() -> Result<()> {
         10,
         None, // no limit
     )))
+}
+
+/// `GlobalLimitExec`'s `skip`/`fetch` and `LocalLimitExec`'s `fetch` cross the
+/// wire through fields narrower than `usize`: `uint32` for skip and the local
+/// fetch, `int64` for the global fetch. A value outside the field's range
+/// must fail encoding with a named error rather than wrap into a different
+/// limit — an `OFFSET` above `u32::MAX` used to wrap to zero and return the
+/// head row instead of erroring.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn limit_row_counts_across_wire_boundaries() -> Result<()> {
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let input =
+        || Arc::new(EmptyExec::new(Arc::new(Schema::empty()))) as Arc<dyn ExecutionPlan>;
+
+    let roundtrip = |plan: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
+        let node = PhysicalPlanNode::try_from_physical_plan(plan, &codec)?;
+        node.try_into_physical_plan(ctx.task_ctx().as_ref(), &codec)
+    };
+
+    // Global skip (`uint32`) together with an unlimited global fetch (`int64`).
+    for skip in [0, u32::MAX as usize] {
+        let plan = roundtrip(Arc::new(GlobalLimitExec::new(input(), skip, None)))?;
+        let plan = plan.downcast_ref::<GlobalLimitExec>().unwrap();
+        assert_eq!(plan.skip(), skip);
+        assert_eq!(plan.fetch(), None);
+    }
+    // Global fetch. `Some(0)` must stay `Some(0)`, not read back as the `-1`
+    // "no limit" sentinel, and the full `int64` range must round-trip.
+    for fetch in [
+        0,
+        u32::MAX as usize,
+        u32::MAX as usize + 1,
+        i64::MAX as usize,
+    ] {
+        let plan = roundtrip(Arc::new(GlobalLimitExec::new(input(), 0, Some(fetch))))?;
+        let plan = plan.downcast_ref::<GlobalLimitExec>().unwrap();
+        assert_eq!(plan.fetch(), Some(fetch));
+    }
+    // Local fetch (`uint32`).
+    for fetch in [0, u32::MAX as usize] {
+        let plan = roundtrip(Arc::new(LocalLimitExec::new(input(), fetch)))?;
+        let plan = plan.downcast_ref::<LocalLimitExec>().unwrap();
+        assert_eq!(plan.fetch(), fetch);
+    }
+
+    // Skip above the `uint32` field wraps on the old unchecked cast; it must
+    // now be a named encode error.
+    for skip in [
+        u32::MAX as usize + 1,
+        i64::MAX as usize,
+        i64::MAX as usize + 1,
+        usize::MAX,
+    ] {
+        let err = PhysicalPlanNode::try_from_physical_plan(
+            Arc::new(GlobalLimitExec::new(input(), skip, None)),
+            &codec,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "GlobalLimitExec: skip value {skip} is out of range for the plan wire format"
+            )),
+            "unexpected error: {err}"
+        );
+    }
+    // Global fetch above the `int64` field.
+    for fetch in [i64::MAX as usize + 1, usize::MAX] {
+        let err = PhysicalPlanNode::try_from_physical_plan(
+            Arc::new(GlobalLimitExec::new(input(), 0, Some(fetch))),
+            &codec,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "GlobalLimitExec: fetch value {fetch} is out of range for the plan wire format"
+            )),
+            "unexpected error: {err}"
+        );
+    }
+    // Local fetch above the `uint32` field.
+    for fetch in [
+        u32::MAX as usize + 1,
+        i64::MAX as usize,
+        i64::MAX as usize + 1,
+        usize::MAX,
+    ] {
+        let err = PhysicalPlanNode::try_from_physical_plan(
+            Arc::new(LocalLimitExec::new(input(), fetch)),
+            &codec,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "LocalLimitExec: fetch value {fetch} is out of range for the plan wire format"
+            )),
+            "unexpected error: {err}"
+        );
+    }
+    Ok(())
+}
+
+/// The successful encodings are byte-for-byte the pre-existing wire format:
+/// `uint32` skip (zero omitted, per proto3), `int64` fetch with `-1` for "no
+/// limit", and `uint32` local fetch. Comparing against hand-built nodes pins
+/// what a legacy reader sees for representable values, so the checked
+/// conversions cannot have changed the bytes.
+#[test]
+fn limit_wire_encoding_matches_legacy_bytes() -> Result<()> {
+    use datafusion_proto::bytes::physical_plan_from_bytes_with_proto_converter;
+    use datafusion_proto::protobuf::physical_plan_node::PhysicalPlanType;
+    use datafusion_proto::protobuf::{
+        EmptyExecNode, GlobalLimitExecNode, LocalLimitExecNode,
+    };
+    use prost::Message;
+
+    #[derive(Debug)]
+    enum Expected {
+        Global { skip: usize, fetch: Option<usize> },
+        Local { fetch: usize },
+    }
+
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let proto_converter = DefaultPhysicalProtoConverter {};
+    let schema = Arc::new(Schema::empty());
+    let input = Arc::new(EmptyExec::new(Arc::clone(&schema))) as Arc<dyn ExecutionPlan>;
+    let empty_node = || -> Result<PhysicalPlanNode> {
+        Ok(PhysicalPlanNode {
+            physical_plan_type: Some(PhysicalPlanType::Empty(EmptyExecNode {
+                schema: Some(schema.as_ref().try_into()?),
+                partitions: 1,
+            })),
+        })
+    };
+
+    let cases: [(Arc<dyn ExecutionPlan>, PhysicalPlanNode, Expected); 3] = [
+        (
+            Arc::new(GlobalLimitExec::new(Arc::clone(&input), 10, None)),
+            PhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::GlobalLimit(Box::new(
+                    GlobalLimitExecNode {
+                        input: Some(Box::new(empty_node()?)),
+                        skip: 10,
+                        fetch: -1, // no limit
+                        required_ordering: vec![],
+                    },
+                ))),
+            },
+            Expected::Global {
+                skip: 10,
+                fetch: None,
+            },
+        ),
+        (
+            Arc::new(GlobalLimitExec::new(Arc::clone(&input), 0, Some(25))),
+            PhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::GlobalLimit(Box::new(
+                    GlobalLimitExecNode {
+                        input: Some(Box::new(empty_node()?)),
+                        skip: 0,
+                        fetch: 25,
+                        required_ordering: vec![],
+                    },
+                ))),
+            },
+            Expected::Global {
+                skip: 0,
+                fetch: Some(25),
+            },
+        ),
+        (
+            Arc::new(LocalLimitExec::new(Arc::clone(&input), 25)),
+            PhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::LocalLimit(Box::new(
+                    LocalLimitExecNode {
+                        input: Some(Box::new(empty_node()?)),
+                        fetch: 25,
+                        required_ordering: vec![],
+                    },
+                ))),
+            },
+            Expected::Local { fetch: 25 },
+        ),
+    ];
+
+    for (plan, expected_node, expect) in cases {
+        let bytes =
+            physical_plan_to_bytes_with_proto_converter(plan, &codec, &proto_converter)?;
+        assert_eq!(bytes.as_ref(), expected_node.encode_to_vec().as_slice());
+
+        let decoded = physical_plan_from_bytes_with_proto_converter(
+            bytes.as_ref(),
+            ctx.task_ctx().as_ref(),
+            &codec,
+            &proto_converter,
+        )?;
+        match expect {
+            Expected::Global { skip, fetch } => {
+                let global = decoded
+                    .downcast_ref::<GlobalLimitExec>()
+                    .expect("expected GlobalLimitExec");
+                assert_eq!(global.skip(), skip);
+                assert_eq!(global.fetch(), fetch);
+            }
+            Expected::Local { fetch } => {
+                let local = decoded
+                    .downcast_ref::<LocalLimitExec>()
+                    .expect("expected LocalLimitExec");
+                assert_eq!(local.fetch(), fetch);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// On a 32-bit target a wire value that fits the protobuf field but not
+/// `usize` must fail decode with a named error instead of truncating
+/// (upstream #24483 keeps the same coverage).
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn global_limit_rejects_fetch_above_usize() -> Result<()> {
+    use datafusion_proto::protobuf;
+
+    let codec = DefaultPhysicalExtensionCodec {};
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(
+        Arc::new(EmptyExec::new(Arc::new(Schema::empty()))),
+        0,
+        Some(1),
+    ));
+    let mut node = PhysicalPlanNode::try_from_physical_plan(plan, &codec)?;
+    let Some(protobuf::physical_plan_node::PhysicalPlanType::GlobalLimit(limit)) =
+        &mut node.physical_plan_type
+    else {
+        panic!("expected GlobalLimitExecNode");
+    };
+    limit.fetch = i64::from(u32::MAX) + 1;
+
+    let ctx = SessionContext::new();
+    let err = node
+        .try_into_physical_plan(&ctx.task_ctx(), &codec)
+        .unwrap_err();
+    assert_eq!(
+        err.strip_backtrace(),
+        "Error during planning: GlobalLimitExec: fetch wire value 4294967296 is out of range for usize"
+    );
+    Ok(())
 }
 
 /// Sort key at index 1, so a decoder that misbinds column name vs index
@@ -212,6 +464,78 @@ fn roundtrip_coalesce_partitions_with_fetch() -> Result<()> {
         CoalescePartitionsExec::new(Arc::new(EmptyExec::new(schema)))
             .with_fetch(Some(10)),
     ))
+}
+
+/// Both coalescing execs carry their `fetch` in a `uint32` field. The largest
+/// representable value must round-trip exactly, and the first value above it
+/// must be a named encode error rather than wrap to a different limit.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn coalesce_fetches_across_the_wire_range() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Boolean, false)]));
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let proto_converter = DefaultPhysicalProtoConverter {};
+
+    let merged = roundtrip_test_and_return(
+        Arc::new(
+            CoalescePartitionsExec::new(Arc::new(EmptyExec::new(Arc::clone(&schema))))
+                .with_fetch(Some(u32::MAX as usize)),
+        ),
+        &ctx,
+        &codec,
+        &proto_converter,
+    )?;
+    let merged = merged.downcast_ref::<CoalescePartitionsExec>().unwrap();
+    assert_eq!(merged.fetch(), Some(u32::MAX as usize));
+
+    #[expect(deprecated)]
+    let batched = roundtrip_test_and_return(
+        Arc::new(
+            CoalesceBatchesExec::new(Arc::new(EmptyExec::new(Arc::clone(&schema))), 8096)
+                .with_fetch(Some(u32::MAX as usize)),
+        ),
+        &ctx,
+        &codec,
+        &proto_converter,
+    )?;
+    #[expect(deprecated)]
+    let batched = batched.downcast_ref::<CoalesceBatchesExec>().unwrap();
+    assert_eq!(batched.fetch(), Some(u32::MAX as usize));
+
+    let err = PhysicalPlanNode::try_from_physical_plan(
+        Arc::new(
+            CoalescePartitionsExec::new(Arc::new(EmptyExec::new(Arc::clone(&schema))))
+                .with_fetch(Some(u32::MAX as usize + 1)),
+        ),
+        &codec,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains(&format!(
+            "CoalescePartitionsExec: fetch value {} is out of range for the plan wire format",
+            u32::MAX as usize + 1
+        )),
+        "unexpected error: {err}"
+    );
+
+    #[expect(deprecated)]
+    let err = PhysicalPlanNode::try_from_physical_plan(
+        Arc::new(
+            CoalesceBatchesExec::new(Arc::new(EmptyExec::new(Arc::clone(&schema))), 8096)
+                .with_fetch(Some(u32::MAX as usize + 1)),
+        ),
+        &codec,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains(&format!(
+            "CoalesceBatchesExec: fetch value {} is out of range for the plan wire format",
+            u32::MAX as usize + 1
+        )),
+        "unexpected error: {err}"
+    );
+    Ok(())
 }
 
 #[test]

@@ -849,9 +849,14 @@ impl ExecutionPlan for FilterExec {
         &self,
         ctx: &crate::proto::ExecutionPlanEncodeCtx<'_>,
     ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
+        use datafusion_common::utils::usize_to_wire;
         use datafusion_proto_models::protobuf;
         let input = ctx.encode_child(self.input())?;
         let expr = ctx.encode_expr(self.predicate())?;
+        let fetch = self
+            .fetch()
+            .map(|fetch| usize_to_wire(fetch, "FilterExec", "fetch"))
+            .transpose()?;
         // Preserve the exact wire format: `None` (full projection) is serialized
         // as the identity projection `[0, 1, ..., num_fields - 1]` so that it is
         // distinguishable from an explicit projection on decode.
@@ -871,7 +876,7 @@ impl ExecutionPlan for FilterExec {
                         default_filter_selectivity: self.default_selectivity() as u32,
                         projection,
                         batch_size: self.batch_size() as u32,
-                        fetch: self.fetch().map(|f| f as u32),
+                        fetch,
                     },
                 )),
             ),
@@ -892,6 +897,7 @@ impl FilterExec {
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &crate::proto::ExecutionPlanDecodeCtx<'_>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_common::utils::usize_from_wire;
         use datafusion_proto_models::protobuf;
         let filter = crate::expect_plan_variant!(
             node,
@@ -924,10 +930,14 @@ impl FilterExec {
         } else {
             Some(projection_vec)
         };
+        let fetch = filter
+            .fetch
+            .map(|f| usize_from_wire(f, "FilterExec", "fetch"))
+            .transpose()?;
         let filter = FilterExecBuilder::new(predicate, input)
             .apply_projection(projection)?
             .with_batch_size(filter.batch_size as usize)
-            .with_fetch(filter.fetch.map(|f| f as usize))
+            .with_fetch(fetch)
             .build()?;
         match filter_selectivity {
             Ok(filter_selectivity) => Ok(Arc::new(

@@ -674,6 +674,103 @@ async fn roundtrip_memory_source_sort_information_and_fetch() -> Result<()> {
     Ok(())
 }
 
+/// `FileScanConfig::limit` and `MemorySourceConfig::fetch` both cross the
+/// wire as `uint32` fields. The largest representable value must round-trip
+/// exactly (and `Some(0)` must stay `Some(0)`), and the first value above it
+/// must be a named encode error rather than wrap to a different limit.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn scan_row_limits_across_the_wire_range() -> Result<()> {
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSource as _;
+
+    let file_schema =
+        Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let proto_converter = DefaultPhysicalProtoConverter {};
+
+    let make_scan = |limit: Option<usize>| {
+        let file_source = Arc::new(ParquetSource::new(Arc::clone(&file_schema)));
+        FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), file_source)
+            .with_file_groups(vec![FileGroup::new(vec![PartitionedFile::new(
+                "/path/to/file.parquet".to_string(),
+                1024,
+            )])])
+            .with_limit(limit)
+            .build()
+    };
+
+    for limit in [Some(0), Some(u32::MAX as usize)] {
+        let decoded = roundtrip_test_and_return(
+            DataSourceExec::from_data_source(make_scan(limit)),
+            &ctx,
+            &codec,
+            &proto_converter,
+        )?;
+        let decoded = decoded.downcast_ref::<DataSourceExec>().unwrap();
+        let scan = decoded
+            .data_source()
+            .downcast_ref::<FileScanConfig>()
+            .expect("expected FileScanConfig");
+        assert_eq!(scan.limit, limit);
+    }
+
+    let err = PhysicalPlanNode::try_from_physical_plan(
+        DataSourceExec::from_data_source(make_scan(Some(u32::MAX as usize + 1))),
+        &codec,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains(&format!(
+            "FileScanConfig: limit value {} is out of range for the plan wire format",
+            u32::MAX as usize + 1
+        )),
+        "unexpected error: {err}"
+    );
+
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(arrow::array::Int64Array::from(vec![18i64, 21i64]))],
+    )?;
+    let make_memory = |fetch: Option<usize>| -> Result<MemorySourceConfig> {
+        Ok(MemorySourceConfig::try_new(
+            &[vec![batch.clone()]],
+            Arc::clone(&schema),
+            None,
+        )?
+        .with_limit(fetch))
+    };
+
+    let decoded = roundtrip_test_and_return(
+        DataSourceExec::from_data_source(make_memory(Some(u32::MAX as usize))?),
+        &ctx,
+        &codec,
+        &proto_converter,
+    )?;
+    let decoded = decoded.downcast_ref::<DataSourceExec>().unwrap();
+    let source = decoded
+        .data_source()
+        .downcast_ref::<MemorySourceConfig>()
+        .expect("expected MemorySourceConfig");
+    assert_eq!(source.fetch(), Some(u32::MAX as usize));
+
+    let err = PhysicalPlanNode::try_from_physical_plan(
+        DataSourceExec::from_data_source(make_memory(Some(u32::MAX as usize + 1))?),
+        &codec,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains(&format!(
+            "MemoryScanExecNode: fetch value {} is out of range for the plan wire format",
+            u32::MAX as usize + 1
+        )),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn roundtrip_listing_table_with_schema_metadata() -> Result<()> {
     let ctx = SessionContext::new();

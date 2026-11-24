@@ -28,8 +28,9 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use datafusion::prelude::SessionContext;
 use datafusion_common::Result;
 use datafusion_proto::physical_plan::{
-    DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
+    AsExecutionPlan, DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
 };
+use datafusion_proto::protobuf::PhysicalPlanNode;
 use std::sync::Arc;
 use std::vec;
 
@@ -247,5 +248,95 @@ fn roundtrip_sort_preserving_merge() -> Result<()> {
         .expect("should decode back into a SortPreservingMergeExec");
     assert_eq!(roundtripped.fetch(), Some(11));
     assert_eq!(roundtripped.expr(), &sort_exprs);
+    Ok(())
+}
+
+/// Both sort execs carry their `fetch` in an `int64` field with `-1` for
+/// "no limit". The largest representable value must round-trip exactly, and
+/// the first value above it must be a named encode error — on the old
+/// unchecked cast it wrapped to `-1` and read back as an unlimited sort.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn sort_fetches_across_the_wire_range() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Boolean, false)]));
+    let sort_exprs: LexOrdering = [PhysicalSortExpr {
+        expr: col("a", &schema)?,
+        options: SortOptions {
+            descending: true,
+            nulls_first: false,
+        },
+    }]
+    .into();
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let proto_converter = DefaultPhysicalProtoConverter {};
+
+    let sorted = roundtrip_test_and_return(
+        Arc::new(
+            SortExec::new(
+                sort_exprs.clone(),
+                Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            )
+            .with_fetch(Some(i64::MAX as usize)),
+        ),
+        &ctx,
+        &codec,
+        &proto_converter,
+    )?;
+    let sorted = sorted.downcast_ref::<SortExec>().unwrap();
+    assert_eq!(sorted.fetch(), Some(i64::MAX as usize));
+
+    let merged = roundtrip_test_and_return(
+        Arc::new(
+            SortPreservingMergeExec::new(
+                sort_exprs.clone(),
+                Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            )
+            .with_fetch(Some(i64::MAX as usize)),
+        ),
+        &ctx,
+        &codec,
+        &proto_converter,
+    )?;
+    let merged = merged.downcast_ref::<SortPreservingMergeExec>().unwrap();
+    assert_eq!(merged.fetch(), Some(i64::MAX as usize));
+
+    let err = PhysicalPlanNode::try_from_physical_plan(
+        Arc::new(
+            SortExec::new(
+                sort_exprs.clone(),
+                Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            )
+            .with_fetch(Some(i64::MAX as usize + 1)),
+        ),
+        &codec,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains(&format!(
+            "SortExec: fetch value {} is out of range for the plan wire format",
+            i64::MAX as usize + 1
+        )),
+        "unexpected error: {err}"
+    );
+
+    let err = PhysicalPlanNode::try_from_physical_plan(
+        Arc::new(
+            SortPreservingMergeExec::new(
+                sort_exprs,
+                Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            )
+            .with_fetch(Some(i64::MAX as usize + 1)),
+        ),
+        &codec,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains(&format!(
+            "SortPreservingMergeExec: fetch value {} is out of range for the plan wire format",
+            i64::MAX as usize + 1
+        )),
+        "unexpected error: {err}"
+    );
     Ok(())
 }
