@@ -52,6 +52,7 @@ use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{GroupsAccumulatorAdapter, PhysicalSortExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
+use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 
 use crate::sorts::IncrementalSortIterator;
 use datafusion_common::instant::Instant;
@@ -844,6 +845,12 @@ impl GroupedHashAggregateStream {
             evaluate_group_by(&self.group_by, batch)?
         };
 
+        let filter_values = if self.spill_state.is_stream_merging {
+            vec![None; self.accumulators.len()]
+        } else {
+            evaluate_optional(&self.filter_expressions, batch)?
+        };
+
         // Only create the timer if there are actual aggregate arguments to evaluate
         let timer = match (
             self.spill_state.is_stream_merging,
@@ -860,17 +867,9 @@ impl GroupedHashAggregateStream {
         let input_values = if self.spill_state.is_stream_merging {
             evaluate_many(&self.spill_state.merging_aggregate_arguments, batch)?
         } else {
-            evaluate_many(&self.aggregate_arguments, batch)?
+            self.evaluate_aggregate_arguments(batch, &filter_values)?
         };
         drop(timer);
-
-        // Evaluate the filter expressions, if any, against the inputs
-        let filter_values = if self.spill_state.is_stream_merging {
-            let filter_expressions = vec![None; self.accumulators.len()];
-            evaluate_optional(&filter_expressions, batch)?
-        } else {
-            evaluate_optional(&self.filter_expressions, batch)?
-        };
 
         for group_values in &group_by_values {
             let groups_start_time = Instant::now();
@@ -1366,11 +1365,35 @@ impl GroupedHashAggregateStream {
             .is_some_and(|probe| probe.should_skip())
     }
 
+    fn evaluate_aggregate_arguments(
+        &self,
+        batch: &RecordBatch,
+        filters: &[Option<ArrayRef>],
+    ) -> Result<Vec<Vec<ArrayRef>>> {
+        self.aggregate_arguments
+            .iter()
+            .zip(filters)
+            .map(|(arguments, filter)| {
+                let Some(filter) = filter else {
+                    return evaluate_expressions_to_arrays(arguments, batch);
+                };
+                let selection = filter.as_boolean();
+                arguments
+                    .iter()
+                    .map(|expr| {
+                        expr.evaluate_selection(batch, selection)?
+                            .into_array(batch.num_rows())
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Transforms input batch to intermediate aggregate state, without grouping it
     fn transform_to_states(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mut group_values = evaluate_group_by(&self.group_by, batch)?;
-        let input_values = evaluate_many(&self.aggregate_arguments, batch)?;
         let filter_values = evaluate_optional(&self.filter_expressions, batch)?;
+        let input_values = self.evaluate_aggregate_arguments(batch, &filter_values)?;
 
         assert_eq_or_internal_err!(
             group_values.len(),
