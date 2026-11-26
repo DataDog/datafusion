@@ -37,12 +37,12 @@ use datafusion_physical_expr::expressions::col;
 use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::aggregates::group_values::multi_group_by::GroupValuesColumn;
 use datafusion_physical_plan::aggregates::group_values::{GroupValues, new_group_values};
-use datafusion_physical_plan::aggregates::order::GroupOrdering;
+use datafusion_physical_plan::aggregates::order::GroupClustering;
 use datafusion_physical_plan::aggregates::{
-    AggregateExec, AggregateMode, PhysicalGroupBy,
+    AggregateExec, AggregateMode, GroupClusteringMode, PhysicalGroupBy,
 };
 use datafusion_physical_plan::test::TestMemoryExec;
-use datafusion_physical_plan::{ExecutionPlan, InputOrderMode, collect};
+use datafusion_physical_plan::{ExecutionPlan, collect};
 use tokio::runtime::Runtime;
 
 const ROWS: usize = 131_072;
@@ -111,8 +111,10 @@ fn grouping(c: &mut Criterion) {
                                 let values: Box<dyn GroupValues> = if selected {
                                     new_group_values(
                                         Arc::clone(&schema),
-                                        &GroupOrdering::try_new(&InputOrderMode::Sorted)
-                                            .unwrap(),
+                                        &GroupClustering::try_new(
+                                            &GroupClusteringMode::Full,
+                                        )
+                                        .unwrap(),
                                     )
                                     .unwrap()
                                 } else {
@@ -157,7 +159,7 @@ fn check_case(schema: &SchemaRef, batches: &[Vec<ArrayRef>]) -> (usize, usize) {
     let mut hashed = GroupValuesColumn::<true>::try_new(Arc::clone(schema)).unwrap();
     let mut selected = new_group_values(
         Arc::clone(schema),
-        &GroupOrdering::try_new(&InputOrderMode::Sorted).unwrap(),
+        &GroupClustering::try_new(&GroupClusteringMode::Full).unwrap(),
     )
     .unwrap();
     let mut expected = Vec::new();
@@ -228,7 +230,7 @@ fn aggregate_plan(
         schema,
     )
     .unwrap();
-    assert_eq!(plan.input_order_mode(), &InputOrderMode::Sorted);
+    assert_eq!(plan.group_clustering_mode(), &GroupClusteringMode::Full);
     Arc::new(plan)
 }
 

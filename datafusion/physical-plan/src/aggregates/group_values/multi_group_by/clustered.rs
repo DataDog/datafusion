@@ -22,7 +22,7 @@ use arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
 use arrow_ord::partition::partition;
 use datafusion_common::{Result, not_impl_err};
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
-use datafusion_expr::{EmitTo, GroupSelection};
+use datafusion_expr::EmitTo;
 
 use super::{GroupColumn, GroupValuesColumn};
 use crate::aggregates::group_values::GroupValues;
@@ -69,8 +69,6 @@ impl GroupValuesClustered {
                         | DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond)
                         | DataType::Duration(_)
                         | DataType::Interval(_)
-                        | DataType::Decimal32(_, _)
-                        | DataType::Decimal64(_, _)
                         | DataType::Decimal128(_, _)
                         | DataType::Decimal256(_, _)
                         | DataType::Utf8
@@ -166,21 +164,6 @@ impl GroupValues for GroupValuesClustered {
         })
     }
 
-    fn values_preserving(
-        &mut self,
-        selection: GroupSelection<'_>,
-    ) -> Result<Vec<ArrayRef>> {
-        selection.validate_num_groups(self.len())?;
-        self.columns
-            .iter()
-            .map(|column| column.values_preserving(selection))
-            .collect()
-    }
-
-    fn supports_values_preserving(&self) -> bool {
-        true
-    }
-
     fn clear_shrink(&mut self, num_rows: usize) {
         self.columns = GroupValuesColumn::<true>::build_group_columns(&self.schema)
             .expect("schema validated by GroupValuesClustered::try_new");
@@ -195,17 +178,15 @@ mod tests {
 
     use arrow::array::UInt32Array;
     use arrow::array::{
-        Array, AsArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array,
-        Decimal256Array, FixedSizeBinaryArray, Int32Array, Int64Array,
-        IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray,
-        StringArray,
+        Array, AsArray, BooleanArray, Decimal128Array, Decimal256Array,
+        FixedSizeBinaryArray, Int32Array, Int64Array, IntervalDayTimeArray,
+        IntervalMonthDayNanoArray, IntervalYearMonthArray, StringArray,
     };
     use arrow::buffer::{Buffer, NullBuffer};
     use arrow::compute::{cast, take};
     use arrow::datatypes::{
         Field, IntervalDayTime, IntervalMonthDayNano, IntervalUnit, i256,
     };
-    use datafusion_expr::GroupSelection;
 
     use super::*;
 
@@ -243,16 +224,6 @@ mod tests {
                 }));
                 cast(&strings, key_type)?
             }
-            DataType::Decimal32(precision, scale) => Arc::new(
-                Decimal32Array::from_iter(keys.iter().map(|key| key.map(|key| key - 2)))
-                    .with_precision_and_scale(*precision, *scale)?,
-            ),
-            DataType::Decimal64(precision, scale) => Arc::new(
-                Decimal64Array::from_iter(
-                    keys.iter().map(|key| key.map(|key| i64::from(key - 2))),
-                )
-                .with_precision_and_scale(*precision, *scale)?,
-            ),
             DataType::Decimal128(precision, scale) => {
                 // Equal low 64 bits must not hide differences in the high bits.
                 let values = [
@@ -379,10 +350,6 @@ mod tests {
             DataType::Interval(IntervalUnit::YearMonth),
             DataType::Interval(IntervalUnit::DayTime),
             DataType::Interval(IntervalUnit::MonthDayNano),
-            DataType::Decimal32(9, 2),
-            DataType::Decimal32(9, -2),
-            DataType::Decimal64(18, 2),
-            DataType::Decimal64(18, -2),
             DataType::Decimal128(38, 2),
             DataType::Decimal128(38, -2),
             DataType::Decimal256(76, 2),
@@ -452,10 +419,6 @@ mod tests {
                                     "{key_type:?}, nullable={nullable}, unsorted={unsorted}, batch={batch_size}, offset={offset}, descending={descending}"
                                 );
                                 assert_eq!(clustered.len(), hashed.len());
-                                let selection = GroupSelection::all(clustered.len());
-                                let values = clustered.values_preserving(selection)?;
-                                assert_eq!(values, hashed.values_preserving(selection)?);
-                                assert_eq!(values[1].data_type(), &key_type);
                                 // A zero-row batch must neither forget the boundary
                                 // key nor leave stale group ids in the output buffer.
                                 let empty = batch
@@ -470,15 +433,6 @@ mod tests {
                                 assert_eq!(values, hashed.emit(EmitTo::First(emit))?);
                                 assert_eq!(values[1].data_type(), &key_type);
                             }
-                            let indices = [clustered.len() - 1, 0, clustered.len() - 1];
-                            let selection = GroupSelection::try_from_indices(
-                                &indices,
-                                clustered.len(),
-                            )?;
-                            assert_eq!(
-                                clustered.values_preserving(selection)?,
-                                hashed.values_preserving(selection)?
-                            );
                             let values = clustered.emit(EmitTo::All)?;
                             assert_eq!(values, hashed.emit(EmitTo::All)?);
                             assert_eq!(values[1].data_type(), &key_type);
@@ -566,10 +520,6 @@ mod tests {
                 clustered.intern(&batch, &mut groups)?;
                 assert_eq!(groups, vec![usize::from(nullable && offset == 2); 2]);
             }
-            let values =
-                clustered.values_preserving(GroupSelection::all(clustered.len()))?;
-            assert_eq!(values[1].len(), if nullable { 2 } else { 1 });
-            assert_eq!(values[1].null_count(), usize::from(nullable));
             let values = clustered.emit(EmitTo::First(1))?;
             assert_eq!(values[1].len(), 1);
             assert_eq!(values[1].null_count(), usize::from(nullable));
@@ -584,6 +534,10 @@ mod tests {
     #[test]
     fn clustered_schema_gate_keeps_unvalidated_types_on_existing_paths() {
         for data_type in [
+            DataType::Decimal32(9, 2),
+            DataType::Decimal32(9, -2),
+            DataType::Decimal64(18, 2),
+            DataType::Decimal64(18, -2),
             DataType::Float16,
             DataType::Float32,
             DataType::Float64,
