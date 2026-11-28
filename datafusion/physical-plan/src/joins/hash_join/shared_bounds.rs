@@ -24,8 +24,8 @@ use std::sync::Arc;
 use crate::ExecutionPlan;
 use crate::ExecutionPlanProperties;
 use crate::Partitioning;
-use crate::joins::Map;
 use crate::joins::PartitionMode;
+use crate::joins::ReservedMap;
 use crate::joins::hash_join::exec::HASH_JOIN_SEED;
 use crate::joins::hash_join::inlist_builder::build_struct_fields;
 use crate::joins::hash_join::partitioned_hash_eval::{
@@ -136,12 +136,14 @@ fn create_membership_predicate(
             )?)))
         }
         // Use hash table lookup for large build sides
-        PushdownStrategy::Map(hash_map) => Ok(Some(Arc::new(HashTableLookupExpr::new(
-            on_right.to_vec(),
-            random_state.clone(),
-            hash_map,
-            "hash_lookup".to_string(),
-        )) as Arc<dyn PhysicalExpr>)),
+        PushdownStrategy::Map(hash_map) => {
+            Ok(Some(Arc::new(HashTableLookupExpr::new_reserved(
+                on_right.to_vec(),
+                random_state.clone(),
+                hash_map,
+                "hash_lookup".to_string(),
+            )) as Arc<dyn PhysicalExpr>))
+        }
         // Empty partition - should not create a filter for this
         PushdownStrategy::Empty => Ok(None),
     }
@@ -278,7 +280,7 @@ pub(crate) enum PushdownStrategy {
     /// Use InList for small build sides (< 128MB)
     InList(ArrayRef),
     /// Use map lookup for large build sides
-    Map(Arc<Map>),
+    Map(Arc<ReservedMap>),
     /// There was no data in this partition, do not build a dynamic filter for it
     Empty,
 }

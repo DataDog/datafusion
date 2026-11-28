@@ -30,7 +30,6 @@ use crate::filter_pushdown::{
     ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
     FilterPushdownPropagation,
 };
-use crate::joins::Map;
 use crate::joins::array_map::ArrayMap;
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::shared_bounds::{
@@ -45,6 +44,7 @@ use crate::joins::utils::{
     swap_join_projection, update_hash,
 };
 use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
+use crate::joins::{Map, ReservedMap};
 use crate::metrics::{Count, MetricBuilder, MetricCategory};
 use crate::projection::{
     EmbeddedProjection, JoinData, ProjectionExec, try_embed_projection,
@@ -194,7 +194,7 @@ fn try_create_array_map(
 pub(super) struct JoinLeftData {
     /// The hash table with indices into `batch`
     /// Arc is used to allow sharing with SharedBuildAccumulator for hash map pushdown
-    pub(super) map: Arc<Map>,
+    pub(super) map: Arc<ReservedMap>,
     /// The input rows for the build side
     batch: RecordBatch,
     /// The build side on expressions values
@@ -2298,13 +2298,14 @@ async fn collect_left_input(
         _ => None,
     };
 
+    let mut map_reservation = reservation.new_empty();
     let (join_hash_map, batch, left_values) =
         if let Some((array_map, batch, left_value)) = try_create_array_map(
             &bounds,
             &schema,
             &batches,
             &on_left,
-            &mut reservation,
+            &mut map_reservation,
             config.execution.perfect_hash_join_small_build_threshold,
             config.execution.perfect_hash_join_min_key_density,
             null_equality,
@@ -2325,13 +2326,13 @@ async fn collect_left_input(
             let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
                 let estimated_hashtable_size =
                     estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-                reservation.try_grow(estimated_hashtable_size)?;
+                map_reservation.try_grow(estimated_hashtable_size)?;
                 metrics.build_mem_used.add(estimated_hashtable_size);
                 Box::new(JoinHashMapU64::with_capacity(num_rows))
             } else {
                 let estimated_hashtable_size =
                     estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-                reservation.try_grow(estimated_hashtable_size)?;
+                map_reservation.try_grow(estimated_hashtable_size)?;
                 metrics.build_mem_used.add(estimated_hashtable_size);
                 Box::new(JoinHashMapU32::with_capacity(num_rows))
             };
@@ -2380,7 +2381,7 @@ async fn collect_left_input(
         BooleanBufferBuilder::new(0)
     };
 
-    let map = Arc::new(join_hash_map);
+    let map = Arc::new(ReservedMap::new(join_hash_map, map_reservation));
 
     let membership = if num_rows == 0 {
         PushdownStrategy::Empty
