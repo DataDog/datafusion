@@ -34,7 +34,7 @@ use datafusion_physical_expr_common::physical_expr::{
     DynHash, PhysicalExpr, PhysicalExprRef,
 };
 
-use crate::joins::Map;
+use crate::joins::{Map, ReservedMap};
 
 /// RandomState wrapper that preserves the seed used to create it.
 ///
@@ -262,7 +262,7 @@ pub struct HashTableLookupExpr {
     /// Random state for hashing (with seeds preserved for serialization)
     random_state: SeededRandomState,
     /// Map to check against (hash table or array map)
-    map: Arc<Map>,
+    map: Arc<ReservedMap>,
     /// Description for display
     description: String,
 }
@@ -281,6 +281,20 @@ impl HashTableLookupExpr {
         on_columns: Vec<PhysicalExprRef>,
         random_state: SeededRandomState,
         map: Arc<Map>,
+        description: String,
+    ) -> Self {
+        Self::new_reserved(
+            on_columns,
+            random_state,
+            Arc::new(ReservedMap::unreserved(map)),
+            description,
+        )
+    }
+
+    pub(crate) fn new_reserved(
+        on_columns: Vec<PhysicalExprRef>,
+        random_state: SeededRandomState,
+        map: Arc<ReservedMap>,
         description: String,
     ) -> Self {
         Self {
@@ -316,7 +330,7 @@ impl Hash for HashTableLookupExpr {
         // hash maps to have the same content in practice.
         // Theoretically this is a public API and users could create identical hash maps,
         // but that seems unlikely and not worth paying the cost of deep comparison all the time.
-        Arc::as_ptr(&self.map).hash(state);
+        Arc::as_ptr(&self.map.map).hash(state);
     }
 }
 
@@ -332,7 +346,7 @@ impl PartialEq for HashTableLookupExpr {
         self.on_columns == other.on_columns
             && self.description == other.description
             && self.random_state.seed() == other.random_state.seed()
-            && Arc::ptr_eq(&self.map, &other.map)
+            && Arc::ptr_eq(&self.map.map, &other.map.map)
     }
 }
 
@@ -353,7 +367,7 @@ impl PhysicalExpr for HashTableLookupExpr {
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        Ok(Arc::new(HashTableLookupExpr::new(
+        Ok(Arc::new(HashTableLookupExpr::new_reserved(
             children,
             self.random_state.clone(),
             Arc::clone(&self.map),
@@ -373,7 +387,8 @@ impl PhysicalExpr for HashTableLookupExpr {
         // Evaluate columns
         let join_keys = evaluate_columns(&self.on_columns, batch)?;
 
-        match self.map.as_ref() {
+        let map: &Map = &self.map;
+        match map {
             Map::HashMap(map) => {
                 with_hashes(&join_keys, self.random_state.random_state(), |hashes| {
                     let array = map.contain_hashes(hashes);

@@ -17,5 +17,6 @@
 
 mod coop;
 mod datasource_split;
+mod dynamic_join_filter;
 mod logical_plan;
 mod register_arrow;
